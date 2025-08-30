@@ -56,10 +56,11 @@ class StockDataset(Dataset):
             for date_key in h5f.keys():
                 date_str = h5f[date_key].attrs['date']
                 date = pd.Timestamp(date_str)
-                stocks = h5f[date_key].attrs['stocks'].tolist()
+
+                # ❷ 读取数据集而不是 attribute
+                stocks = h5f[date_key]['stocks'][:].astype(str).tolist()
 
                 for stock_idx, stock in enumerate(stocks):
-                    # 检查是否有标签
                     if (date, stock) in self.labels.index:
                         self.index.append({
                             'date_key': date_key,

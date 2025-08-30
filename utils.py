@@ -11,9 +11,14 @@ from pathlib import Path
 
 def load_trading_calendar(calendar_file: Path) -> pd.DatetimeIndex:
     """加载交易日历"""
-    df = pd.read_csv(calendar_file, header=None)
-    dates = pd.to_datetime(df.iloc[:, 0], format='%Y/%m/%d')
-    return pd.DatetimeIndex(dates.unique().sort_values())
+    # 跳过第一行（,0），从第二行开始读取
+    df = pd.read_csv(calendar_file, header=None, skiprows=1)
+
+    # 取第二列（索引1）作为日期数据
+    dates = pd.to_datetime(df.iloc[:, 1], format='%Y/%m/%d')
+
+    # 修复：直接对DatetimeIndex进行排序
+    return pd.DatetimeIndex(sorted(dates.unique()))
 
 
 def week_last_trading_days(calendar: pd.DatetimeIndex) -> pd.DatetimeIndex:
