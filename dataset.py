@@ -143,12 +143,16 @@ class StockDataset(Dataset):
         # ---------- 标签 ----------
         label = self.labels.loc[(meta["date"], meta["stock"]), "next_week_return"]
 
+        # ---------- 日期（用于按日成批和按日评估） ----------
+        date_int = int(meta["date"].strftime('%Y%m%d'))
+
         return dict(
             daily=torch.tensor(daily_arr, dtype=torch.float32),
             min30=torch.tensor(min30_arr, dtype=torch.float32),
             ind_id=torch.tensor(ind_id, dtype=torch.long),
             sec_id=torch.tensor(sec_id, dtype=torch.long),
-            label=torch.tensor(label, dtype=torch.float32)
+            label=torch.tensor(label, dtype=torch.float32),
+            date=torch.tensor(date_int, dtype=torch.int32)
         )
 
     # -------------------------------------------------
@@ -169,5 +173,6 @@ def collate_fn(batch):
         min30=torch.stack([b["min30"] for b in batch]),  # [B,Tm,6]
         ind_id=torch.stack([b["ind_id"] for b in batch]),  # [B]
         sec_id=torch.stack([b["sec_id"] for b in batch]),  # [B]
-        label=torch.stack([b["label"] for b in batch])  # [B]
+        label=torch.stack([b["label"] for b in batch]),  # [B]
+        date=torch.stack([b["date"] for b in batch])  # [B] int32 (yyyymmdd)
     )

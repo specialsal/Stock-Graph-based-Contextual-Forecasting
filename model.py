@@ -1,6 +1,6 @@
 # coding: utf-8
 """
-模型定义：多尺度时序编码 + 行业/板块 Embedding + 双阶段截面交互
+模型定义：多尺度时序编码 + 行业/板块 Embedding + 截面交互（O(B) 注意力）
 """
 import torch
 import torch.nn as nn
@@ -67,7 +67,8 @@ class FusionModel(nn.Module):
     """
     * 股票自身时序特征  = 日线 + 30min
     * 离散标签          = 行业 + 板块
-    * 截面交互          = 市场隐状态 R → 截面 B → 反馈到个股
+    * 截面交互          = 市场隐状态 R（Q=cls, K/V=stocks）→ 截面 B → 反馈到个股
+      注意力复杂度：全部为 O(B)，避免 O(B^2) 显存爆炸
     """
     def __init__(self,
                  num_industries: int = 100,
@@ -87,11 +88,11 @@ class FusionModel(nn.Module):
         self.ln_in   = nn.LayerNorm(self.stk_dim)
 
         # learnable cls_token 用于抽取市场隐状态 R
-        self.cls_token = nn.Parameter(torch.randn(1, 1, self.stk_dim))
+        self.cls_token = nn.Parameter(torch.randn(1, 1, self.stk_dim) * 0.02)
 
-        # 双阶段多头注意力
-        self.attn1 = nn.MultiheadAttention(self.stk_dim, num_heads=8, batch_first=True, dropout=0.1)
-        self.attn2 = nn.MultiheadAttention(self.stk_dim, num_heads=8, batch_first=True, dropout=0.1)
+        # 双阶段多头注意力（batch_first: [B, L, D]）
+        self.attn1 = nn.MultiheadAttention(self.stk_dim, num_heads=CFG.attn_heads, batch_first=True, dropout=0.1)
+        self.attn2 = nn.MultiheadAttention(self.stk_dim, num_heads=CFG.attn_heads, batch_first=True, dropout=0.1)
 
         # 输出层（拼接三个向量：stk_repr | R | cross）
         final_dim = self.stk_dim * 3
@@ -106,43 +107,58 @@ class FusionModel(nn.Module):
             nn.Linear(64, 1)
         )
 
-    # -------------------------------------------------
-    def forward(self,
-                daily:  torch.Tensor,                               # [B,Td,6]
-                minute: torch.Tensor,                               # [B,Tm,6]
-                ind_id: torch.Tensor,                               # [B]   int
-                sec_id: torch.Tensor):                              # [B]   int
-        """前向传播"""
-        # 1) 个股时序编码
-        h_d = self.daily_enc(daily)                                 # [B,128]
-        h_m = self.minute_enc(minute)                               # [B,256]
-
-        # 2) 行业 / 板块 Embedding
+    # ---------- 将原三路输入编码为单只股票表征 ----------
+    def encode(self,
+               daily:  torch.Tensor,                                # [B,Td,6]
+               minute: torch.Tensor,                                # [B,Tm,6]
+               ind_id: torch.Tensor,                                # [B]   int
+               sec_id: torch.Tensor) -> torch.Tensor:               # return [B, D]
+        h_d  = self.daily_enc(daily)                                # [B,128]
+        h_m  = self.minute_enc(minute)                              # [B,256]
         h_ind = self.ind_emb(ind_id)                                # [B,32]
         h_sec = self.sec_emb(sec_id)                                # [B,32]
+        stk_repr = torch.cat([h_d, h_m, h_ind, h_sec], dim=-1)      # [B,D]
+        stk_repr = self.ln_in(stk_repr)
+        return stk_repr                                             # [B,D]
 
-        # 3) 拼接成原始股票表征
-        stk_repr = torch.cat([h_d, h_m, h_ind, h_sec], dim=-1)      # [B,stk_dim]
-        stk_repr = self.ln_in(stk_repr).unsqueeze(0)                # [1,B,D] —— 视作序列
+    # ---------- 截面交互 + 头部 ----------
+    def interact_and_head(self, stk_repr: torch.Tensor) -> torch.Tensor:
+        """
+        输入: stk_repr [B,D]
+        过程:
+          1) R = Attn(cls -> stocks)              O(B)
+          2) B = Attn(R -> stocks)                O(B)
+          3) cross = Attn(stocks -> B)            O(B)（K/V 长度为 1）
+          4) 拼接 [stk | R | cross] -> head
+        输出: [B]
+        """
+        Bsz = stk_repr.size(0)
 
-        # 4) 抽取市场隐状态 R（cls_token + Self Attn）
-        seq_with_cls = torch.cat([self.cls_token, stk_repr], dim=1) # [1,B+1,D]
-        seq_out, _   = self.attn1(seq_with_cls, seq_with_cls, seq_with_cls)
-        R = seq_out[:, 0:1, :]                                      # 取 cls 位置 → [1,1,D]
+        # 视作序列：[1, B, D]
+        stk_seq = stk_repr.unsqueeze(0)
 
-        # 5) 第一次交叉注意力：R → Stocks，生成 B
-        B, _ = self.attn1(R, stk_repr, stk_repr)                    # [1,1,D]
+        # 1) 市场隐状态 R：Q=cls_token, K/V=stocks
+        R, _ = self.attn1(self.cls_token, stk_seq, stk_seq)         # [1,1,D]
 
-        # 6) 第二次交叉注意力：Stocks → B
-        B_expanded = B.repeat(1, stk_repr.size(1), 1)               # [1,B,D]
-        cross_out, _ = self.attn2(stk_repr, B_expanded, B_expanded) # [1,B,D]
+        # 2) 第一次交叉注意力：R → Stocks，生成 B（市场基底）
+        B_vec, _ = self.attn1(R, stk_seq, stk_seq)                  # [1,1,D]
 
-        # 7) 拼接三个向量
-        stk_repr = stk_repr.squeeze(0)      # [B,D]
-        cross_out = cross_out.squeeze(0)    # [B,D]
-        R_expand  = R.squeeze(0).repeat(stk_repr.size(0), 1)  # [B,D]
+        # 3) 第二次交叉注意力：Stocks → B（不再 repeat 到 B）
+        cross_out, _ = self.attn2(stk_seq, B_vec, B_vec)            # [1,B,D]
 
-        final = torch.cat([stk_repr, R_expand, cross_out], dim=-1)  # [B,3D]
+        # 4) 拼接三个向量
+        stk_seq   = stk_seq.squeeze(0)                               # [B,D]
+        cross_out = cross_out.squeeze(0)                             # [B,D]
+        R_expand  = R.squeeze(0).repeat(Bsz, 1)                      # [B,D]
 
-        # 8) 预测
-        return self.head(final).squeeze(-1)                         # [B]
+        final = torch.cat([stk_seq, R_expand, cross_out], dim=-1)    # [B,3D]
+        return self.head(final).squeeze(-1)                          # [B]
+
+    # ---------- 标准前向 ----------
+    def forward(self,
+                daily:  torch.Tensor,                                # [B,Td,6]
+                minute: torch.Tensor,                                # [B,Tm,6]
+                ind_id: torch.Tensor,                                # [B]   int
+                sec_id: torch.Tensor):                               # [B]   int
+        stk_repr = self.encode(daily, minute, ind_id, sec_id)        # [B,D]
+        return self.interact_and_head(stk_repr)                      # [B]
