@@ -1,13 +1,11 @@
 # coding: utf-8
 """
-训练主程序
+训练脚本：三模态 + 行业 / 板块标签
 """
 import torch
-import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
-import numpy as np
 from tqdm import tqdm
 from pathlib import Path
 
@@ -16,241 +14,186 @@ from dataset import StockDataset, collate_fn
 from model import FusionModel
 
 
-def rank_ic(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """计算Rank IC (Spearman相关系数)"""
-    pred_rank = pred.argsort().argsort().float()
-    target_rank = target.argsort().argsort().float()
-
-    pred_rank = (pred_rank - pred_rank.mean()) / (pred_rank.std() + 1e-8)
-    target_rank = (target_rank - target_rank.mean()) / (target_rank.std() + 1e-8)
-
-    ic = (pred_rank * target_rank).mean()
-    return ic
+# --------------- RankIC & Loss ----------------
+def rank_ic(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
+    """Spearman 相关系数的快速实现"""
+    pred_r = pred.argsort().argsort().float()
+    tgt_r = tgt.argsort().argsort().float()
+    pred_r = (pred_r - pred_r.mean()) / (pred_r.std() + 1e-8)
+    tgt_r = (tgt_r - tgt_r.mean()) / (tgt_r.std() + 1e-8)
+    return (pred_r * tgt_r).mean()
 
 
-def ic_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """IC Loss"""
-    return 1 - rank_ic(pred, target)
+def ic_loss(pred, tgt):
+    return 1.0 - rank_ic(pred, tgt)
 
 
-def pairwise_ranking_loss(pred: torch.Tensor, target: torch.Tensor, margin: float = 0.01) -> torch.Tensor:
-    """成对排序损失"""
-    n = pred.shape[0]
+def pairwise_loss(pred, tgt, margin=0.01):
+    """成对排序 hinge 损失"""
+    n = pred.size(0)
     if n < 2:
         return torch.tensor(0.0, device=pred.device)
-
-    # 随机采样配对
     idx1 = torch.randint(0, n, (n // 2,))
     idx2 = torch.randint(0, n, (n // 2,))
-
-    diff_pred = pred[idx1] - pred[idx2]
-    diff_true = target[idx1] - target[idx2]
-
-    label = torch.sign(diff_true)
-    loss = torch.relu(margin - label * diff_pred)
-
-    return loss.mean()
+    dp = pred[idx1] - pred[idx2]
+    dt = tgt[idx1] - tgt[idx2]
+    label = torch.sign(dt)
+    return torch.relu(margin - label * dp).mean()
 
 
-def combined_loss(pred: torch.Tensor, target: torch.Tensor, alpha: float = 0.7) -> torch.Tensor:
-    """组合损失函数"""
-    l_ic = ic_loss(pred, target)
-    l_rank = pairwise_ranking_loss(pred, target)
-    return alpha * l_ic + (1 - alpha) * l_rank
+def total_loss(pred, tgt):
+    return CFG.alpha * ic_loss(pred, tgt) + (1 - CFG.alpha) * pairwise_loss(pred, tgt)
 
 
-def train_epoch(model, loader, optimizer, device):
-    """训练一个epoch"""
-    model.train()
-    total_loss = 0
-    total_ic = 0
-    num_batches = 0
+# --------------- 训练 / 验证 ----------------
+@torch.no_grad()
+def evaluate(model, loader):
+    model.eval()
+    tot_ic, tot_loss, n = 0.0, 0.0, 0
 
-    pbar = tqdm(loader, desc="Training")
+    pbar = tqdm(loader, desc="Validating", leave=False)
     for batch in pbar:
-        daily = batch['daily'].to(device)
-        min30 = batch['min30'].to(device)
-        labels = batch['label'].to(device)
+        for k in ("daily", "min30", "ind_id", "sec_id", "label"):
+            batch[k] = batch[k].to(CFG.device)
 
-        # 前向传播
-        pred = model(daily, min30)
+        pred = model(batch["daily"], batch["min30"], batch["ind_id"], batch["sec_id"])
+        loss = total_loss(pred, batch["label"])
+        ic = rank_ic(pred, batch["label"]).item()
 
-        # 计算损失
-        loss = combined_loss(pred, labels, alpha=CFG.alpha)
+        tot_ic += ic
+        tot_loss += loss.item()
+        n += 1
 
-        # 反向传播
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-
-        # 记录指标
-        with torch.no_grad():
-            batch_ic = rank_ic(pred, labels)
-            total_loss += loss.item()
-            total_ic += batch_ic.item()
-            num_batches += 1
-
+        # 更新进度条信息
         pbar.set_postfix({
-            'loss': f'{loss.item():.4f}',
-            'ic': f'{batch_ic.item():.4f}'
+            'Val_Loss': f'{tot_loss / n:.4f}',
+            'Val_IC': f'{tot_ic / n:.4f}'
         })
 
-    return total_loss / num_batches, total_ic / num_batches
+    return tot_ic / n, tot_loss / n
 
 
-@torch.no_grad()
-def evaluate(model, loader, device):
-    """评估模型"""
-    model.eval()
-    total_ic = 0
-    num_batches = 0
+def train_one_epoch(model, loader, optimizer, epoch):
+    model.train()
+    tot_loss, tot_ic, tot_ic_loss, tot_pair_loss, n = 0.0, 0.0, 0.0, 0.0, 0
 
-    all_preds = []
-    all_labels = []
+    pbar = tqdm(loader, desc=f"Epoch {epoch}")
+    for batch_idx, batch in enumerate(pbar):
+        for k in ("daily", "min30", "ind_id", "sec_id", "label"):
+            batch[k] = batch[k].to(CFG.device)
 
-    for batch in tqdm(loader, desc="Evaluating"):
-        daily = batch['daily'].to(device)
-        min30 = batch['min30'].to(device)
-        labels = batch['label'].to(device)
+        pred = model(batch["daily"], batch["min30"], batch["ind_id"], batch["sec_id"])
 
-        pred = model(daily, min30)
+        # 计算各种损失
+        ic_loss_val = ic_loss(pred, batch["label"])
+        pair_loss_val = pairwise_loss(pred, batch["label"])
+        loss = CFG.alpha * ic_loss_val + (1 - CFG.alpha) * pair_loss_val
 
-        batch_ic = rank_ic(pred, labels)
-        total_ic += batch_ic.item()
-        num_batches += 1
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
 
-        all_preds.append(pred.cpu())
-        all_labels.append(labels.cpu())
+        # 计算指标
+        ic = rank_ic(pred, batch["label"]).item()
+        tot_loss += loss.item()
+        tot_ic += ic
+        tot_ic_loss += ic_loss_val.item()
+        tot_pair_loss += pair_loss_val.item()
+        n += 1
 
-    # 计算整体IC
-    all_preds = torch.cat(all_preds)
-    all_labels = torch.cat(all_labels)
-    overall_ic = rank_ic(all_preds, all_labels)
+        # 更新进度条信息
+        current_lr = optimizer.param_groups[0]['lr']
+        pbar.set_postfix({
+            'Loss': f'{tot_loss / n:.4f}',
+            'IC': f'{tot_ic / n:.4f}',
+            'IC_Loss': f'{tot_ic_loss / n:.4f}',
+            'Pair_Loss': f'{tot_pair_loss / n:.4f}',
+            'LR': f'{current_lr:.2e}',
+            'Batch': f'{batch_idx + 1}/{len(loader)}'
+        })
 
-    return total_ic / num_batches, overall_ic.item()
+    return tot_loss / n, tot_ic / n
 
 
+# --------------- 主函数 ----------------
 def main():
-    """主训练函数"""
+    # ---------- 数据集 ----------
+    print("正在加载数据集...")
+    train_ds = StockDataset(CFG.train_features_file, CFG.label_file,
+                            CFG.scaler_file, CFG.universe_file)
+    val_ds = StockDataset(CFG.val_features_file, CFG.label_file,
+                          CFG.scaler_file, CFG.universe_file)
 
-    # 创建数据集
-    print("加载数据集...")
-    train_dataset = StockDataset(
-        features_path=CFG.train_features_file,
-        label_path=CFG.label_file,
-        scaler_path=CFG.scaler_file,
-        universe_path=CFG.universe_file
-    )
+    train_ld = DataLoader(train_ds, batch_size=CFG.batch_size, shuffle=True,
+                          num_workers=CFG.num_workers, collate_fn=collate_fn, pin_memory=True)
+    val_ld = DataLoader(val_ds, batch_size=CFG.batch_size, shuffle=False,
+                        num_workers=CFG.num_workers, collate_fn=collate_fn, pin_memory=True)
 
-    val_dataset = StockDataset(
-        features_path=CFG.val_features_file,
-        label_path=CFG.label_file,
-        scaler_path=CFG.scaler_file,
-        universe_path=CFG.universe_file
-    )
+    print(f"训练集样本数: {len(train_ds)}")
+    print(f"验证集样本数: {len(val_ds)}")
+    print(f"每epoch训练步数: {len(train_ld)}")
 
-    print(f"训练集大小: {len(train_dataset)}")
-    print(f"验证集大小: {len(val_dataset)}")
+    # ---------- 模型 ----------
+    model = FusionModel(num_industries=train_ds.num_industries,
+                        num_sectors=train_ds.num_sectors).to(CFG.device)
 
-    # 创建数据加载器
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=CFG.batch_size,
-        shuffle=True,
-        num_workers=CFG.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=True
-    )
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"模型总参数量: {total_params / 1e6:.2f} M")
+    print(f"可训练参数量: {trainable_params / 1e6:.2f} M")
 
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=CFG.batch_size,
-        shuffle=False,
-        num_workers=CFG.num_workers,
-        collate_fn=collate_fn,
-        pin_memory=True
-    )
+    # ---------- 优化器 & 调度 ----------
+    opt = AdamW(model.parameters(), lr=CFG.lr, weight_decay=CFG.weight_decay)
+    sch = CosineAnnealingLR(opt, T_max=CFG.epochs, eta_min=CFG.lr * 0.01)
 
-    # 创建模型
-    model = FusionModel().to(CFG.device)
-    print(f"模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
-
-    # 优化器和调度器
-    optimizer = AdamW(
-        model.parameters(),
-        lr=CFG.lr,
-        weight_decay=CFG.weight_decay
-    )
-
-    scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=CFG.epochs,
-        eta_min=CFG.lr * 0.01
-    )
-
-    # 训练循环
-    best_val_ic = -1
+    best_ic = -1.0
     best_epoch = 0
 
+    print(f"\n开始训练 - 设备: {CFG.device}")
+    print(f"配置: batch_size={CFG.batch_size}, lr={CFG.lr}, alpha={CFG.alpha}")
+    print("=" * 80)
+
     for epoch in range(1, CFG.epochs + 1):
-        print(f"\n{'=' * 50}")
-        print(f"Epoch {epoch}/{CFG.epochs}")
-        print(f"Learning Rate: {optimizer.param_groups[0]['lr']:.6f}")
+        print(f"\nEpoch {epoch}/{CFG.epochs}")
+        print("-" * 50)
 
         # 训练
-        train_loss, train_ic = train_epoch(model, train_loader, optimizer, CFG.device)
+        tr_loss, tr_ic = train_one_epoch(model, train_ld, opt, epoch)
 
         # 验证
-        val_ic, val_overall_ic = evaluate(model, val_loader, CFG.device)
+        val_ic, val_loss = evaluate(model, val_ld)
 
         # 学习率调度
-        scheduler.step()
+        sch.step()
+        current_lr = opt.param_groups[0]['lr']
 
-        # 打印结果
-        print(f"Train Loss: {train_loss:.4f}, Train IC: {train_ic:.4f}")
-        print(f"Val IC: {val_ic:.4f}, Val Overall IC: {val_overall_ic:.4f}")
+        # 打印epoch总结
+        print(f"Train - Loss: {tr_loss:.4f} | IC: {tr_ic:.4f}")
+        print(f"Valid - Loss: {val_loss:.4f} | IC: {val_ic:.4f}")
+        print(f"LR: {current_lr:.2e}")
 
-        # 保存最佳模型
-        if val_overall_ic > best_val_ic:
-            best_val_ic = val_overall_ic
+        # 保存最好模型
+        if val_ic > best_ic:
+            best_ic = val_ic
             best_epoch = epoch
-
             torch.save({
-                'epoch': epoch,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_ic': val_overall_ic,
-            }, CFG.processed_dir / 'best_model.pth')
+                "model": model.state_dict(),
+                "ic": best_ic,
+                "epoch": epoch,
+                "train_ic": tr_ic,
+                "train_loss": tr_loss,
+                "val_loss": val_loss,
+                "config": CFG.__dict__.copy() if hasattr(CFG, '__dict__') else None
+            }, CFG.processed_dir / "best_model.pth")
+            print(f">>> 保存新最佳模型 (IC: {best_ic:.4f})")
+        else:
+            print(f">>> 当前最佳IC: {best_ic:.4f} (Epoch {best_epoch})")
 
-            print(f"保存最佳模型 (IC: {val_overall_ic:.4f})")
-
-    print(f"\n训练完成！最佳验证IC: {best_val_ic:.4f} (Epoch {best_epoch})")
-
-    # 测试集评估
-    if CFG.test_features_file.exists():
-        print("\n在测试集上评估...")
-        test_dataset = StockDataset(
-            features_path=CFG.test_features_file,
-            label_path=CFG.label_file,
-            scaler_path=CFG.scaler_file,
-            universe_path=CFG.universe_file
-        )
-
-        test_loader = DataLoader(
-            test_dataset,
-            batch_size=CFG.batch_size,
-            shuffle=False,
-            num_workers=CFG.num_workers,
-            collate_fn=collate_fn
-        )
-
-        # 加载最佳模型
-        checkpoint = torch.load(CFG.processed_dir / 'best_model.pth')
-        model.load_state_dict(checkpoint['model_state_dict'])
-
-        test_ic, test_overall_ic = evaluate(model, test_loader, CFG.device)
-        print(f"测试集 IC: {test_ic:.4f}, Overall IC: {test_overall_ic:.4f}")
+    print("\n" + "=" * 80)
+    print(f"训练结束！")
+    print(f"最佳验证 IC: {best_ic:.4f} (Epoch {best_epoch})")
+    print(f"模型已保存至: {CFG.processed_dir / 'best_model.pth'}")
 
 
 if __name__ == "__main__":
