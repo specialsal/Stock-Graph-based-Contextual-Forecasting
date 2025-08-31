@@ -50,12 +50,12 @@ class Config:
     hidden        = 128               # 时序编码隐藏维
     ind_emb_dim   = 32                # 行业 Embedding 维
     sec_emb_dim   = 32                # 板块 Embedding 维
-    batch_size    = 512
+    batch_size    = 1024
     lr            = 3e-4
     weight_decay  = 1e-2
-    alpha         = 0.7               # IC Loss 权重
-    epochs        = 20
-    num_workers   = 4
+    alpha         = 0.5               # IC Loss 权重
+    epochs        = 100
+    num_workers   = 20
 
     # -------------------- 数据集年份 --------------------
     train_end_year = 2021
