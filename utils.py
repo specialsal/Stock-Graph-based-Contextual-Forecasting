@@ -58,13 +58,14 @@ def load_universe(path: Path):
 # ---------------- 可导排序相关 ----------------
 def soft_rank(x: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
     """
-    Differentiable ranking approximation (O(N²)).
-    论文: Blondel et al. NeurIPS 2020
+    可导的秩近似（O(N^2)）
+    方向：值越大 → soft_rank 越大（与常规升序秩一致）
+    参考：Blondel et al., NeurIPS 2020
     """
-    n = x.size(-1)
-    diff = x.unsqueeze(-1) - x.unsqueeze(-2)        # [..., N, N]
-    P = torch.sigmoid(-diff / tau)                  # 蚂蚁概率
-    SR = P.sum(dim=-1) + 0.5                        # [..., N]
+    diff = x.unsqueeze(-1) - x.unsqueeze(-2)  # x_i - x_j
+    # 原来是 sigmoid(-diff / tau)，方向相反
+    P = torch.sigmoid(diff / tau)             # 近似 I[x_i > x_j]
+    SR = P.sum(dim=-1) + 0.5                  # [..., N]
     return SR
 
 
@@ -72,7 +73,8 @@ def soft_ic_loss(pred: torch.Tensor,
                  tgt:  torch.Tensor,
                  tau:  float = 1.0) -> torch.Tensor:
     """
-    可导 Spearman IC Loss = 1 - Corr(pred, soft_rank(label))
+    可导 Spearman IC Loss ≈ 1 - Corr(pred, soft_rank(label))
+    保持与 rank_ic 同方向（正相关即更优）
     """
     p = (pred - pred.mean()) / (pred.std() + 1e-8)
     r = soft_rank(tgt, tau=tau)

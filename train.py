@@ -77,7 +77,7 @@ def rank_ic(pred: torch.Tensor, tgt: torch.Tensor) -> torch.Tensor:
 @torch.no_grad()
 def evaluate(model, loader, amp_ctx, amp_kwargs):
     model.eval()
-    tot_ic_w, tot_loss, n_stk = 0., 0., 0
+    tot_ic_w, tot_loss, tot_pair, n_stk = 0., 0., 0., 0
 
     pbar = tqdm(loader, desc="Valid", leave=False)
     for batch in pbar:
@@ -87,28 +87,30 @@ def evaluate(model, loader, amp_ctx, amp_kwargs):
         with amp_ctx(**amp_kwargs):
             pred = model(batch["daily"], batch["min30"],
                          batch["ind_id"], batch["sec_id"])
-        ic_l  = soft_ic_loss(pred, batch["label"])
+        ic_l   = soft_ic_loss(pred, batch["label"])
         pair_l = pairwise_loss(pred, batch["label"])
-        loss  = CFG.alpha * ic_l + (1 - CFG.alpha) * pair_l
+        loss   = CFG.alpha * ic_l + (1 - CFG.alpha) * pair_l
 
         B = batch["label"].size(0)
         ic = rank_ic(pred, batch["label"]).item()
 
         tot_ic_w += ic * B
         tot_loss += loss.item() * B
+        tot_pair += pair_l.item() * B
         n_stk    += B
 
         pbar.set_postfix(IC=f"{tot_ic_w / n_stk:.4f}",
-                         Loss=f"{tot_loss / n_stk:.4f}")
+                         Loss=f"{tot_loss / n_stk:.4f}",
+                         PairLoss=f"{tot_pair / n_stk:.4f}")
 
-    return tot_ic_w / n_stk, tot_loss / n_stk
+    return tot_ic_w / n_stk, tot_loss / n_stk, tot_pair / n_stk
 
 
 # ---------------- Train one epoch ----------------
 def train_one_epoch(model, loader, optim, scaler,
                     amp_ctx, amp_kwargs, epoch):
     model.train()
-    tot_ic_w, tot_loss, n_stk = 0., 0., 0
+    tot_ic_w, tot_loss, tot_pair, n_stk = 0., 0., 0., 0
 
     pbar = tqdm(loader, desc=f"Epoch {epoch}")
     for batch in pbar:
@@ -140,22 +142,24 @@ def train_one_epoch(model, loader, optim, scaler,
 
         tot_ic_w += ic * B
         tot_loss += loss.item() * B
+        tot_pair += pair_l.item() * B
         n_stk    += B
 
         pbar.set_postfix(IC=f"{tot_ic_w / n_stk:.4f}",
                          Loss=f"{tot_loss / n_stk:.4f}",
+                         PairLoss=f"{tot_pair / n_stk:.4f}",
                          LR=f"{optim.param_groups[0]['lr']:.2e}")
 
-    return tot_ic_w / n_stk, tot_loss / n_stk
+    return tot_ic_w / n_stk, tot_loss / n_stk, tot_pair / n_stk
 
 
 # ---------------- Main ----------------
 def main():
-    # AMP
     use_amp = CFG.use_amp and CFG.device.type == "cuda"
     if use_amp:
         dtype = torch.bfloat16 if CFG.amp_dtype.lower() == "bf16" else torch.float16
-        amp_ctx, amp_kwargs = torch.cuda.amp.autocast, dict(dtype=dtype)
+        amp_ctx, amp_kwargs = torch.amp.autocast, dict(device_type='cuda', dtype=dtype)
+        # GradScaler 维持原写法即可（无警告）
         scaler = torch.cuda.amp.GradScaler(enabled=(dtype == torch.float16))
     else:
         amp_ctx, amp_kwargs, scaler = nullcontext, {}, None
@@ -192,14 +196,16 @@ def main():
     best_ic, best_ep = -1., 0
     print("\n开始训练...")
     for ep in range(1, CFG.epochs + 1):
-        tr_ic, tr_loss = train_one_epoch(model, tr_ld, optim, scaler,
-                                         amp_ctx, amp_kwargs, ep)
-        val_ic, val_loss = evaluate(model, val_ld,
-                                    amp_ctx, amp_kwargs)
+        tr_ic, tr_loss, tr_pair = train_one_epoch(model, tr_ld, optim, scaler,
+                                                  amp_ctx, amp_kwargs, ep)
+        val_ic, val_loss, val_pair = evaluate(model, val_ld, amp_ctx, amp_kwargs)
 
         sched.step()
 
-        print(f"[Epoch {ep}] TrainIC: {tr_ic:.4f}  ValIC: {val_ic:.4f}")
+        print(f"[Epoch {ep}] "
+              f"TrainIC: {tr_ic:.4f}  ValIC: {val_ic:.4f}  "
+              f"TrainLoss: {tr_loss:.4f}  ValLoss: {val_loss:.4f}  "
+              f"TrainPairLoss: {tr_pair:.4f}  ValPairLoss: {val_pair:.4f}")
 
         if val_ic > best_ic:
             best_ic, best_ep = val_ic, ep
