@@ -27,6 +27,18 @@ class Config:
     style_day_file     = raw_dir / "sector_price_day.parquet"
     trading_day_file   = raw_dir / "trading_day.csv"
     industry_map_file  = raw_dir / "stock_industry_map.csv"
+    stock_info_file     = raw_dir / "stock_info.csv"     # 必含列: [code, ipo_date, delist_date]
+    is_suspended_file   = raw_dir / "is_suspended.csv"   # 行: date, 列: 股票代码，值: TRUE/FALSE 或 1/0
+    is_st_file          = raw_dir / "is_st_stock.csv"          # 行: date, 列: 股票代码，值: TRUE/FALSE 或 1/0
+
+    # -------- 股票筛选（可选） --------
+    enable_filters      = True       # 是否启用筛选（关闭则与旧逻辑一致）
+    ipo_cut_days        = 120        # 新股上市满多少天才纳入（自然日）
+    suspended_exclude   = True       # 排除停牌
+    st_exclude          = True       # 排除 ST
+    min_daily_turnover  = 5e6        # 当日最低成交额（单位与原始数据一致，如人民币元）
+    allow_missing_info  = False      # 缺少基础信息的股票是否保留（默认丢弃）
+
 
     # -------- 特征窗口 --------
     daily_window = 20

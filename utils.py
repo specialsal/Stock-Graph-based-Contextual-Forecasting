@@ -67,8 +67,17 @@ def pkl_load(path: Path):
 # -------- RankIC（torch，无梯度）--------
 @torch.no_grad()
 def rank_ic(pred, tgt):
+    # pred, tgt: 1D tensor
+    n = pred.numel()
+    if n < 2:
+        return 0.0
     pr = pred.argsort().argsort().float()
     tg = tgt.argsort().argsort().float()
-    pr = (pr - pr.mean()) / (pr.std() + 1e-8)
-    tg = (tg - tg.mean()) / (tg.std() + 1e-8)
+    # z-score 前检查方差
+    pr_std = pr.std(unbiased=False)
+    tg_std = tg.std(unbiased=False)
+    if pr_std <= 1e-12 or tg_std <= 1e-12:
+        return 0.0
+    pr = (pr - pr.mean()) / (pr_std + 1e-8)
+    tg = (tg - tg.mean()) / (tg_std + 1e-8)
     return (pr * tg).mean().item()
