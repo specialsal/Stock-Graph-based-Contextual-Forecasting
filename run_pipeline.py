@@ -1,33 +1,21 @@
 # coding: utf-8
 """
-运行整个pipeline
+一键执行：特征 ➜ 上下文特征 ➜ 标签 ➜ 滚动训练
 """
-import sys
-from pathlib import Path
-
+from feature_engineering import main as gen_feature
+from feature_context import main as gen_context
+from label_generation import main as gen_label
+from train_rolling import main as rolling_train
 
 def main():
-    print("=" * 60)
-    print("量化模型训练Pipeline")
-    print("=" * 60)
-
-    # 1. 生成标签
-    print("\n步骤1: 生成标签...")
-    from label_generation import main as generate_labels
-    generate_labels()
-
-    # 2. 数据预处理
-    print("\n步骤2: 数据预处理...")
-    from data_preprocessing import main as preprocess_data
-    preprocess_data()
-
-    # 3. 模型训练
-    print("\n步骤3: 模型训练...")
-    from train import main as train_model
-    train_model()
-
-    print("\n训练完成！")
-
+    print("STEP 1: 生成离线特征仓")
+    gen_feature()
+    print("STEP 2: 生成市场/风格上下文特征")
+    gen_context()
+    print("STEP 3: 生成周度标签")
+    gen_label()
+    print("STEP 4: 滚动训练")
+    rolling_train()
 
 if __name__ == "__main__":
     main()

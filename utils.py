@@ -1,82 +1,74 @@
 # coding: utf-8
-"""
-通用工具函数
-"""
-import numpy as np
-import pandas as pd
-import pickle
+import numpy as np, pandas as pd, pickle, torch
 from pathlib import Path
-import torch
 
+def load_industry_map(csv_file: Path):
+    # 使用 gbk 编码，兼容列名的潜在空白与大小写
+    df = pd.read_csv(csv_file, encoding='gbk')
+    cols = {c.strip().lower(): c for c in df.columns}
+    # 兼容可能的列名变体
+    key_col = None
+    ind_col = None
+    for cand in ['order_book_id', 'code', 'stock_code', 'ticker']:
+        if cand in cols:
+            key_col = cols[cand]
+            break
+    for cand in ['industry', 'industry_name', 'sector', 'industry_cn']:
+        if cand in cols:
+            ind_col = cols[cand]
+            break
+    if key_col is None or ind_col is None:
+        raise ValueError(f"行业映射CSV缺少必要列，检测到列: {df.columns.tolist()}，需要至少包含 order_book_id 与 industry")
 
-# ---------------- 交易日历 ----------------
-def load_trading_calendar(calendar_file: Path) -> pd.DatetimeIndex:
-    df = pd.read_csv(calendar_file, header=None, skiprows=1)
-    dates = pd.to_datetime(df.iloc[:, 1], format='%Y/%m/%d')
-    return pd.DatetimeIndex(sorted(dates.unique()))
+    df = df[[key_col, ind_col]].copy()
+    df[key_col] = df[key_col].astype(str).str.strip()
+    df[ind_col] = df[ind_col].astype(str).str.strip()
 
+    # 去重，保留首次出现
+    df = df.dropna(subset=[key_col, ind_col]).drop_duplicates(subset=[key_col])
 
-def week_last_trading_days(calendar: pd.DatetimeIndex) -> pd.DatetimeIndex:
-    df = pd.DataFrame({'date': calendar})
-    df['week'] = df['date'].dt.to_period('W')
-    weekly_last = df.groupby('week')['date'].last()
-    return pd.DatetimeIndex(weekly_last.values)
+    # 将中文行业名映射为稳定整数ID（按名称排序，保证可复现）
+    unique_inds = sorted(df[ind_col].unique())
+    ind2id = {name: i for i, name in enumerate(unique_inds)}  # 0..K-1
+    stock2id = {stk: ind2id[ind_name] for stk, ind_name in zip(df[key_col], df[ind_col])}
 
+    # 返回股票->行业ID 映射；如需行业名->ID也可返回
+    return stock2id  # 与现有调用兼容
+# -------- 交易日历 --------
+def load_calendar(csv_file: Path) -> pd.DatetimeIndex:
+    dates = pd.read_csv(csv_file, header=None, skiprows=1).iloc[:, 1]
+    return pd.DatetimeIndex(sorted(pd.to_datetime(dates, format='%Y/%m/%d').unique()))
 
-# ---------------- 数据处理 ----------------
-def mad_clip(arr: np.ndarray, k: float = 3.0) -> np.ndarray:
-    median = np.nanmedian(arr, axis=0, keepdims=True)
-    mad = np.nanmedian(np.abs(arr - median), axis=0, keepdims=True) + 1e-6
-    upper = median + k * mad
-    lower = median - k * mad
-    return np.clip(arr, lower, upper)
+def weekly_fridays(calendar: pd.DatetimeIndex) -> pd.DatetimeIndex:
+    df = pd.DataFrame({"d": calendar})
+    df['w'] = df['d'].dt.to_period('W')
+    return pd.DatetimeIndex(df.groupby('w')['d'].last().values)
 
+# -------- MAD 裁剪 + z-score --------
+def mad_clip(x: np.ndarray, k: float = 3.0):
+    med = np.nanmedian(x, 0, keepdims=True)
+    mad = np.nanmedian(np.abs(x - med), 0, keepdims=True) + 1e-6
+    return np.clip(x, med - k * mad, med + k * mad)
 
 class Scaler:
-    def __init__(self):
-        self.mean, self.std = None, None
+    def __init__(self): self.mean = None; self.std = None
+    def fit(self, arr): 
+        self.mean = np.nanmean(arr, (0, 1), keepdims=True)
+        self.std  = np.nanstd (arr, (0, 1), keepdims=True) + 1e-6
+    def transform(self, arr): return (arr - self.mean) / self.std
 
-    def fit(self, x: np.ndarray):
-        self.mean = np.nanmean(x, axis=(0, 1), keepdims=True)
-        self.std  = np.nanstd(x,  axis=(0, 1), keepdims=True) + 1e-6
+# -------- 保存 / 读取任意对象 --------
+def pkl_dump(obj, path: Path):
+    with open(path, "wb") as f: pickle.dump(obj, f)
 
-    def transform(self, x: np.ndarray) -> np.ndarray:
-        return (x - self.mean) / self.std
+def pkl_load(path: Path):
+    with open(path, "rb") as f: return pickle.load(f)
 
-
-# ---------------- 股票池 ----------------
-def save_universe(obj, path: Path):
-    with open(path, "wb") as f:
-        pickle.dump(obj, f)
-
-
-def load_universe(path: Path):
-    with open(path, "rb") as f:
-        return pickle.load(f)
-
-
-# ---------------- 可导排序相关 ----------------
-def soft_rank(x: torch.Tensor, tau: float = 1.0) -> torch.Tensor:
-    """
-    可导的秩近似（O(N^2)）
-    方向：值越大 → soft_rank 越大（与常规升序秩一致）
-    参考：Blondel et al., NeurIPS 2020
-    """
-    diff = x.unsqueeze(-1) - x.unsqueeze(-2)  # x_i - x_j
-    # 原来是 sigmoid(-diff / tau)，方向相反
-    P = torch.sigmoid(diff / tau)             # 近似 I[x_i > x_j]
-    SR = P.sum(dim=-1) + 0.5                  # [..., N]
-    return SR
-
-
-def soft_ic_loss(pred: torch.Tensor,
-                 tgt:  torch.Tensor,
-                 tau:  float = 1.0) -> torch.Tensor:
-    """
-    可导 Spearman IC Loss ≈ 1 - Corr(pred, soft_rank(label))
-    保持与 rank_ic 同方向（正相关即更优）
-    """
-    p = (pred - pred.mean()) / (pred.std() + 1e-8)
-    r = soft_rank(tgt, tau=tau)
-    r = (r - r.mean()) / (r.std() + 1e-8)
-    return 1.0 - (p * r).mean()
+# -------- RankIC（torch，无梯度）--------
+@torch.no_grad()
+def rank_ic(pred, tgt):
+    pr = pred.argsort().argsort().float()
+    tg = tgt.argsort().argsort().float()
+    pr = (pr - pr.mean()) / (pr.std() + 1e-8)
+    tg = (tg - tg.mean()) / (tg.std() + 1e-8)
+    return (pr * tg).mean().item()

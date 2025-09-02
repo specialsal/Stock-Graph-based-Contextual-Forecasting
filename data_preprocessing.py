@@ -291,7 +291,7 @@ def extract_features(
 
                     if len(daily_data) >= CFG.daily_window:
                         daily_data = daily_data.tail(CFG.daily_window)
-                        feats = daily_data[['open', 'high', 'low', 'close', 'volume', 'total_turnover']].values
+                        feats = daily_data[['open', 'high', 'low', 'close', 'volume', 'num_trades']].values
                         daily_features.append(feats)
                     else:
                         daily_features.append(np.full((CFG.daily_window, 6), np.nan))

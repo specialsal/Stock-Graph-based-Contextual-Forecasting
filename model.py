@@ -1,128 +1,197 @@
+# ====================== model.py ======================
 # coding: utf-8
 """
-Fusion Model：时间序列编码 + 行业/板块 Embedding + 截面交互注意力
+GCF-Net v2（稀疏行业图版本）- 提速版
+- 新增 graph_type="mean"：行业内均值聚合，O(N) 时间，显著加速
+- 将 Transformer 层数默认 1，hidden/emb 默认更小
 """
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
+import torch, torch.nn as nn, torch.nn.functional as F
 from config import CFG
 
-
-# =============== 1. 编码器 ===============
-class DailyEncoder(nn.Module):
-    def __init__(self, in_dim: int = 6, hidden: int = CFG.hidden):
+# ----------------------------------------------------------------------
+# 1. 基础组件
+# ----------------------------------------------------------------------
+class GLUConv(nn.Module):
+    def __init__(self, in_c, out_c, k=3, s=1, p=1):
         super().__init__()
-        self.proj = nn.Linear(in_dim, hidden)
-        self.pe   = nn.Parameter(torch.randn(1, CFG.daily_window, hidden) * 0.02)
-        enc_layer = nn.TransformerEncoderLayer(hidden, nhead=4,
-                                               dim_feedforward=hidden * 4,
-                                               dropout=0.1, batch_first=True)
-        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=2)
-        self.norm = nn.LayerNorm(hidden)
+        self.conv = nn.Conv1d(in_c, out_c * 2, k, s, p)
 
-    def forward(self, x):                           # [B, Td, 6]
-        h = self.proj(x) + self.pe
-        h = self.encoder(h)
-        h = self.norm(h)
-        return h.mean(1)                            # [B, hidden]
+    def forward(self, x):  # x:[B,C,T]
+        a, b = self.conv(x).chunk(2, dim=1)
+        return a * torch.sigmoid(b)
 
-
-class MinuteEncoder(nn.Module):
-    def __init__(self, in_dim: int = 6, hidden: int = CFG.hidden):
+class RelPosTransformer(nn.Module):
+    def __init__(self, dim, nhead=4, layers=1, p_drop=0.1):
         super().__init__()
-        self.conv1 = nn.Conv1d(in_dim, hidden // 2, kernel_size=5,
-                               stride=2, padding=2)
-        self.bn1   = nn.BatchNorm1d(hidden // 2)
-        self.conv2 = nn.Conv1d(hidden // 2, hidden, kernel_size=3, padding=1)
-        self.bn2   = nn.BatchNorm1d(hidden)
-        self.gru   = nn.GRU(hidden, hidden, num_layers=1,
-                             batch_first=True, bidirectional=False)
-        self.attn  = nn.Sequential(
-            nn.Linear(hidden, hidden),
-            nn.Tanh(),
-            nn.Linear(hidden, 1)
+        enc_layer = nn.TransformerEncoderLayer(
+            dim, nhead=nhead, dim_feedforward=dim * 4,
+            dropout=p_drop, batch_first=True)
+        self.encoder = nn.TransformerEncoder(enc_layer, layers)
+
+    def forward(self, x):  # x:[B,T,H]
+        return self.encoder(x)
+
+class AttnPooling(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.w = nn.Sequential(
+            nn.Linear(dim, dim), nn.Tanh(), nn.Linear(dim, 1)
         )
 
-    def forward(self, x):                           # [B, Tm, 6]
-        x = x.transpose(1, 2)                       # [B, 6, Tm]
-        x = F.relu(self.bn1(self.conv1(x)))
-        x = F.relu(self.bn2(self.conv2(x)))         # [B, H, T']
-        x = x.transpose(1, 2)                       # [B, T', H]
-        out, _ = self.gru(x)                        # [B, T', H]
-        w = torch.softmax(self.attn(out), dim=1)    # [B, T', 1]
-        return (out * w).sum(1)                     # [B, hidden]
+    def forward(self, x):  # x:[B,T,H]
+        a = torch.softmax(self.w(x), 1)  # [B,T,1]
+        return (a * x).sum(1)            # [B,H]
 
-
-# =============== 2. 主模型 ===============
-class FusionModel(nn.Module):
-    def __init__(self, num_industries: int, num_sectors: int):
+# ----------------------------------------------------------------------
+# 2. 日频特征编码器
+# ----------------------------------------------------------------------
+class DailyEncoder(nn.Module):
+    def __init__(self, in_dim, hidden=CFG.hidden, tr_layers=CFG.tr_layers):
         super().__init__()
-        # --- 编码 ---
-        self.daily_enc  = DailyEncoder()
-        self.minute_enc = MinuteEncoder()
+        self.conv = GLUConv(in_dim, hidden, k=3, p=1)
+        self.tr   = RelPosTransformer(hidden, nhead=4, layers=tr_layers)
+        self.pool = AttnPooling(hidden)
 
-        self.ind_emb = nn.Embedding(num_industries, CFG.ind_emb_dim)
-        self.sec_emb = nn.Embedding(num_sectors,   CFG.sec_emb_dim)
+    def forward(self, x):  # x:[B,T,C] or [B,T,1,C]
+        if x.ndim == 4 and x.shape[2] == 1:
+            x = x.squeeze(2)
+        x = x.transpose(1, 2)            # [B,C,T]
+        x = self.conv(x)                 # [B,H,T]
+        x = x.transpose(1, 2)            # [B,T,H]
+        x = self.tr(x)                   # [B,T,H]
+        return self.pool(x)              # [B,H]
 
-        # gate 融合日/分钟
-        self.gate = nn.Linear(CFG.hidden * 2, 1)
+# ----------------------------------------------------------------------
+# 3A. 提速版行业“均值图”块（O(N)）
+# ----------------------------------------------------------------------
+class IndustryMeanBlock(nn.Module):
+    def __init__(self, hidden=CFG.hidden, layers=CFG.gat_layers, dropout=0.1):
+        super().__init__()
+        self.layers = nn.ModuleList([nn.Identity() for _ in range(layers)])
+        self.norms  = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(layers)])
+        self.dropout = nn.Dropout(dropout)
+        self.gate = nn.Linear(hidden * 2, hidden)
 
-        self.stk_dim = CFG.hidden + CFG.ind_emb_dim + CFG.sec_emb_dim
-        self.ln_in   = nn.LayerNorm(self.stk_dim)
+    @staticmethod
+    def group_mean(h, ind_id):
+        # h:[N,H], ind_id:[N], 计算每个行业均值，并按样本顺序聚合回去
+        N, H = h.shape
+        K = int(ind_id.max().item()) + 1
+        sum_buf = torch.zeros(K, H, device=h.device, dtype=h.dtype)
+        cnt_buf = torch.zeros(K, 1, device=h.device, dtype=h.dtype)
+        sum_buf.index_add_(0, ind_id, h)
+        ones = torch.ones(N, 1, device=h.device, dtype=h.dtype)
+        cnt_buf.index_add_(0, ind_id, ones)
+        mean = sum_buf / (cnt_buf + 1e-6)   # [K,H]
+        return mean[ind_id]                 # [N,H]
 
-        self.cls_token = nn.Parameter(torch.randn(1, 1, self.stk_dim) * 0.02)
+    def forward(self, h, ind_id):
+        # 简单 residual + gating 到行业均值
+        for layer, norm in zip(self.layers, self.norms):
+            h_in = layer(h)
+            ind_mean = self.group_mean(h_in, ind_id)
+            g = torch.sigmoid(self.gate(torch.cat([h_in, ind_mean], -1)))
+            h = norm(h_in + self.dropout(g * ind_mean))
+        return h
 
-        self.attn_r2s = nn.MultiheadAttention(self.stk_dim, CFG.attn_heads,
-                                              dropout=0.1, batch_first=True)
-        self.attn_s2r = nn.MultiheadAttention(self.stk_dim, CFG.attn_heads,
-                                              dropout=0.1, batch_first=True)
+# ----------------------------------------------------------------------
+# 3B. 原 EGAT（保留以备切换）
+# ----------------------------------------------------------------------
+class EGATLayer(nn.Module):
+    def __init__(self, hidden):
+        super().__init__()
+        self.W   = nn.Linear(hidden, hidden, bias=False)
+        self.att = nn.Linear(hidden * 2 + 1, 1, bias=False)
+        self.leaky_relu = nn.LeakyReLU(0.1)
 
-        final_dim = self.stk_dim * 3
+    def forward(self, h, ind_id):  # h:[N,H]  ind_id:[N]
+        Wh = self.W(h)             # [N,H]
+        out = torch.zeros_like(Wh)
+        # 注意：该实现 O(∑M_i^2) 很慢，仅在 graph_type="gat" 时使用
+        for ind in ind_id.unique():
+            idx = (ind_id == ind).nonzero(as_tuple=True)[0]
+            if idx.numel() <= 1:
+                continue
+            Wh_sub = Wh[idx]       # [M,H]
+            M = len(idx)
+            Wh_i = Wh_sub.unsqueeze(1).expand(-1, M, -1)
+            Wh_j = Wh_sub.unsqueeze(0).expand(M, -1, -1)
+            e_ij = torch.ones(M, M, 1, device=h.device)
+            e = self.leaky_relu(self.att(torch.cat([Wh_i, Wh_j, e_ij], dim=-1))).squeeze(-1)  # [M,M]
+            alpha = torch.softmax(e, 1)
+            out[idx] = alpha @ Wh_sub
+        return out
+
+class DynamicGraphBlock(nn.Module):
+    def __init__(self, hidden=CFG.hidden, layers=CFG.gat_layers):
+        super().__init__()
+        self.layers = nn.ModuleList([EGATLayer(hidden) for _ in range(layers)])
+        self.norms  = nn.ModuleList([nn.LayerNorm(hidden) for _ in range(layers)])
+
+    def forward(self, h, ind_id):
+        for gat, norm in zip(self.layers, self.norms):
+            h = norm(gat(h, ind_id) + h)
+        return h
+
+# ----------------------------------------------------------------------
+# 4. FiLM
+# ----------------------------------------------------------------------
+class FiLM(nn.Module):
+    def __init__(self, ctx_dim, hidden):
+        super().__init__()
+        self.gamma = nn.Linear(ctx_dim, hidden)
+        self.beta  = nn.Linear(ctx_dim, hidden)
+    def forward(self, h, ctx):
+        return h * (1 + self.gamma(ctx)) + self.beta(ctx)
+
+# ----------------------------------------------------------------------
+# 5. 主模型
+# ----------------------------------------------------------------------
+class GCFNet(nn.Module):
+    def __init__(
+        self,
+        d_in: int,
+        n_ind: int,                 # 已知行业类别数（不含未知）
+        ctx_dim: int = CFG.ctx_dim,
+        hidden: int = CFG.hidden,
+        ind_emb_dim: int = CFG.ind_emb,
+        graph_type: str = CFG.graph_type,
+        tr_layers: int = CFG.tr_layers,
+        gat_layers: int = CFG.gat_layers
+    ):
+        super().__init__()
+        self.daily_enc = DailyEncoder(d_in, hidden, tr_layers=tr_layers)
+
+        self.n_ind_total = n_ind + 1
+        self.pad_index   = self.n_ind_total - 1
+        self.ind_emb  = nn.Embedding(self.n_ind_total, ind_emb_dim, padding_idx=self.pad_index)
+        self.ind_proj = nn.Linear(ind_emb_dim, hidden)
+
+        self.gate = nn.Linear(hidden * 2, 1)
+        self.film = FiLM(ctx_dim, hidden)
+
+        self.graph_type = graph_type
+        if graph_type == "gat":
+            self.graph_blk = DynamicGraphBlock(hidden, layers=gat_layers)
+        else:
+            self.graph_blk = IndustryMeanBlock(hidden, layers=gat_layers)
+
         self.head = nn.Sequential(
-            nn.LayerNorm(final_dim),
-            nn.Linear(final_dim, 256),
-            nn.SiLU(),
-            nn.Dropout(0.2),
-            nn.Linear(256, 64),
-            nn.SiLU(),
-            nn.Dropout(0.1),
+            nn.LayerNorm(hidden * 3),
+            nn.Linear(hidden * 3, 192), nn.SiLU(), nn.Dropout(0.2),
+            nn.Linear(192, 64), nn.SiLU(), nn.Dropout(0.1),
             nn.Linear(64, 1)
         )
 
-    # ---------- Encode ----------
-    def encode(self, daily, minute, ind_id, sec_id):
-        h_d   = self.daily_enc(daily)               # [B, H]
-        h_m   = self.minute_enc(minute)             # [B, H]
+    def forward(self, daily_feat: torch.Tensor, ind_id: torch.Tensor, ctx_feat: torch.Tensor) -> torch.Tensor:
+        h_d   = self.daily_enc(daily_feat)             # [N,H]
+        h_ind = self.ind_proj(self.ind_emb(ind_id))    # [N,H]
 
-        gate   = torch.sigmoid(self.gate(torch.cat([h_d, h_m], -1)))
-        h_prc  = gate * h_d + (1. - gate) * h_m     # [B, H]
+        g = torch.sigmoid(self.gate(torch.cat([h_d, h_ind], -1))).squeeze(-1)
+        h_price = g.unsqueeze(-1) * h_d + (1 - g.unsqueeze(-1)) * h_ind
 
-        h_ind = self.ind_emb(ind_id)                # [B, 32]
-        h_sec = self.sec_emb(sec_id)                # [B, 32]
+        h_ctx   = self.film(h_price, ctx_feat)         # [N,H]
+        h_graph = self.graph_blk(h_ctx, ind_id)        # [N,H]
 
-        stk = torch.cat([h_prc, h_ind, h_sec], -1)  # [B, D]
-        return self.ln_in(stk)
-
-    # ---------- Interact ----------
-    def interact_and_head(self, stk_repr):
-        B = stk_repr.size(0)
-        stk_seq = stk_repr.unsqueeze(0)             # [1, B, D]
-
-        # R: cls_token → stocks
-        R, _ = self.attn_r2s(self.cls_token, stk_seq, stk_seq)
-
-        # Stocks → R (cross)
-        cross, _ = self.attn_s2r(stk_seq, R, R)
-
-        stk_seq  = stk_seq.squeeze(0)               # [B, D]
-        R_expand = R.squeeze(0).repeat(B, 1)        # [B, D]
-        cross    = cross.squeeze(0)                 # [B, D]
-
-        final = torch.cat([stk_seq, R_expand, cross], -1)
-        return self.head(final).squeeze(-1)
-
-    # ---------- forward ----------
-    def forward(self, daily, minute, ind_id, sec_id):
-        stk = self.encode(daily, minute, ind_id, sec_id)
-        return self.interact_and_head(stk)
+        out = torch.cat([h_price, h_ctx, h_graph], -1) # [N,3H]
+        return self.head(out).squeeze(-1)              # [N]

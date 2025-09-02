@@ -1,140 +1,118 @@
 # coding: utf-8
 """
-PyTorch Dataset：时序特征 + 行业 id + 板块 id
+多源特征数据集（仅日频因子 + 市场/风格上下文 + 行业 ID）
 """
-import h5py, pickle, numpy as np, pandas as pd, torch
+import h5py, torch, numpy as np, pandas as pd
 from torch.utils.data import Dataset
 from pathlib import Path
-
-from utils import mad_clip, load_universe
 from config import CFG
+from utils import pkl_load
 
 
-class StockDataset(Dataset):
-    def __init__(self,
-                 features_path: Path,
-                 label_path: Path,
-                 scaler_path: Path,
-                 universe_path: Path):
+class MultiFeatureDataset(Dataset):
+    """
+    单个采样日期 = HDF5 中一个 group（形如 date_0 / date_1 ...）
+    每条样本 = (日频因子序列, 行业 id, 上下文向量, 周度收益标签)
+    """
+    def __init__(
+        self,
+        daily_h5: Path,                 # features_daily.h5
+        ctx_file: Path,                 # context_features.parquet
+        label_df: pd.DataFrame,         # MultiIndex (date, stock) -> next_week_return
+        scaler_daily,                   # utils.Scaler
+        industry_map: dict,             # {stock: industry_id}
+        date_indices                    # 需要读取的 group 名列表，例如 ["date_0", "date_1"]
+    ):
+        super().__init__()
+        self.h5 = h5py.File(daily_h5, "r")
+        self.scaler = scaler_daily
+        self.lbl = label_df
+        self.ind_map = industry_map
 
-        # ---------- 标签 ----------
-        self.labels = pd.read_parquet(label_path)
+        # 读取上下文特征 DataFrame（index = 周五日期）
+        self.ctx_df = pd.read_parquet(ctx_file)
+        self.ctx_dim = self.ctx_df.shape[1]
 
-        # ---------- 标准化器 ----------
-        with open(scaler_path, "rb") as f:
-            scalers = pickle.load(f)
-            self.daily_scaler = scalers["daily"]
-            self.min30_scaler = scalers["min30"]
+        self.factor_cols = self.h5.attrs["factor_cols"].astype(str)
 
-        # ---------- 行业 / 板块映射 ----------
-        self._build_mappings()
+        # ------- 构造索引 ------- #
+        # 每个元素: (group_key, row_id, date, stock)
+        self.idx = []
+        for gk in date_indices:
+            if gk not in self.h5:
+                continue
+            g = self.h5[gk]
+            date = pd.Timestamp(g.attrs["date"])
+            stocks = g["stocks"][:].astype(str)
 
-        # ---------- 股票池 ----------
-        self.universe = load_universe(universe_path)
+            for i, stk in enumerate(stocks):
+                if (date, stk) in self.lbl.index:
+                    self.idx.append((gk, i, date, stk))
 
-        # ---------- 样本索引 ----------
-        self.features_path = features_path
-        self._build_index()
+        if len(self.idx) == 0:
+            raise RuntimeError("当前日期窗口未匹配到任何标签样本")
 
-    # ------------------------------------------------------------------
-    def _build_mappings(self):
-        # 行业
-        if not CFG.industry_map_file.exists():
-            self.ind2id, self.stk2ind = {"未知": 0}, {}
-        else:
-            ind_df = pd.read_csv(CFG.industry_map_file).dropna(subset=['industry'])
-            ind_vals = sorted(ind_df["industry"].astype(str).unique())
-            self.ind2id = {v: i for i, v in enumerate(ind_vals)}
-            self.ind2id.setdefault("未知", len(self.ind2id))
-            self.stk2ind = ind_df.set_index("stock")["industry"].astype(str).to_dict()
-        self.num_industries = len(self.ind2id)
-
-        # 板块
-        if not CFG.sector_map_file.exists():
-            self.sec2id, self.stk2sec = {"未知": 0}, {}
-        else:
-            sec_df = pd.read_csv(CFG.sector_map_file).dropna(subset=['sector'])
-            sec_vals = sorted(sec_df["sector"].astype(str).unique())
-            self.sec2id = {v: i for i, v in enumerate(sec_vals)}
-            self.sec2id.setdefault("未知", len(self.sec2id))
-            self.stk2sec = sec_df.set_index("stock")["sector"].astype(str).to_dict()
-        self.num_sectors = len(self.sec2id)
-
-    # ------------------------------------------------------------------
-    def _build_index(self):
-        """遍历 h5 构建样本索引"""
-        self.idxs = []
-        with h5py.File(self.features_path, "r") as h5f:
-            for g_key in h5f.keys():
-                date = pd.Timestamp(h5f[g_key].attrs["date"])
-                stocks = h5f[g_key]["stocks"][:].astype(str).tolist()
-                for idx, stk in enumerate(stocks):
-                    if (date, stk) in self.labels.index:
-                        self.idxs.append(dict(g_key=g_key,
-                                              date=date,
-                                              idx=idx,
-                                              stock=stk))
-
-    # ------------------------------------------------------------------
+    # -------------------- Dataset API -------------------- #
     def __len__(self):
-        return len(self.idxs)
+        return len(self.idx)
 
-    # ------------------------------------------------------------------
-    def __getitem__(self, i: int):
-        meta = self.idxs[i]
+    def __getitem__(self, i):
+        gk, row, date, stk = self.idx[i]
 
-        # -------- 读取特征 --------
-        with h5py.File(self.features_path, "r") as h5f:
-            grp = h5f[meta["g_key"]]
-            daily_arr = grp["daily"][meta["idx"]]   # [Td,6]
-            min30_arr = grp["min30"][meta["idx"]]   # [Tm,6]
+        # 日频因子 [T, C] -> 标准化
+        feat = self.h5[gk]["factor"][row]          # 期望是 numpy [T,C]
+        # 防御性处理：去掉多余的维度（如 [T,1,C] 或 [T,C,1]）
+        feat = np.asarray(feat)
+        # --------- 统一去掉所有 size==1 的维度 ---------
+        feat = np.squeeze(feat)                    # 得到 (T,C)
 
-        # -------- 预处理 --------
-        daily_arr  = self._process_modality(daily_arr,  self.daily_scaler)
-        min30_arr  = self._process_modality(min30_arr,  self.min30_scaler)
+        feat = self.scaler.transform(feat)         # 标准化仍为 [T, C]
+        feat = np.squeeze(feat)  
+        if feat.ndim != 2:
+            raise RuntimeError(f"factor shape 期望 [T,C]，当前 {feat.shape}")
 
-        # -------- 行业/板块 id --------
-        ind = self.stk2ind.get(meta["stock"], "未知")
-        sec = self.stk2sec.get(meta["stock"], "未知")
-        ind_id = self.ind2id.get(ind, self.ind2id["未知"])
-        sec_id = self.sec2id.get(sec, self.sec2id["未知"])
+        # 行业 id（未知置为 padding_id = n_ind）
+        ind_id = self.ind_map.get(stk, self.pad_ind_id)
 
-        # -------- 标签 --------
-        label = self.labels.loc[(meta["date"], meta["stock"]), "next_week_return"]
+        # 上下文向量（同一日期全股票一致；无则 0）
+        if date in self.ctx_df.index:
+            ctx_vec = self.ctx_df.loc[date].values.astype(np.float32)
+        else:
+            ctx_vec = np.zeros(self.ctx_dim, dtype=np.float32)
 
-        date_int = int(meta["date"].strftime('%Y%m%d'))
+        # 标签
+        y = self.lbl.loc[(date, stk), "next_week_return"]
 
-        return dict(
-            daily=torch.tensor(daily_arr, dtype=torch.float32),
-            min30=torch.tensor(min30_arr, dtype=torch.float32),
-            ind_id=torch.tensor(ind_id, dtype=torch.long),
-            sec_id=torch.tensor(sec_id, dtype=torch.long),
-            label=torch.tensor(label, dtype=torch.float32),
-            date=torch.tensor(date_int, dtype=torch.int32)
+        return (
+            torch.tensor(feat, dtype=torch.float32),          # [T,C]
+            torch.tensor(ind_id, dtype=torch.long),           # []
+            torch.tensor(ctx_vec, dtype=torch.float32),       # [C_ctx]
+            torch.tensor(y, dtype=torch.float32)              # []
         )
+    # --------- 行业类别数 / padding id --------- #
+    @property
+    def n_ind(self):
+        if not hasattr(self, "_n_ind"):
+            inds = set(self.ind_map.values())
+            self._n_ind = max(inds) + 1
+        return self._n_ind
 
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _process_modality(arr: np.ndarray, scaler):
-        """
-        MAD 去极值 + Scaler + NaN/Inf → 0
-        """
-        if np.isnan(arr).all():
-            return np.zeros_like(arr, dtype=np.float32)
-
-        arr = mad_clip(arr)
-        arr = scaler.transform(arr[None])[0]
-        arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-        return arr.astype(np.float32)
+    @property
+    def pad_ind_id(self):
+        return self.n_ind   # 未知行业放最后一类
 
 
-# ---------------- collate_fn ----------------
-def collate_fn(batch):
-    return dict(
-        daily=torch.stack([b["daily"] for b in batch]),
-        min30=torch.stack([b["min30"] for b in batch]),
-        ind_id=torch.stack([b["ind_id"] for b in batch]),
-        sec_id=torch.stack([b["sec_id"] for b in batch]),
-        label=torch.stack([b["label"] for b in batch]),
-        date=torch.stack([b["date"] for b in batch])
-    )
+# ---------------- Mini-batch 组装 ---------------- #
+def collate(batch):
+    """
+    输出:
+        daily_feat : [B,T,C]
+        ind_id     : [B]
+        ctx_feat   : [B,C_ctx]
+        y          : [B]
+    """
+    daily_feat = torch.stack([b[0] for b in batch])
+    ind_id     = torch.stack([b[1] for b in batch])
+    ctx_feat   = torch.stack([b[2] for b in batch])
+    y          = torch.stack([b[3] for b in batch])
+    return daily_feat, ind_id, ctx_feat, y

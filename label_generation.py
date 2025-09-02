@@ -7,7 +7,7 @@ import numpy as np
 from pathlib import Path
 from tqdm import tqdm
 from config import CFG
-from utils import load_trading_calendar, week_last_trading_days
+from utils import load_calendar, weekly_fridays
 
 
 def generate_weekly_labels(
@@ -117,17 +117,17 @@ def main():
     """主函数 - 生成并保存标签"""
     # 加载数据
     print("加载日频价格数据...")
-    daily_df = pd.read_parquet(CFG.price_daily_file)
+    daily_df = pd.read_parquet(CFG.price_day_file)
 
     print(f"价格数据形状: {daily_df.shape}")
     print(f"价格数据索引级别: {daily_df.index.names}")
 
     # 加载交易日历
-    calendar = load_trading_calendar(CFG.trading_day_file)
+    calendar = load_calendar(CFG.trading_day_file)
     print(f"交易日历范围: {calendar.min()} 到 {calendar.max()}")
 
     # 获取每周最后交易日
-    sample_dates = week_last_trading_days(calendar)
+    sample_dates = weekly_fridays(calendar)
     print(f"采样日期数量: {len(sample_dates)}")
 
     # 生成并保存标签
