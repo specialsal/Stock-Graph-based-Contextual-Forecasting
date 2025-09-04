@@ -1,10 +1,14 @@
 # coding: utf-8
 """
-高速版: 生成 features_daily.h5 + scaler.pkl
+高速版: 生成 features_daily.h5
 提速要点:
 1) 对每只股票一次性计算全量特征 -> 缓存
 2) 采样日仅做索引切片 + 拼接 + 一次性 mad_clip
 3) 线程并行计算(可切换进程)
+
+重要变更：
+- 不再在此阶段拟合/保存全局 Scaler，避免后续训练误用导致未来信息泄漏。
+- 滚动训练阶段将针对每个训练窗口仅用训练分组拟合当期 Scaler。
 """
 import numpy as np
 import pandas as pd
@@ -15,8 +19,7 @@ from typing import List, Tuple, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 # 如需更强并行, 可改为: from concurrent.futures import ProcessPoolExecutor as PoolExec
 from config import CFG
-from utils import mad_clip, Scaler, weekly_fridays, load_calendar
-from utils import pkl_dump
+from utils import mad_clip, weekly_fridays, load_calendar
 
 EPS = 1e-12
 
@@ -58,8 +61,6 @@ def _corr(a: pd.Series, b: pd.Series, win: int) -> pd.Series: return a.rolling(w
 def _zscore(s: pd.Series, win: int) -> pd.Series:
     m = _mean_rolling(s, win); sd = _std_rolling(s, win)
     return (s - m) / (sd + EPS)
-def _shifted_corr(a: pd.Series, b: pd.Series, win: int, lag: int) -> pd.Series:
-    return _corr(a, b.shift(-lag), win)
 
 def calc_factors_one_stock_full(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -173,7 +174,6 @@ def calc_factors_one_stock_full(df: pd.DataFrame) -> pd.DataFrame:
         roll_max = _max_rolling(C, n); roll_min = _min_rolling(C, n)
         out[f'price_pos_{n}'] = (C - roll_min) / (roll_max - roll_min + EPS)
 
-    out['vol_ret_corr20_lead1'] = _shifted_corr(V.pct_change(), ret, 20, lag=1)
     out['vol_ret_corr20_lag1']  = _corr(V.pct_change(), ret.shift(1), 20)
 
     out = out.replace([np.inf, -np.inf], np.nan)
@@ -193,32 +193,6 @@ def _compute_one(stock: str, df_all: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
         return stock, fct
     except Exception:
         return stock, pd.DataFrame()
-
-def fit_scaler_h5(h5_path: Path) -> Scaler:
-    scaler = Scaler()
-    n_seen = 0
-    mean_acc = None
-    m2_acc = None
-
-    with h5py.File(h5_path, "r") as h5f:
-        keys = list(h5f.keys())
-        for k in tqdm(keys, desc="拟合 Scaler (增量)"):
-            if "factor" not in h5f[k]:
-                continue
-            arr = h5f[k]["factor"][:]       # [N,T,C]
-            arr = arr.reshape(-1, arr.shape[-1])   # 合并 batch & time → [N*T, C]
-            if mean_acc is None:
-                mean_acc = np.nansum(arr, 0)
-                m2_acc   = np.nansum(arr**2, 0)
-            else:
-                mean_acc += np.nansum(arr, 0)
-                m2_acc   += np.nansum(arr**2, 0)
-            n_seen += arr.shape[0]
-
-    scaler.mean = (mean_acc / n_seen).reshape(1, 1, -1)
-    var = (m2_acc / n_seen) - np.square(scaler.mean.squeeze())
-    scaler.std = (np.sqrt(var) + 1e-6).reshape(1, 1, -1)
-    return scaler
 
 def main():
     # 1) 读取日频数据
@@ -300,14 +274,8 @@ def main():
                     chunks=(chunk0, T, C)
                 )
 
-    # 6) 拟合 scaler（所有日期合并）
-    # 调用
-    scaler = fit_scaler_h5(CFG.feat_file)
-    pkl_dump(scaler, CFG.scaler_file)
-    print("Scaler 拟合完成！")
+    print("features_daily.h5 生成完成。")
+    print("注意：滚动训练将按窗口拟合标准化参数（仅用训练期），避免未来信息。")
 
 if __name__ == "__main__":
     main()
-    # scaler = fit_scaler_h5(CFG.feat_file)
-    # pkl_dump(scaler, CFG.scaler_file)
-    # print("Scaler 拟合完成！")
