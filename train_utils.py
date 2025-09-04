@@ -15,6 +15,64 @@ from pathlib import Path
 from typing import Iterable, Optional, Tuple, List, Dict
 from config import CFG
 from utils import Scaler, rank_ic
+from typing import Any
+# ================= RAM 模式（窗口级一次性加载并常驻） =================
+def load_window_to_ram(
+    h5: h5py.File,
+    group_keys: List[str],
+    label_df: pd.DataFrame,
+    ctx_df: pd.DataFrame,
+    scaler_d: Scaler,
+    ind_map: dict,
+    pad_ind_id: int,
+    filter_fn=None
+) -> Tuple[List[Dict[str, Any]], float]:
+    """
+    将一个窗口的所有 group 一次性加载到内存，返回：
+    - items: 每个元素为 {date, X, ind, ctx, y}
+    - total_gb: 估算总内存占用（GB）
+    """
+    items: List[Dict[str, Any]] = []
+    total_bytes = 0
+    skipped = 0
+    for gk in group_keys:
+        out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
+        if out is None:
+            skipped += 1
+            continue
+        X, ind, ctx, y, date = out
+        items.append({"date": date, "X": X, "ind": ind, "ctx": ctx, "y": y})
+        total_bytes += X.nbytes + ind.nbytes + ctx.nbytes + y.nbytes
+    total_gb = total_bytes / 1e9
+    print(f"[RAM预载] 已加载 {len(items)} 个 group 到内存，约 {total_gb:.2f} GB（跳过空组 {skipped}）")
+    return items, total_gb
+
+def iterate_ram_minibatches(mem_items: List[Dict[str, Any]], batch_size: int, shuffle: bool = True):
+    """
+    仅使用常驻内存的数据进行训练迭代：先打乱 group，再 group 内打乱切 batch。
+    """
+    if not mem_items:
+        return
+    order = np.arange(len(mem_items))
+    if shuffle:
+        np.random.shuffle(order)
+    for idx in order:
+        it = mem_items[idx]
+        X, ind, ctx, y = it["X"], it["ind"], it["ctx"], it["y"]
+        M = X.shape[0]
+        idxs = np.arange(M)
+        if shuffle:
+            np.random.shuffle(idxs)
+        for st in range(0, M, batch_size):
+            sel = idxs[st: st+batch_size]
+            xb = torch.from_numpy(X[sel])
+            ib = torch.from_numpy(ind[sel])
+            cb = torch.from_numpy(ctx[sel])
+            yb = torch.from_numpy(y[sel])
+            if HAS_CUDA:
+                xb = xb.pin_memory(); ib = ib.pin_memory()
+                cb = cb.pin_memory(); yb = yb.pin_memory()
+            yield xb, ib, cb, yb
 
 # --------------------------- 基础环境/优化器 --------------------------- #
 HAS_CUDA = (torch.cuda.is_available() and CFG.device.type == "cuda")

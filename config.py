@@ -34,6 +34,10 @@ class Config:
     is_suspended_file   = raw_dir / "is_suspended.csv"
     is_st_file          = raw_dir / "is_st_stock.csv"
 
+    # -------- RAM 加速（窗口级一次性常驻内存）--------
+    ram_accel_enable    = True     # 默认关闭；内存大的机器可手动改为 True
+    ram_accel_mem_cap_gb= 24        # RAM 加速单窗口的内存上限（GB）；超过将自动回退为逐组加载
+
     # -------- 股票筛选（可选） --------
     enable_filters      = True       # 是否启用筛选（关闭则与旧逻辑一致）
     ipo_cut_days        = 120        # 新股上市满多少天才纳入（自然日）
@@ -43,7 +47,7 @@ class Config:
     allow_missing_info  = False      # 缺少基础信息的股票是否保留（默认丢弃）
 
     # -------- 特征窗口 --------
-    daily_window = 20
+    daily_window = 20  # 日频特征的时间窗口大小
 
     # -------- 滚动窗参数 --------
     train_years = 5
@@ -53,30 +57,30 @@ class Config:
     end_date    = "2025-08-26"
 
     # -------- 模型超参 --------
-    hidden        = 64
-    ind_emb       = 16
-    ctx_dim       = 21
-    tr_layers     = 1
-    gat_layers    = 1
-    graph_type    = "gat"        # "mean" 或 "gat"
-    topk_per_ind  = 16
-    lr            = 3e-4
-    weight_decay  = 1e-2
-    epochs_warm   = 10
+    hidden        = 64  # 隐藏层维度
+    ind_emb       = 16  # 行业嵌入维度
+    ctx_dim       = 21  # 上下文特征维度
+    tr_layers     = 1   # Transformer 层数
+    gat_layers    = 1  # GAT 层数
+    graph_type    = "gat"        # 图模块类型"mean" 或 "gat"
+    topk_per_ind  = 16  # 每个行业选取的TopK股票数量
+    lr            = 3e-4    # 学习率
+    weight_decay  = 1e-2    # 权重衰减
+    epochs_warm   = 10  # 每个窗口训练轮数
 
     # -------- 训练细节 --------
     batch_size        = 3500
-    grad_accum_steps  = 4
+    grad_accum_steps  = 4 # 梯度累积步数
     device            = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_workers       = 8
-    prefetch_factor   = 4
-    persistent_workers= True
-    pin_memory        = True
-    use_amp           = True
+    num_workers       = 8   # 数据加载进程数
+    prefetch_factor   = 4   # 每个进程预取批次数
+    persistent_workers= True    # 是否保持数据加载进程常驻
+    pin_memory        = True    # 是否固定内存（加速GPU传输）
+    use_amp           = True    # 是否启用混合精度训练
     amp_dtype         = "bf16"           # "bf16" 或 "fp16"
-    use_tf32          = True
-    use_torch_compile = False
-    print_step_interval = 10
+    use_tf32          = True    # 是否启用TF32精度
+    use_torch_compile = False   # 是否启用TorchCompile加速
+    print_step_interval = 10    # 每多少步打印一次日志
 
     # -------- 选择与记录 --------
     select_metric   = "rankic"  # 基于验证集平均 RankIC 选择

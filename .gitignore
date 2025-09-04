@@ -113,3 +113,4 @@ data/processed/models_gat_15/model_best_20230324.pth
 data/processed/models_gat_15/model_best_20240403.pth
 data/processed/models_gat_15/model_best_20250403.pth
 data/processed/models_gat_15/model_registry.csv
+__pycache__/train_utils.cpython-310.pyc

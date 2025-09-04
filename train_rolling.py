@@ -13,6 +13,8 @@
   * ic_r（RankIC）
 - 评估阶段按周五分组计算 MSE / Pearson / RankIC 及 RankIC 的标准差，并输出 pairwise ranking loss 与加权 loss
 - 按验证集指标选择 best 模型，登记全局与最近N窗口最优并复制到固定路径
+- 新增：RAM 常驻加速路径（窗口级一次性加载 Train/Val 到内存，epoch 内零 IO），由 CFG.ram_accel_enable 控制；
+       若估算内存超过 CFG.ram_accel_mem_cap_gb 则自动回退为逐组加载
 """
 
 import math, torch, pandas as pd, numpy as np, h5py, shutil
@@ -28,7 +30,9 @@ from train_utils import (
     HAS_CUDA, setup_env, get_amp_dtype, try_fused_adamw, ensure_parent_dir,
     make_filter_fn, load_stock_info, load_flag_table,
     fit_scaler_for_groups, iterate_group_minibatches, load_group_to_memory,
-    pairwise_ranking_loss, pearsonr
+    pairwise_ranking_loss, pearsonr,
+    # RAM 模式
+    load_window_to_ram, iterate_ram_minibatches
 )
 
 # --------------------------- 辅助：保存模型 --------------------------- #
@@ -124,6 +128,27 @@ def main():
             select_metric = getattr(CFG, "select_metric", "rankic")
             w_loss = float(getattr(CFG, "ranking_weight", 0.5))
 
+            # RAM 分支：根据配置决定是否一次性将 Train/Val 载入内存
+            use_ram = bool(getattr(CFG, "ram_accel_enable", False))
+            mem_items_train = None
+            mem_items_val = None
+            if use_ram:
+                mem_items_train, gb_train = load_window_to_ram(
+                    h5, train_gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn
+                )
+                mem_items_val, gb_val = load_window_to_ram(
+                    h5, val_gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn
+                )
+                total_gb = gb_train + gb_val
+                cap_gb = float(getattr(CFG, "ram_accel_mem_cap_gb", 48))
+                if total_gb > cap_gb:
+                    print(f"[RAM预载] 估算内存 {total_gb:.2f} GB 超过上限 {cap_gb:.2f} GB，回退为逐组加载模式")
+                    use_ram = False
+                    mem_items_train = None
+                    mem_items_val = None
+                else:
+                    print(f"[RAM预载] 启用 RAM 模式，总内存估算 {total_gb:.2f} GB（<= {cap_gb:.2f} GB）")
+
             # 训练多个 epoch，保存 best
             best_metric = -1e9
             best_epoch  = -1
@@ -138,13 +163,18 @@ def main():
                 opt.zero_grad(set_to_none=True)
                 step = 0
 
-                pbar = tqdm(
-                    iterate_group_minibatches(
-                        h5, train_gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id,
-                        batch_size=CFG.batch_size, shuffle=True, filter_fn=filter_fn
-                    ),
-                    total=None, leave=False, desc="train-fast"
-                )
+                # 数据迭代器：RAM 常驻或逐组加载
+                if use_ram:
+                    data_iter = iterate_ram_minibatches(mem_items_train, CFG.batch_size, shuffle=True)
+                    pbar = tqdm(data_iter, total=None, leave=False, desc="train-fast[RAM]")
+                else:
+                    pbar = tqdm(
+                        iterate_group_minibatches(
+                            h5, train_gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id,
+                            batch_size=CFG.batch_size, shuffle=True, filter_fn=filter_fn
+                        ),
+                        total=None, leave=False, desc="train-fast"
+                    )
 
                 # autocast 上下文（在 amp_dtype 不为 None 且启用 CUDA 时启用）
                 autocast_ctx = torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(amp_dtype is not None)) \
@@ -215,43 +245,68 @@ def main():
                 # ---------------- 验证（按组聚合） ---------------- #
                 model.eval()
                 per_date = []
-                for gk in val_gk:
-                    out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
-                    if out is None:
-                        continue
-                    # 转张量并送设备
-                    X, ind_t, ctx_t, y_t = [torch.from_numpy(o) for o in out[:4]]
-                    X = X.to(CFG.device, non_blocking=HAS_CUDA)
-                    ind_t = ind_t.to(CFG.device, non_blocking=HAS_CUDA)
-                    ctx_t = ctx_t.to(CFG.device, non_blocking=HAS_CUDA)
-                    y_t  = y_t.to(CFG.device, non_blocking=HAS_CUDA)
+                if use_ram:
+                    # RAM 模式：使用内存中的 val items
+                    for it in mem_items_val:
+                        X = torch.from_numpy(it["X"]).to(CFG.device, non_blocking=HAS_CUDA)
+                        ind_t = torch.from_numpy(it["ind"]).to(CFG.device, non_blocking=HAS_CUDA)
+                        ctx_t = torch.from_numpy(it["ctx"]).to(CFG.device, non_blocking=HAS_CUDA)
+                        y_t  = torch.from_numpy(it["y"]).to(CFG.device, non_blocking=HAS_CUDA)
 
-                    # 分批预测避免显存峰值
-                    preds = []
-                    bs = CFG.batch_size
-                    for st in range(0, X.shape[0], bs):
-                        p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
-                        preds.append(p.detach().float().cpu())
-                    pred_cpu = torch.cat(preds, 0)
-                    y_cpu = y_t.detach().float().cpu()
+                        preds = []
+                        bs = CFG.batch_size
+                        for st in range(0, X.shape[0], bs):
+                            p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
+                            preds.append(p.detach().float().cpu())
+                        pred_cpu = torch.cat(preds, 0)
+                        y_cpu = y_t.detach().float().cpu()
 
-                    mse  = F.mse_loss(pred_cpu, y_cpu).item()
-                    cc_t = pearsonr(pred_cpu, y_cpu)
-                    cc   = float(cc_t.item()) if not torch.isnan(cc_t) else float("nan")
-                    ric  = rank_ic(pred_cpu, y_cpu)
-                    # 验证集也计算 pairwise ranking loss（与训练一致的 num_pairs）
-                    prl_t = pairwise_ranking_loss(pred_cpu, y_cpu, num_pairs=2048)
-                    prl   = float(prl_t.item())
-                    # 使用与训练相同的加权公式计算验证 loss
-                    if not math.isnan(cc):
-                        loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
-                    else:
-                        # 若 Pearson 不可计算，回退到 MSE 部分（与训练中回退策略保持近似一致）
-                        loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
-                    per_date.append({
-                        "mse": mse, "ic_pearson": cc, "ic_rank": ric,
-                        "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)
-                    })
+                        mse  = F.mse_loss(pred_cpu, y_cpu).item()
+                        cc_t = pearsonr(pred_cpu, y_cpu)
+                        cc   = float(cc_t.item()) if not torch.isnan(cc_t) else float("nan")
+                        ric  = rank_ic(pred_cpu, y_cpu)
+                        prl  = float(pairwise_ranking_loss(pred_cpu, y_cpu, num_pairs=2048).item())
+                        if not math.isnan(cc):
+                            loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
+                        else:
+                            loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
+                        per_date.append({
+                            "mse": mse, "ic_pearson": cc, "ic_rank": ric,
+                            "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)
+                        })
+                else:
+                    # 原逐组加载
+                    for gk in val_gk:
+                        out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
+                        if out is None:
+                            continue
+                        X, ind_t, ctx_t, y_t = [torch.from_numpy(o) for o in out[:4]]
+                        X = X.to(CFG.device, non_blocking=HAS_CUDA)
+                        ind_t = ind_t.to(CFG.device, non_blocking=HAS_CUDA)
+                        ctx_t = ctx_t.to(CFG.device, non_blocking=HAS_CUDA)
+                        y_t  = y_t.to(CFG.device, non_blocking=HAS_CUDA)
+
+                        preds = []
+                        bs = CFG.batch_size
+                        for st in range(0, X.shape[0], bs):
+                            p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
+                            preds.append(p.detach().float().cpu())
+                        pred_cpu = torch.cat(preds, 0)
+                        y_cpu = y_t.detach().float().cpu()
+
+                        mse  = F.mse_loss(pred_cpu, y_cpu).item()
+                        cc_t = pearsonr(pred_cpu, y_cpu)
+                        cc   = float(cc_t.item()) if not torch.isnan(cc_t) else float("nan")
+                        ric  = rank_ic(pred_cpu, y_cpu)
+                        prl  = float(pairwise_ranking_loss(pred_cpu, y_cpu, num_pairs=2048).item())
+                        if not math.isnan(cc):
+                            loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
+                        else:
+                            loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
+                        per_date.append({
+                            "mse": mse, "ic_pearson": cc, "ic_rank": ric,
+                            "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)
+                        })
 
                 if len(per_date) == 0:
                     valm = {"avg_mse": float("nan"), "avg_ic_pearson": float("nan"),
@@ -299,32 +354,57 @@ def main():
 
             model.eval()
             per_date = []
-            for gk in val_gk:
-                out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
-                if out is None: continue
-                X, ind_t, ctx_t, y_t = [torch.from_numpy(o) for o in out[:4]]
-                X = X.to(CFG.device, non_blocking=HAS_CUDA)
-                ind_t = ind_t.to(CFG.device, non_blocking=HAS_CUDA)
-                ctx_t = ctx_t.to(CFG.device, non_blocking=HAS_CUDA)
-                y_t  = y_t.to(CFG.device, non_blocking=HAS_CUDA)
-                preds = []
-                bs = CFG.batch_size
-                for st in range(0, X.shape[0], bs):
-                    p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
-                    preds.append(p.detach().float().cpu())
-                pred_cpu = torch.cat(preds, 0)
-                y_cpu = y_t.detach().float().cpu()
-                mse  = F.mse_loss(pred_cpu, y_cpu).item()
-                cc_t = pearsonr(pred_cpu, y_cpu)
-                cc   = float(cc_t.item()) if not torch.isnan(cc_t) else float("nan")
-                ric  = rank_ic(pred_cpu, y_cpu)
-                prl  = float(pairwise_ranking_loss(pred_cpu, y_cpu, num_pairs=2048).item())
-                if not math.isnan(cc):
-                    loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
-                else:
-                    loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
-                per_date.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
-                                 "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
+            if use_ram:
+                for it in mem_items_val:
+                    X = torch.from_numpy(it["X"]).to(CFG.device, non_blocking=HAS_CUDA)
+                    ind_t = torch.from_numpy(it["ind"]).to(CFG.device, non_blocking=HAS_CUDA)
+                    ctx_t = torch.from_numpy(it["ctx"]).to(CFG.device, non_blocking=HAS_CUDA)
+                    y_t  = torch.from_numpy(it["y"]).to(CFG.device, non_blocking=HAS_CUDA)
+                    preds = []
+                    bs = CFG.batch_size
+                    for st in range(0, X.shape[0], bs):
+                        p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
+                        preds.append(p.detach().float().cpu())
+                    pred_cpu = torch.cat(preds, 0)
+                    y_cpu = y_t.detach().float().cpu()
+                    mse  = F.mse_loss(pred_cpu, y_cpu).item()
+                    cc_t = pearsonr(pred_cpu, y_cpu)
+                    cc   = float(cc_t.item()) if not torch.isnan(cc_t) else float("nan")
+                    ric  = rank_ic(pred_cpu, y_cpu)
+                    prl  = float(pairwise_ranking_loss(pred_cpu, y_cpu, num_pairs=2048).item())
+                    if not math.isnan(cc):
+                        loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
+                    else:
+                        loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
+                    per_date.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
+                                     "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
+            else:
+                for gk in val_gk:
+                    out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
+                    if out is None: continue
+                    X, ind_t, ctx_t, y_t = [torch.from_numpy(o) for o in out[:4]]
+                    X = X.to(CFG.device, non_blocking=HAS_CUDA)
+                    ind_t = ind_t.to(CFG.device, non_blocking=HAS_CUDA)
+                    ctx_t = ctx_t.to(CFG.device, non_blocking=HAS_CUDA)
+                    y_t  = y_t.to(CFG.device, non_blocking=HAS_CUDA)
+                    preds = []
+                    bs = CFG.batch_size
+                    for st in range(0, X.shape[0], bs):
+                        p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
+                        preds.append(p.detach().float().cpu())
+                    pred_cpu = torch.cat(preds, 0)
+                    y_cpu = y_t.detach().float().cpu()
+                    mse  = F.mse_loss(pred_cpu, y_cpu).item()
+                    cc_t = pearsonr(pred_cpu, y_cpu)
+                    cc   = float(cc_t.item()) if not torch.isnan(cc_t) else float("nan")
+                    ric  = rank_ic(pred_cpu, y_cpu)
+                    prl  = float(pairwise_ranking_loss(pred_cpu, y_cpu, num_pairs=2048).item())
+                    if not math.isnan(cc):
+                        loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
+                    else:
+                        loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
+                    per_date.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
+                                     "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
 
             if len(per_date) == 0:
                 final_val = {"avg_mse": float("nan"), "avg_ic_pearson": float("nan"),
