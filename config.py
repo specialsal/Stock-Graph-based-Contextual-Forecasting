@@ -10,6 +10,7 @@
 import torch, random, numpy as np
 from dataclasses import dataclass
 from pathlib import Path
+from datetime import datetime
 
 @dataclass
 class Config:
@@ -47,6 +48,7 @@ class Config:
     allow_missing_info  = False      # 缺少基础信息的股票是否保留（默认丢弃）
 
     # -------- 特征窗口 --------
+    max_lookback = 120  # 最大回溯天数（确保足够覆盖所有日频特征）在增量更新时使用
     daily_window = 20  # 日频特征的时间窗口大小
 
     # -------- 滚动窗参数 --------
@@ -54,7 +56,7 @@ class Config:
     val_weeks   = 52
     step_weeks  = 52
     start_date  = "2011-01-01"
-    end_date    = "2025-08-26"
+    end_date    = datetime.today().strftime("%Y-%m-%d")  # 默认到今天为止
 
     # -------- 模型超参 --------
     hidden        = 64  # 隐藏层维度

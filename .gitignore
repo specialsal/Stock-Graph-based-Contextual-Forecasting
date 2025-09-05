@@ -114,3 +114,8 @@ data/processed/models_gat_15/model_best_20240403.pth
 data/processed/models_gat_15/model_best_20250403.pth
 data/processed/models_gat_15/model_registry.csv
 __pycache__/train_utils.cpython-310.pyc
+data/raw/stock_list_jq.csv
+__pycache__/backtest_config.cpython-310.pyc
+__pycache__/train_utils.cpython-310.pyc
+data/raw/suspended_list.csv
+data/raw/trading_week.csv

@@ -1,28 +1,34 @@
 # coding: utf-8
 """
-高速版: 生成 features_daily.h5
-提速要点:
-1) 对每只股票一次性计算全量特征 -> 缓存
-2) 采样日仅做索引切片 + 拼接 + 一次性 mad_clip
-3) 线程并行计算(可切换进程)
+增量版: 生成/追加 features_daily.h5
 
-重要变更：
-- 不再在此阶段拟合/保存全局 Scaler，避免后续训练误用导致未来信息泄漏。
-- 滚动训练阶段将针对每个训练窗口仅用训练分组拟合当期 Scaler。
+提速策略：
+- 只对“缺失的周五采样日”进行追加；
+- 仅计算满足这些采样日所需的“局部历史片段”: [history_start, end_date]；
+- 线程并行对该片段内的每只股票计算全量因子（相对片段），采样时做窗口切片；
+- 一次性 mad_clip，避免重复标准化；不保存全局 Scaler。
+
+注意：
+- 需要 utils.read_h5_meta / list_missing_fridays / get_required_history_start / ensure_multiindex_price 等新工具函数。
+- 最长回溯窗口为 120（与当前因子定义一致）；若后续新增更长窗口，请同步更新 CFG.max_lookback。
 """
 import numpy as np
 import pandas as pd
 import h5py
 from tqdm import tqdm
 from pathlib import Path
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
-# 如需更强并行, 可改为: from concurrent.futures import ProcessPoolExecutor as PoolExec
+
 from config import CFG
-from utils import mad_clip, weekly_fridays, load_calendar
+from utils import (
+    mad_clip, weekly_fridays, load_calendar,
+    read_h5_meta, list_missing_fridays, get_required_history_start,
+    ensure_multiindex_price, SlidingWindowCache
+)
 
+# ===== 数值稳定工具 =====
 EPS = 1e-12
-
 def _safe_div(a, b): return a / (b.replace(0, np.nan) + EPS)
 def _ema(s: pd.Series, span: int) -> pd.Series: return s.ewm(span=span, adjust=False, min_periods=1).mean()
 def _std_rolling(s: pd.Series, win: int) -> pd.Series: return s.rolling(win, min_periods=1).std()
@@ -62,11 +68,8 @@ def _zscore(s: pd.Series, win: int) -> pd.Series:
     m = _mean_rolling(s, win); sd = _std_rolling(s, win)
     return (s - m) / (sd + EPS)
 
+# ===== 因子计算（与原版一致） =====
 def calc_factors_one_stock_full(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    输入: 单只股票全量日频数据(index=date)
-    输出: 与df.index对齐的特征DataFrame（全量，不截断）
-    """
     out = pd.DataFrame(index=df.index)
     O, H, L, C = df['open'], df['high'], df['low'], df['close']
     V, NT, TT = df['volume'], df['num_trades'], df['total_turnover']
@@ -179,13 +182,10 @@ def calc_factors_one_stock_full(df: pd.DataFrame) -> pd.DataFrame:
     out = out.replace([np.inf, -np.inf], np.nan)
     return out
 
+# ===== 并行包装 =====
 def _compute_one(stock: str, df_all: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
-    """
-    给线程/进程池用：对单只股票计算全量因子
-    """
     try:
         hist = df_all.loc[stock]
-        # 保证为 DataFrame
         if isinstance(hist, pd.Series):
             hist = hist.to_frame().T
         hist = hist.sort_index()
@@ -194,42 +194,70 @@ def _compute_one(stock: str, df_all: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
     except Exception:
         return stock, pd.DataFrame()
 
+def enforce_factor_cols_consistency(stock_feat: Dict[str, pd.DataFrame], existed_cols: Optional[List[str]]) -> List[str]:
+    if existed_cols is not None and len(existed_cols) > 0:
+        return list(existed_cols)
+    if len(stock_feat) == 0:
+        raise RuntimeError("无可用的股票因子用于推断列名。")
+    sample_stock = next(iter(stock_feat.keys()))
+    return stock_feat[sample_stock].columns.tolist()
+
+# ===== 主流程（增量 + 局部片段） =====
 def main():
-    # 1) 读取日频数据
-    day_df = pd.read_parquet(CFG.price_day_file)  # MultiIndex (order_book_id, date)
-    day_df = day_df.sort_index()
+    # 1) 读取最新的日频数据并规范索引
+    day_df = pd.read_parquet(CFG.price_day_file)
+    day_df = ensure_multiindex_price(day_df)
+
     stocks = day_df.index.get_level_values(0).unique().tolist()
 
-    # 2) 周五采样
-    calendar = load_calendar(CFG.trading_day_file)
-    fridays  = weekly_fridays(calendar)
-    fridays  = fridays[(fridays >= pd.Timestamp(CFG.start_date)) & (fridays <= pd.Timestamp(CFG.end_date))]
+    # 2) 已写入的 H5 元信息
+    h5_path = Path(CFG.feat_file)
+    next_idx, written_dates, existed_cols = read_h5_meta(h5_path)
 
-    # 3) 并行计算所有股票的“全量因子”
+    # 3) 缺失的周五
+    missing_fridays = list_missing_fridays(Path(CFG.trading_day_file), CFG.start_date, CFG.end_date, written_dates)
+    if len(missing_fridays) == 0:
+        print("没有新增的周五采样日需要写入，增量构建完成。")
+        return
+
+    # 4) 局部历史片段的起点
+    hist_start = get_required_history_start(missing_fridays, max_lookback=CFG.max_lookback)
+    hist_end = pd.Timestamp(CFG.end_date)
+    # 截取行情片段，仅用这一段计算全量因子
+    print(f"局部历史片段: {hist_start.date()} ~ {hist_end.date()},读取中...")
+    sliced = day_df[(day_df.index.get_level_values('datetime') >= hist_start) &
+                    (day_df.index.get_level_values('datetime') <= hist_end)]
+    print(f"读取局部行情片段: {sliced.index.get_level_values('datetime').min().date()} ~ {sliced.index.get_level_values('datetime').max().date()}, 股票数={sliced.index.get_level_values(0).nunique()}")
+    # 5) 并行计算“局部片段”的全量因子缓存
     stock_feat: Dict[str, pd.DataFrame] = {}
     with ThreadPoolExecutor(max_workers=CFG.num_workers) as ex:
-        futures = {ex.submit(_compute_one, s, day_df): s for s in stocks}
-        for fut in tqdm(as_completed(futures), total=len(futures), desc="并行计算全量因子"):
+        futures = {ex.submit(_compute_one, s, sliced): s for s in stocks if s in sliced.index.get_level_values(0)}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="并行计算因子(局部片段)"):
             s = futures[fut]
             stk, fct = fut.result()
             if not fct.empty:
                 stock_feat[stk] = fct
 
     if len(stock_feat) == 0:
-        raise RuntimeError("未能计算出任何股票的全量因子，请检查原始数据。")
+        print("局部片段内无可计算的股票因子，增量构建结束。")
+        return
 
-    # 4) 确定列名（与之前一致）
-    sample_stock = next(iter(stock_feat.keys()))
-    factor_cols  = stock_feat[sample_stock].columns.tolist()
+    # 6) 因子列名与历史一致
+    factor_cols = enforce_factor_cols_consistency(stock_feat, existed_cols)
 
-    # 5) 写 HDF5（按采样周五分组），构建 [N, T, C]
+    # 7) 逐个周五写入（只处理缺失的）
     str_dt = h5py.string_dtype(encoding='utf-8')
-    with h5py.File(CFG.feat_file, "w") as h5f:
-        h5f.attrs['factor_cols'] = np.asarray(factor_cols, dtype=str_dt)
+    mode = "a" if h5_path.exists() else "w"
+    written_cnt_total = 0
+    with h5py.File(h5_path, mode) as h5f:
+        if 'factor_cols' not in h5f.attrs:
+            h5f.attrs['factor_cols'] = np.asarray(factor_cols, dtype=str_dt)
 
-        for date_idx, d in enumerate(tqdm(fridays, desc="写入特征仓")):
+        group_idx = next_idx
+        for d in tqdm(missing_fridays, desc="增量写入特征仓"):
             feats_all = []
             stk_list  = []
+            # 对所有股票在该日期切出窗口
             for stk, fct_full in stock_feat.items():
                 fct_hist = fct_full[fct_full.index <= d]
                 if len(fct_hist) < CFG.daily_window:
@@ -252,30 +280,30 @@ def main():
             feats_arr = mad_clip(feats_arr)
             feats_arr = np.nan_to_num(feats_arr, nan=0.0, posinf=0.0, neginf=0.0)
 
-            g = h5f.create_group(f"date_{date_idx}")
+            g = h5f.create_group(f"date_{group_idx}")
             g.attrs['date'] = d.strftime('%Y-%m-%d')
             g.create_dataset("stocks", data=np.asarray(stk_list, dtype=str_dt))
 
-            # 关键：为按行（样本）读取优化 chunk，并使用更快压缩
             N, T, C = feats_arr.shape
-            chunk0 = int(min(256, N))  # 每块最多 256 行
+            chunk0 = int(min(256, N))
             try:
                 g.create_dataset(
                     "factor",
                     data=feats_arr,
-                    compression="lzf",        # 更快（若不可用，可用 None）
+                    compression="lzf",
                     chunks=(chunk0, T, C)
                 )
             except Exception:
                 g.create_dataset(
                     "factor",
                     data=feats_arr,
-                    compression=None,         # 退化为不压缩，读取最快
+                    compression=None,
                     chunks=(chunk0, T, C)
                 )
+            written_cnt_total += 1
+            group_idx += 1
 
-    print("features_daily.h5 生成完成。")
-    print("注意：滚动训练将按窗口拟合标准化参数（仅用训练期），避免未来信息。")
+    print(f"增量构建完成：新增周五组数={written_cnt_total}，H5路径={h5_path}")
 
 if __name__ == "__main__":
     main()
