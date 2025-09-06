@@ -7,11 +7,15 @@
 - 在组合构建前，按与训练一致的口径进行样本过滤（去 ST、停牌、成交额过低、IPO未满等，参数来自 backtest_config）
 - 保存两份预测：原始未筛选 predictions_raw_*.parquet 与 筛选后 predictions_filtered_*.parquet
 - 根据下周收益计算净值，输出：净值CSV、净值图、指标JSON
+
+新增（问题B修复）：
+- 从模型checkpoint读取 scaler_mean / scaler_std，并在回测推理时对 [N,T,C] 做与训练一致的标准化。
+- 若checkpoint中不存在 scaler 参数，则打印警告并退化为不做标准化（保持兼容）。
 """
 import math
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import numpy as np
 import pandas as pd
@@ -70,25 +74,59 @@ def infer_factor_dim(h5: h5py.File) -> int:
     raise RuntimeError("无法推断因子维度")
 
 
+class ScalerPayload:
+    """
+    负责承载并应用训练期的标准化参数（若存在）。
+    mean/std 形状在训练端通常为 [1,1,C]；这里兼容 [C]、[1,C]、[1,1,C]。
+    """
+    def __init__(self, mean: Optional[np.ndarray], std: Optional[np.ndarray]):
+        self.mean = None if mean is None else np.asarray(mean, dtype=np.float32)
+        self.std  = None if std  is None else np.asarray(std,  dtype=np.float32)
+
+        if self.mean is not None and self.std is not None:
+            # 统一成 [1,1,C]
+            if self.mean.ndim == 1:
+                self.mean = self.mean.reshape(1, 1, -1)
+            elif self.mean.ndim == 2:
+                self.mean = self.mean.reshape(1, self.mean.shape[0], self.mean.shape[1]).mean(axis=1, keepdims=False).reshape(1, 1, -1)
+            elif self.mean.ndim == 3:
+                pass
+            else:
+                raise ValueError(f"scaler_mean 维度不支持: {self.mean.shape}")
+
+            if self.std.ndim == 1:
+                self.std = self.std.reshape(1, 1, -1)
+            elif self.std.ndim == 2:
+                self.std = self.std.reshape(1, self.std.shape[0], self.std.shape[1]).mean(axis=1, keepdims=False).reshape(1, 1, -1)
+            elif self.std.ndim == 3:
+                pass
+            else:
+                raise ValueError(f"scaler_std 维度不支持: {self.std.shape}")
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """
+        X: [N,T,C] 或 [N,T,1,C]（将被 squeeze 到 [N,T,C]）
+        返回与训练一致的标准化结果；若无 mean/std 则原样返回。
+        """
+        X = np.squeeze(np.asarray(X))
+        if self.mean is None or self.std is None:
+            return X.astype(np.float32)
+        return ((X - self.mean) / (self.std + 1e-6)).astype(np.float32)
+
+
 def predict_one_group(model: GCFNet,
                       h5: h5py.File,
                       gk: str,
                       ctx_df: pd.DataFrame,
                       ind_map: dict,
                       pad_ind_id: int,
-                      device: torch.device) -> pd.DataFrame:
+                      device: torch.device,
+                      scaler_payload: ScalerPayload) -> pd.DataFrame:
     g = h5[gk]
     date = pd.Timestamp(g.attrs["date"])
     stocks = g["stocks"][:].astype(str)
     X = np.asarray(g["factor"][:])  # [N,T,C]（特征阶段已MAD clip）
-    X = np.squeeze(X).astype(np.float32)
-
-    # 可选：组内z-score
-    do_group_z = False
-    if do_group_z:
-        mu = np.nanmean(X, axis=(0, 1), keepdims=True)
-        sd = np.nanstd(X, axis=(0, 1), keepdims=True) + 1e-6
-        X = (X - mu) / sd
+    X = scaler_payload.transform(X)  # === 修复点：与训练一致的标准化 ===
 
     # 行业ID
     ind = np.asarray([ind_map.get(s, pad_ind_id) for s in stocks], dtype=np.int64)
@@ -275,7 +313,7 @@ def main():
     out_dir = BT_CFG.processed_dir / "backtest"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1) 读取数据与日历
+    # 1) 读取 H5 / 上下文 / 交易日历
     print("[BT] 读取 H5 / 上下文 / 交易日历")
     with h5py.File(BT_CFG.feat_file, "r") as h5:
         d_in = infer_factor_dim(h5)
@@ -290,7 +328,7 @@ def main():
     if len(fridays_bt) < 2:
         raise RuntimeError("回测周五数量不足（<2）。请调整回测区间。")
 
-    # 2) 加载模型
+    # 2) 加载模型 + 读取训练期的 scaler（若有）
     model_path = (BT_CFG.model_dir / BT_CFG.model_name)
     if not model_path.exists():
         raise FileNotFoundError(f"模型不存在：{model_path}")
@@ -309,8 +347,21 @@ def main():
         hidden=CFG.hidden, ind_emb_dim=CFG.ind_emb,
         graph_type=CFG.graph_type, tr_layers=CFG.tr_layers, gat_layers=getattr(CFG, "gat_layers", 1)
     ).to(BT_CFG.device)
+
     state = torch.load(model_path, map_location=BT_CFG.device)
-    model.load_state_dict(state, strict=False)
+    # 兼容两类保存方式：直接state_dict或payload字典
+    if isinstance(state, dict) and "state_dict" in state:
+        model.load_state_dict(state["state_dict"], strict=False)
+        sc_mean = state.get("scaler_mean", None)
+        sc_std  = state.get("scaler_std", None)
+    else:
+        model.load_state_dict(state, strict=False)
+        sc_mean = None
+        sc_std  = None
+    scaler_payload = ScalerPayload(sc_mean, sc_std)
+    if scaler_payload.mean is None or scaler_payload.std is None:
+        print("[BT][提示] 未在模型文件中发现 scaler_mean/std，推理将不做标准化（与原实现一致）。"
+              "为与训练完全一致，建议在训练保存时一起保存 scaler 参数。")
     model.eval()
 
     # 3) 逐周预测（tqdm）
@@ -321,7 +372,7 @@ def main():
                 continue
             gk = date2grp[d]
             df_pred = predict_one_group(
-                model, h5, gk, ctx_df, ind_map, pad_ind_id, BT_CFG.device
+                model, h5, gk, ctx_df, ind_map, pad_ind_id, BT_CFG.device, scaler_payload
             )
             preds_all.append(df_pred)
 
@@ -380,7 +431,6 @@ def main():
             pred_df_filtered = pred_df_filtered.sort_values(["date", "score"], ascending=[True, False])
 
     # 6) 保存两份预测结果
-    out_dir = BT_CFG.processed_dir / "backtest"
     out_pred_raw = out_dir / f"predictions_raw_{BT_CFG.run_name}.parquet"
     out_pred_filtered = out_dir / f"predictions_filtered_{BT_CFG.run_name}.parquet"
     ensure_dir(out_pred_raw)

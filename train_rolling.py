@@ -4,7 +4,7 @@
 滚动训练主循环（日频 + 行业图/可关闭）
 本版本特性：
 - 使用 train_utils 抽离通用函数，精简主文件
-- 每个训练窗口仅用“训练分组”拟合 Scaler（避免未来信息泄漏）
+- 每个训练窗口仅用“训练分组”拟合 Scaler（避免未来信息泄露）
 - 训练损失：loss = w*(1 - Pearson) + (1 - w)*PairwiseRanking（w=CFG.ranking_weight，默认0.5）
 - 训练进度条与日志同时显示：
   * 总损失 loss（权重后的总损失）
@@ -13,8 +13,9 @@
   * ic_r（RankIC）
 - 评估阶段按周五分组计算 MSE / Pearson / RankIC 及 RankIC 的标准差，并输出 pairwise ranking loss 与加权 loss
 - 按验证集指标选择 best 模型，登记全局与最近N窗口最优并复制到固定路径
-- 新增：RAM 常驻加速路径（窗口级一次性加载 Train/Val 到内存，epoch 内零 IO），由 CFG.ram_accel_enable 控制；
-       若估算内存超过 CFG.ram_accel_mem_cap_gb 则自动回退为逐组加载
+- RAM 常驻加速路径（窗口级一次性加载 Train/Val 到内存，epoch 内零 IO），由 CFG.ram_accel_enable 控制；
+  若估算内存超过 CFG.ram_accel_mem_cap_gb 则自动回退为逐组加载
+- 修复：按“真实日期 -> H5组键”的映射取组，避免固定 date_编号导致的“窗口不滚动”问题
 """
 
 import math, torch, pandas as pd, numpy as np, h5py, shutil
@@ -36,9 +37,34 @@ from train_utils import (
 )
 
 # --------------------------- 辅助：保存模型 --------------------------- #
-def save_checkpoint(model, path: Path):
+def save_checkpoint(model, path: Path, scaler_d=None):
     ensure_parent_dir(path)
-    torch.save(model.state_dict(), path)
+    payload = {"state_dict": model.state_dict()}
+    if scaler_d is not None and getattr(scaler_d, "mean", None) is not None and getattr(scaler_d, "std", None) is not None:
+        payload["scaler_mean"] = scaler_d.mean.astype("float32")
+        payload["scaler_std"]  = scaler_d.std.astype("float32")
+    torch.save(payload, path)
+
+def build_date_to_group_map(h5: h5py.File) -> dict:
+    """
+    从 H5 的每个 group 的 attrs['date'] 构建 {date(pd.Timestamp) -> group_key(str)} 映射。
+    如果存在同一日期多个组，后出现的会覆盖前者（一般不建议出现重复日期）。
+    """
+    d2g = {}
+    for k in h5.keys():
+        if not k.startswith("date_"):
+            continue
+        d = h5[k].attrs.get("date", None)
+        if d is None:
+            continue
+        if isinstance(d, bytes):
+            d = d.decode("utf-8")
+        try:
+            dt = pd.to_datetime(d)
+        except Exception:
+            continue
+        d2g[dt] = k
+    return d2g
 
 # --------------------------- 主流程 --------------------------- #
 def main():
@@ -96,19 +122,24 @@ def main():
 
     # 6) 滚动训练
     with h5py.File(daily_h5, "r") as h5:
+        # 新增：构建真实日期 -> 组键映射
+        date2gk_all = build_date_to_group_map(h5)
+        if len(date2gk_all) == 0:
+            raise RuntimeError(f"H5 中没有任何以 date_* 命名的组：{daily_h5}")
+
         # 以“训练年数 * 52周”为滑动窗口的训练起点；每次步进 step_weeks
         for i in range(CFG.train_years * 52,
                        len(fridays) - CFG.val_weeks - 1,
                        CFG.step_weeks):
 
-            # 时间切片
+            # 时间切片（当前窗口的真实日期列表）
             train_dates = fridays[i - CFG.train_years * 52 : i]
             val_dates   = fridays[i : i + CFG.val_weeks]
             pred_date   = fridays[i + CFG.val_weeks]
 
-            # 将“当前窗口内的周五索引”映射到 HDF5 group key（注意：feature_engineering 写入顺序与 fridays 对齐）
-            train_gk = [f"date_{d}" for d in range(len(train_dates))]
-            val_gk   = [f"date_{d}" for d in range(len(train_dates), len(train_dates)+len(val_dates))]
+            # 按日期映射到组键（跳过 H5 缺失日期）
+            train_gk = [date2gk_all[d] for d in train_dates if d in date2gk_all]
+            val_gk   = [date2gk_all[d] for d in val_dates   if d in date2gk_all]
 
             # 仅用“训练组”拟合当期标准化 Scaler（避免未来信息）
             scaler_d = fit_scaler_for_groups(h5, train_gk)
@@ -120,9 +151,16 @@ def main():
                     if k in h5:
                         n += len(h5[k]["stocks"])
                 return n
+
             print(f"=== 窗口 {pred_date.strftime('%Y-%m-%d')} === "
-                  f"TrainDates={len(train_dates)} ValDates={len(val_dates)} "
+                  f"TrainDates={len(train_dates)}(H5命中={len(train_gk)}) "
+                  f"ValDates={len(val_dates)}(H5命中={len(val_gk)}) "
                   f"TrainSamples≈{_count_samples(train_gk)} ValSamples≈{_count_samples(val_gk)}")
+
+            # 若命中率过低，提示并跳过该窗口
+            if len(train_gk) == 0 or len(val_gk) == 0:
+                print("[警告] 该窗口在 H5 中命中组过少，跳过本窗口训练。")
+                continue
 
             # 选择指标：rankic 或 pearson
             select_metric = getattr(CFG, "select_metric", "rankic")
@@ -340,11 +378,11 @@ def main():
                 if math.isfinite(sel) and sel > best_metric:
                     best_metric = sel
                     best_epoch  = ep + 1
-                    save_checkpoint(model, best_path)
+                    save_checkpoint(model, best_path, scaler_d=scaler_d)
 
             # 训练完一个窗口：保存最后一版
             last_path = CFG.model_dir / f"model_{pred_date.strftime('%Y%m%d')}.pth"
-            save_checkpoint(model, last_path)
+            save_checkpoint(model, last_path, scaler_d=scaler_d)
             print(f"窗口结束，已保存：last -> {last_path.name} , best(ep={best_epoch}) -> {best_path.name}")
 
             # ---------------- 记录与选择全局/最近N最优 ---------------- #
