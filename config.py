@@ -37,7 +37,7 @@ class Config:
 
     # -------- RAM 加速（窗口级一次性常驻内存）--------
     ram_accel_enable    = True     # 默认关闭；内存大的机器可手动改为 True
-    ram_accel_mem_cap_gb= 24        # RAM 加速单窗口的内存上限（GB）；超过将自动回退为逐组加载
+    ram_accel_mem_cap_gb= 48        # RAM 加速单窗口的内存上限（GB）；超过将自动回退为逐组加载
 
     # -------- 股票筛选（可选） --------
     enable_filters      = True       # 是否启用筛选（关闭则与旧逻辑一致）
@@ -68,10 +68,10 @@ class Config:
     topk_per_ind  = 16  # 每个行业选取的TopK股票数量
     lr            = 3e-4    # 学习率
     weight_decay  = 1e-2    # 权重衰减
-    epochs_warm   = 10  # 每个窗口训练轮数
+    epochs_warm   = 20  # 每个窗口训练轮数
 
     # -------- 训练细节 --------
-    batch_size        = 3500
+    batch_size        = 8196
     grad_accum_steps  = 4 # 梯度累积步数
     device            = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_workers       = 8   # 数据加载进程数

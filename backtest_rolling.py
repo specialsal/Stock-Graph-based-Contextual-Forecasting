@@ -1,0 +1,569 @@
+# coding: utf-8
+"""
+滚动回测（与 5+1 滑窗训练对齐）
+- 根据 CFG.train_years / CFG.val_weeks / CFG.step_weeks 构造滚动窗口
+- 窗口 i:
+    * 训练区间: fridays[i - 5y] ~ fridays[i-1]
+    * 验证/回测区间: fridays[i] ~ fridays[i+val_weeks-1]
+    * 模型命名锚点 pred_date = fridays[i + val_weeks]
+      使用模型: model_best_{pred_date:%Y%m%d}.pth（若无则回退 model_{pred_date:%Y%m%d}.pth）
+    * 回测：对 [fridays[i], pred_date)（即验证年整年）逐周打分
+- 筛选逻辑、周收益、净值与图表输出复用 backtest.py 的口径
+- 注意：要求训练期已按上述命名保存模型；否则该年度将跳过（不做 further fallback，避免穿越）
+
+运行:
+    python backtest_rolling.py
+"""
+import math
+import json
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
+import pandas as pd
+import h5py
+import torch
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+from backtest_config import BT_CFG
+from config import CFG
+from model import GCFNet
+from utils import load_calendar, weekly_fridays, load_industry_map
+# 训练期的筛选工具
+from train_utils import make_filter_fn, load_stock_info, load_flag_table
+
+plt.switch_backend("Agg")  # 无界面环境保存图
+
+
+# ---------------- 工具函数（复用/改写自 backtest.py） ---------------- #
+def ensure_dir(p: Path):
+    p.parent.mkdir(parents=True, exist_ok=True)
+
+
+def list_h5_groups(h5: h5py.File) -> pd.DataFrame:
+    rows = []
+    for k in h5.keys():
+        if not k.startswith("date_"):
+            continue
+        d = h5[k].attrs.get("date", None)
+        if d is None:
+            continue
+        if isinstance(d, bytes):
+            d = d.decode("utf-8")
+        rows.append({"group": k, "date": pd.to_datetime(d)})
+    if not rows:
+        return pd.DataFrame(columns=["group", "date"])
+    df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
+    return df
+
+
+def date_to_group(h5: h5py.File) -> Dict[pd.Timestamp, str]:
+    df = list_h5_groups(h5)
+    return {row["date"]: row["group"] for _, row in df.iterrows()}
+
+
+def infer_factor_dim(h5: h5py.File) -> int:
+    if "factor_cols" in h5.attrs:
+        return int(len(h5.attrs["factor_cols"]))
+    # fallback: look at first group
+    for k in h5.keys():
+        if "factor" in h5[k]:
+            arr = np.asarray(h5[k]["factor"][:])
+            arr = np.squeeze(arr)
+            return int(arr.shape[-1])
+    raise RuntimeError("无法推断因子维度")
+
+
+class ScalerPayload:
+    """
+    负责承载并应用训练期的标准化参数（若存在）。
+    mean/std 形状在训练端通常为 [1,1,C]；这里兼容 [C]、[1,C]、[1,1,C]。
+    """
+    def __init__(self, mean: Optional[np.ndarray], std: Optional[np.ndarray]):
+        self.mean = None if mean is None else np.asarray(mean, dtype=np.float32)
+        self.std  = None if std  is None else np.asarray(std,  dtype=np.float32)
+
+        if self.mean is not None and self.std is not None:
+            # 统一成 [1,1,C]
+            if self.mean.ndim == 1:
+                self.mean = self.mean.reshape(1, 1, -1)
+            elif self.mean.ndim == 2:
+                self.mean = self.mean.reshape(1, self.mean.shape[0], self.mean.shape[1]).mean(axis=1, keepdims=False).reshape(1, 1, -1)
+            elif self.mean.ndim == 3:
+                pass
+            else:
+                raise ValueError(f"scaler_mean 维度不支持: {self.mean.shape}")
+
+            if self.std.ndim == 1:
+                self.std = self.std.reshape(1, 1, -1)
+            elif self.std.ndim == 2:
+                self.std = self.std.reshape(1, self.std.shape[0], self.std.shape[1]).mean(axis=1, keepdims=False).reshape(1, 1, -1)
+            elif self.std.ndim == 3:
+                pass
+            else:
+                raise ValueError(f"scaler_std 维度不支持: {self.std.shape}")
+
+    def transform(self, X: np.ndarray) -> np.ndarray:
+        """
+        X: [N,T,C] 或 [N,T,1,C]（将被 squeeze 到 [N,T,C]）
+        返回与训练一致的标准化结果；若无 mean/std 则原样返回。
+        """
+        X = np.squeeze(np.asarray(X))
+        if self.mean is None or self.std is None:
+            return X.astype(np.float32)
+        return ((X - self.mean) / (self.std + 1e-6)).astype(np.float32)
+
+
+def predict_one_group(model: GCFNet,
+                      h5: h5py.File,
+                      gk: str,
+                      ctx_df: pd.DataFrame,
+                      ind_map: dict,
+                      pad_ind_id: int,
+                      device: torch.device,
+                      scaler_payload: ScalerPayload) -> pd.DataFrame:
+    g = h5[gk]
+    date = pd.Timestamp(g.attrs["date"])
+    stocks = g["stocks"][:].astype(str)
+    X = np.asarray(g["factor"][:])  # [N,T,C]
+    X = scaler_payload.transform(X)
+
+    # 行业ID
+    ind = np.asarray([ind_map.get(s, pad_ind_id) for s in stocks], dtype=np.int64)
+
+    # 上下文
+    if date in ctx_df.index:
+        ctx_vec = ctx_df.loc[date].values.astype(np.float32)
+    else:
+        ctx_vec = np.zeros(ctx_df.shape[1], dtype=np.float32)
+    ctx = np.broadcast_to(ctx_vec, (X.shape[0], ctx_vec.shape[0])).copy()
+
+    # 推理
+    with torch.no_grad():
+        xb = torch.from_numpy(X).to(device)
+        ib = torch.from_numpy(ind).to(device)
+        cb = torch.from_numpy(ctx).to(device)
+        preds = []
+        bs = 4096
+        for st in range(0, xb.shape[0], bs):
+            pe = model(xb[st:st+bs], ib[st:st+bs], cb[st:st+bs])
+            preds.append(pe.detach().float().cpu().numpy())
+        score = np.concatenate(preds, 0)
+
+    df = pd.DataFrame({
+        "date": date,
+        "stock": stocks,
+        "score": score
+    })
+    return df
+
+
+def compute_weekly_returns(close_pivot: pd.DataFrame,
+                           fridays: pd.DatetimeIndex) -> Tuple[Dict[pd.Timestamp, pd.Series], Dict[pd.Timestamp, pd.Timestamp]]:
+    """
+    对每个周五 f，找 <=f 的最后交易日 d0，下一周五同理得到 d1，计算 (close[d1]/close[d0]-1)
+    返回：
+      - weekly_ret: {friday -> Series(index=stock) 的一周收益}
+      - friday_start_map: {friday -> d0} 起点交易日映射（用于过滤时的口径日）
+    """
+    avail = close_pivot.index
+    out = {}
+    start_date_map = {}
+    for i in range(len(fridays) - 1):
+        f0 = fridays[i]
+        f1 = fridays[i+1]
+        i0 = avail[avail <= f0]
+        i1 = avail[avail <= f1]
+        if len(i0) == 0 or len(i1) == 0:
+            continue
+        d0 = i0[-1]; d1 = i1[-1]
+        if d0 >= d1:
+            continue
+        start = close_pivot.loc[d0]
+        end = close_pivot.loc[d1]
+        ret = (end / start - 1).replace([np.inf, -np.inf], np.nan)
+        out[f0] = ret
+        start_date_map[f0] = d0
+    return out, start_date_map
+
+
+def build_portfolio(scores: pd.DataFrame,
+                    weekly_ret: Dict[pd.Timestamp, pd.Series],
+                    mode: str = "ls",
+                    top_pct: float = 0.2,
+                    bottom_pct: float = 0.2,
+                    min_n: int = 20,
+                    max_n: int = 200,
+                    long_w: float = 1.0,
+                    short_w: float = 1.0,
+                    slippage_bps: float = 0.0,
+                    fee_bps: float = 0.0) -> pd.DataFrame:
+    """
+    输入每周打分 + 每周实际收益，输出周频净值序列
+    """
+    dates = sorted(set(scores["date"]))
+    records = []
+
+    for d in dates:
+        df_d = scores[scores["date"] == d].copy()
+        if d not in weekly_ret:
+            continue
+        ret_s = weekly_ret[d]  # Series(stock -> ret)
+
+        df_d = df_d.merge(ret_s.rename("ret"), left_on="stock", right_index=True, how="inner")
+        df_d = df_d.dropna(subset=["ret", "score"])
+        if len(df_d) < min_n:
+            records.append({"date": d, "ret_long": 0.0, "ret_short": 0.0, "ret_total": 0.0, "n_long": 0, "n_short": 0})
+            continue
+
+        df_d = df_d.sort_values("score", ascending=False)
+        n = len(df_d)
+        n_long = max(0, min(int(math.floor(n * top_pct)), max_n))
+        n_short = 0
+        if mode == "ls":
+            n_short = max(0, min(int(math.floor(n * bottom_pct)), max_n))
+
+        # 最少持仓保障
+        if n_long == 0 and n >= min_n:
+            n_long = min(min_n, n)
+        if mode == "ls" and n_short == 0 and n >= min_n:
+            n_short = min(min_n, n - n_long)
+
+        long_ret = 0.0
+        short_ret = 0.0
+        if n_long > 0:
+            long_leg = df_d.head(n_long)
+            long_ret = float(long_leg["ret"].mean())
+        if mode == "ls" and n_short > 0:
+            short_leg = df_d.tail(n_short)
+            short_ret = float(short_leg["ret"].mean())
+
+        # 成本（双边合计）
+        cost_long = (slippage_bps + fee_bps) * 1e-4
+        cost_short = (slippage_bps + fee_bps) * 1e-4
+
+        if mode == "long":
+            total = long_ret - cost_long
+        else:
+            total = long_w * (long_ret - cost_long) - short_w * (short_ret + cost_short)
+
+        records.append({
+            "date": d,
+            "ret_long": long_ret,
+            "ret_short": short_ret,
+            "ret_total": total,
+            "n_long": n_long,
+            "n_short": n_short
+        })
+
+    if not records:
+        return pd.DataFrame(columns=["date", "ret_total"]).set_index("date")
+
+    df_ret = pd.DataFrame(records).set_index("date").sort_index()
+    df_ret["nav"] = (1.0 + df_ret["ret_total"]).cumprod()
+    return df_ret
+
+
+def calc_stats(nav_df: pd.DataFrame, freq_per_year: int = 52) -> Dict[str, float]:
+    if nav_df.empty:
+        return {}
+    nav = nav_df["nav"].values
+    rets = nav_df["ret_total"].values
+
+    total_return = float(nav[-1] - 1.0)
+    ann_return = float((1.0 + rets).prod() ** (freq_per_year / max(1, len(rets))) - 1.0)
+    vol = float(np.std(rets, ddof=1)) * math.sqrt(freq_per_year) if len(rets) > 1 else 0.0
+    sharpe = float(ann_return / vol) if vol > 1e-12 else float("nan")
+
+    peak = -np.inf
+    max_dd = 0.0
+    for v in nav:
+        peak = max(peak, v) if np.isfinite(peak) else v
+        dd = (v / peak - 1.0) if peak > 0 else 0.0
+        max_dd = min(max_dd, dd)
+    max_drawdown = float(-max_dd)
+    calmar = float(ann_return / max_drawdown) if max_drawdown > 1e-12 else float("nan")
+
+    return {
+        "total_return": total_return,
+        "annual_return": ann_return,
+        "annual_vol": vol,
+        "sharpe": sharpe,
+        "max_drawdown": max_drawdown,
+        "calmar": calmar,
+        "n_periods": int(len(rets))
+    }
+
+
+def save_nav_plot(nav_df: pd.DataFrame, out_png: Path, title: str):
+    ensure_dir(out_png)
+    fig, ax = plt.subplots(1, 1, figsize=(10, 5))
+    ax.plot(nav_df.index, nav_df["nav"], label="Strategy NAV")
+    ax.set_title(title)
+    ax.set_xlabel("Date")
+    ax.set_ylabel("NAV")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.tight_layout()
+    fig.savefig(out_png, dpi=160)
+    plt.close(fig)
+
+
+# ---------------- 依据 CFG 的 5+1+步长 构造滚动年度段 ---------------- #
+def make_rolling_segments(fridays: pd.DatetimeIndex) -> List[Tuple[pd.Timestamp, pd.DatetimeIndex]]:
+    """
+    返回列表，每个元素为 (pred_date, fridays_segment)：
+      - pred_date = fridays[i + CFG.val_weeks]
+      - fridays_segment = [fridays[i], ..., fridays[i + CFG.val_weeks - 1]] = [start, pred_date) 闭开
+    """
+    segs = []
+    train_weeks = CFG.train_years * 52
+    val_weeks = CFG.val_weeks
+    step_weeks = CFG.step_weeks
+
+    # 与 train_rolling.py 的循环一致
+    for i in range(train_weeks, len(fridays) - val_weeks, step_weeks):
+        start = fridays[i]
+        pred_date = fridays[i + val_weeks]  # 命名锚点（次年首周五）
+        mask = (fridays >= start) & (fridays < pred_date)
+        fridays_seg = fridays[mask]
+        if len(fridays_seg) == 0:
+            continue
+        segs.append((pred_date, fridays_seg))
+    return segs
+
+
+# ---------------- 主流程 ---------------- #
+def main():
+    out_dir = BT_CFG.processed_dir / "backtest"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    run_name = f"rolling_{BT_CFG.run_name}"
+
+    # 1) 读取 H5 / 上下文 / 交易日历
+    print("[RB] 读取 H5 / 上下文 / 交易日历")
+    with h5py.File(BT_CFG.feat_file, "r") as h5:
+        d_in = infer_factor_dim(h5)
+        date2grp = date_to_group(h5)
+
+    ctx_df = pd.read_parquet(BT_CFG.ctx_file)
+    if not isinstance(ctx_df.index, pd.DatetimeIndex):
+        raise ValueError("context_features 索引需为 DatetimeIndex")
+
+    cal = load_calendar(BT_CFG.trading_day_file if BT_CFG.trading_day_file.exists() else CFG.trading_day_file)
+    fridays_all = weekly_fridays(cal)
+    # 依据 CFG.start_date / CFG.end_date（用户要求“参考 config 的参数”）
+    mask_cfg = (fridays_all >= pd.Timestamp(CFG.start_date)) & (fridays_all <= pd.Timestamp(CFG.end_date))
+    fridays_all = fridays_all[mask_cfg]
+    if len(fridays_all) < (CFG.train_years * 52 + CFG.val_weeks + 1):
+        raise RuntimeError("交易周五数量不足以构造 5+1 滚动窗口，请检查 CFG.start_date / CFG.end_date")
+
+    # 2) 行业映射、ctx_dim、设备
+    ind_map = load_industry_map(BT_CFG.industry_map_file)
+    n_ind_known = max(ind_map.values()) + 1
+    pad_ind_id = n_ind_known
+    ctx_dim = ctx_df.shape[1] if ctx_df.shape[0] > 0 else int(CFG.ctx_dim)
+
+    # 3) 周收益与口径日映射（全域一次性算，后续子集复用）
+    print("[RB] 载入日行情并计算周收益")
+    price_df = pd.read_parquet(BT_CFG.price_day_file)
+    if not isinstance(price_df.index, pd.MultiIndex):
+        # 兼容：若未是 MultiIndex，则尝试设置
+        if {"order_book_id", "date"}.issubset(price_df.columns):
+            price_df = price_df.set_index(["order_book_id", "date"]).sort_index()
+        elif {"order_book_id", "datetime"}.issubset(price_df.columns):
+            price_df = price_df.copy()
+            price_df["datetime"] = pd.to_datetime(price_df["datetime"])
+            price_df = price_df.set_index(["order_book_id", "datetime"]).sort_index()
+        else:
+            raise ValueError("price_day_file 需为 MultiIndex(order_book_id, date/datetime) 或具备相应列")
+
+    # close 透视（将第二层索引统一到 DatetimeIndex）
+    second_level = price_df.index.names[1]
+    close_pivot = price_df["close"].unstack(level=0)
+    close_pivot.index = pd.to_datetime(close_pivot.index)
+    close_pivot = close_pivot.sort_index()
+
+    # 按全域周五计算一次周收益和口径起点
+    weekly_ret_all, friday_start_map_all = compute_weekly_returns(close_pivot, fridays_all)
+
+    # 4) 构造过滤闭包（口径与训练一致）
+    filter_fn = None
+    if getattr(BT_CFG, "enable_filters", False):
+        # 覆写 CFG 的过滤参数，使 make_filter_fn 读到回测用的门槛/板块开关
+        CFG.enable_filters = bool(BT_CFG.enable_filters)
+        CFG.ipo_cut_days = int(BT_CFG.ipo_cut_days)
+        CFG.suspended_exclude = bool(BT_CFG.suspended_exclude)
+        CFG.st_exclude = bool(BT_CFG.st_exclude)
+        CFG.min_daily_turnover = float(BT_CFG.min_daily_turnover)
+        CFG.allow_missing_info = bool(BT_CFG.allow_missing_info)
+        CFG.include_star_market = bool(getattr(BT_CFG, "include_star_market", True))
+        CFG.include_chinext = bool(getattr(BT_CFG, "include_chinext", True))
+        CFG.include_bse = bool(getattr(BT_CFG, "include_bse", True))
+        CFG.include_neeq = bool(getattr(BT_CFG, "include_neeq", True))
+
+        stock_info_df = load_stock_info(BT_CFG.stock_info_file)
+        susp_df = load_flag_table(BT_CFG.is_suspended_file)
+        st_df = load_flag_table(BT_CFG.is_st_file)
+        filter_fn = make_filter_fn(price_df.reset_index().rename(columns={second_level: "date"}).set_index(["order_book_id", "date"]).sort_index(),
+                                   stock_info_df, susp_df, st_df)
+
+    # 5) 依据 CFG 的滑窗构造“年度段”（验证年）并逐段切换模型回测
+    segments = make_rolling_segments(fridays_all)
+    if not segments:
+        raise RuntimeError("未生成任何滚动段，请检查 CFG.* 参数与交易周五覆盖范围")
+
+    preds_raw_all = []
+    preds_flt_all = []
+
+    with h5py.File(BT_CFG.feat_file, "r") as h5:
+        for pred_date, fridays_year in segments:
+            # 限制到回测区间（可选：BT_CFG.bt_start_date / bt_end_date）
+            bt_mask = (fridays_year >= pd.Timestamp(BT_CFG.bt_start_date)) & (fridays_year <= pd.Timestamp(BT_CFG.bt_end_date))
+            fridays_year = fridays_year[bt_mask]
+            if len(fridays_year) < 1:
+                continue
+
+            # 寻找年度模型（严格使用 pred_date 命名的文件，不做 further fallback）
+            ymd = pred_date.strftime("%Y%m%d")
+            cand_best = CFG.model_dir / f"model_best_{ymd}.pth"
+            cand_last = CFG.model_dir / f"model_{ymd}.pth"
+            model_path = cand_best if cand_best.exists() else (cand_last if cand_last.exists() else None)
+            if model_path is None:
+                print(f"[RB][跳过] 找不到该段模型：{cand_best.name} / {cand_last.name}，年度起点={fridays_year[0].date()} 终点={fridays_year[-1].date()}")
+                continue
+
+            print(f"[RB] 使用模型 {model_path.name} 预测区间 [{fridays_year[0].date()} ~ {fridays_year[-1].date()}]（闭区间，以周五计）")
+
+            # 6) 加载模型 + scaler
+            model = GCFNet(
+                d_in=d_in, n_ind=n_ind_known, ctx_dim=ctx_dim,
+                hidden=CFG.hidden, ind_emb_dim=CFG.ind_emb,
+                graph_type=CFG.graph_type, tr_layers=CFG.tr_layers, gat_layers=getattr(CFG, "gat_layers", 1)
+            ).to(BT_CFG.device)
+
+            state = torch.load(model_path, map_location=BT_CFG.device)
+            if isinstance(state, dict) and "state_dict" in state:
+                model.load_state_dict(state["state_dict"], strict=False)
+                sc_mean = state.get("scaler_mean", None)
+                sc_std  = state.get("scaler_std", None)
+            else:
+                model.load_state_dict(state, strict=False)
+                sc_mean = None
+                sc_std  = None
+            scaler_payload = ScalerPayload(sc_mean, sc_std)
+            if scaler_payload.mean is None or scaler_payload.std is None:
+                print("[RB][提示] 未在模型文件中发现 scaler_mean/std，推理将不做标准化（保持兼容）。"
+                      "为与训练完全一致，建议在训练保存时一起保存 scaler 参数。")
+            model.eval()
+
+            # 7) 年度内逐周预测
+            preds_year_raw = []
+            preds_year_flt = []
+            for d in tqdm(fridays_year, desc=f"年度预测 {fridays_year[0].year}", unit="w", leave=False):
+                if d not in date2grp:
+                    continue
+                gk = date2grp[d]
+                # 原始预测
+                df_pred = predict_one_group(
+                    model, h5, gk, ctx_df, ind_map, pad_ind_id, BT_CFG.device, scaler_payload
+                )
+                preds_year_raw.append(df_pred)
+
+                # 筛选（使用该周收益起点口径日）
+                if filter_fn is not None:
+                    if d not in friday_start_map_all:
+                        # 找不到口径起点，无法筛选；跳过该周
+                        continue
+                    start_dt = friday_start_map_all[d]
+                    mask = []
+                    ss = df_pred["stock"].tolist()
+                    for s in ss:
+                        try:
+                            ok = filter_fn(start_dt, s)
+                        except Exception:
+                            ok = False
+                        mask.append(bool(ok))
+                    df_flt = df_pred.loc[mask]
+                else:
+                    df_flt = df_pred
+                if len(df_flt) > 0:
+                    preds_year_flt.append(df_flt)
+
+            if preds_year_raw:
+                df_raw = pd.concat(preds_year_raw, ignore_index=True)
+                preds_raw_all.append(df_raw)
+            if preds_year_flt:
+                df_flt = pd.concat(preds_year_flt, ignore_index=True)
+                preds_flt_all.append(df_flt)
+
+    if not preds_raw_all and not preds_flt_all:
+        raise RuntimeError("滚动区间内未获得任何预测，请检查模型文件与数据覆盖。")
+
+    pred_df_raw = pd.concat(preds_raw_all, ignore_index=True) if preds_raw_all else pd.DataFrame(columns=["date","stock","score"])
+    pred_df_flt = pd.concat(preds_flt_all, ignore_index=True) if preds_flt_all else pd.DataFrame(columns=["date","stock","score"])
+
+    # 排序
+    if len(pred_df_raw) > 0:
+        pred_df_raw = pred_df_raw.sort_values(["date", "score"], ascending=[True, False])
+    if len(pred_df_flt) > 0:
+        pred_df_flt = pred_df_flt.sort_values(["date", "score"], ascending=[True, False])
+
+    # 8) 保存两份预测结果
+    out_pred_raw = out_dir / f"predictions_raw_rolling_{run_name}.parquet"
+    out_pred_filtered = out_dir / f"predictions_filtered_rolling_{run_name}.parquet"
+    ensure_dir(out_pred_raw)
+    ensure_dir(out_pred_filtered)
+    if len(pred_df_raw) > 0:
+        pred_df_raw.to_parquet(out_pred_raw)
+        print(f"[RB] 已保存原始预测：{out_pred_raw}")
+    if len(pred_df_flt) > 0:
+        pred_df_flt.to_parquet(out_pred_filtered)
+        print(f"[RB] 已保存筛选后预测：{out_pred_filtered}")
+
+    # 9) 用筛选后的预测构建组合与净值（若筛选后为空，则退回用原始预测）
+    scores_df = pred_df_flt if len(pred_df_flt) > 0 else pred_df_raw
+    if len(scores_df) == 0:
+        raise RuntimeError("无可用预测样本，无法构建净值。")
+
+    # 只对“有分数的周”子集计算净值，周收益字典用全域已算的 weekly_ret_all
+    ret_df = build_portfolio(
+        scores_df, weekly_ret_all,
+        mode=BT_CFG.mode,
+        top_pct=BT_CFG.top_pct,
+        bottom_pct=BT_CFG.bottom_pct,
+        min_n=BT_CFG.min_n_stocks,
+        max_n=BT_CFG.max_n_stocks,
+        long_w=BT_CFG.long_weight,
+        short_w=BT_CFG.short_weight,
+        slippage_bps=BT_CFG.slippage_bps,
+        fee_bps=BT_CFG.fee_bps
+    )
+    if ret_df.empty:
+        raise RuntimeError("未能生成回测净值，请检查回测参数与数据。")
+
+    # 10) 输出净值与图表
+    out_nav_csv = out_dir / f"nav_rolling_{run_name}.csv"
+    ensure_dir(out_nav_csv)
+    ret_df[["ret_long", "ret_short", "ret_total", "nav", "n_long", "n_short"]].to_csv(out_nav_csv, float_format="%.8f")
+    print(f"[RB] 已保存净值序列：{out_nav_csv}")
+
+    out_png = out_dir / f"nav_rolling_{run_name}.png"
+    save_nav_plot(ret_df, out_png, title=f"Rolling[{CFG.train_years}y+{CFG.val_weeks//52}y-step{CFG.step_weeks//52}y] {BT_CFG.mode}")
+    print(f"[RB] 已保存净值图：{out_png}")
+
+    # 11) 指标
+    metrics = calc_stats(ret_df)
+    out_json = out_dir / f"metrics_rolling_{run_name}.json"
+    ensure_dir(out_json)
+    with open(out_json, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, ensure_ascii=False, indent=2)
+    print("[RB] 指标汇总：")
+    for k, v in metrics.items():
+        print(f"  {k}: {v:.6f}" if isinstance(v, float) else f"  {k}: {v}")
+    print(f"[RB] 已保存指标JSON：{out_json}")
+
+
+if __name__ == "__main__":
+    main()
