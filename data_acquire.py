@@ -11,25 +11,25 @@ import rqdatac as rq
 # 基础配置
 # =========================
 # 如果有账号密码: rq.init('user','pwd')
-rq.init()
+rq.init('15005800360','123456')
 
 DATA_PATH = 'data/raw/'
 os.makedirs(DATA_PATH, exist_ok=True)
 
 TODAY_STR = datetime.today().strftime('%Y-%m-%d')
 FREQ_DAY = '1d'
-TRADING_DAY_END = '2023-12-31'
+TRADING_DAY_END = '2030-12-31'
 
 # 是否更新的开关（可按需修改）
 UPDATE_SWITCH = {
     'trading_calendar': True,      # 交易日 & 交易周
-    'stock_info': True,            # 股票信息（聚宽导出覆盖）
-    'stock_price_day': True,       # 股票日行情（parquet, MultiIndex）
-    'suspended': True,             # 停牌（CSV 宽表）
-    'is_st': True,                 # ST（CSV 宽表）
-    'index_components': True,      # 指数成分（快照覆盖）
-    'industry_and_style': True,    # 行业与风格（快照覆盖 + 映射）
-    'index_price_day': True,       # 指数日行情（parquet, MultiIndex）
+    'stock_info': False,            # 股票信息（聚宽导出覆盖）
+    'stock_price_day': False,       # 股票日行情（parquet, MultiIndex）
+    'suspended': False,             # 停牌（CSV 宽表）
+    'is_st': False,                 # ST（CSV 宽表）
+    'index_components': False,      # 指数成分（快照覆盖）
+    'industry_and_style': False,    # 行业与风格（快照覆盖 + 映射）
+    'index_price_day': False,       # 指数日行情（parquet, MultiIndex）
 }
 
 # 可选：在获取行情时过滤无效代码，减少 invalid order_book_id 警告
@@ -290,7 +290,7 @@ def update_suspended(start='2010-01-01', end=TODAY_STR):
         return
     stock_list = stock_info['code'].dropna().unique().tolist()
 
-    out_path = os.path.join(DATA_PATH, 'suspended_list.csv')
+    out_path = os.path.join(DATA_PATH, 'is_suspended.csv')
     df_old = read_csv_safe(out_path, index_col=0)
     if df_old is not None and not df_old.empty:
         try:

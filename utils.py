@@ -40,7 +40,7 @@ def load_industry_map(csv_file: Path):
 # -------- 交易日历 --------
 def load_calendar(csv_file: Path) -> pd.DatetimeIndex:
     dates = pd.read_csv(csv_file, header=None, skiprows=1).iloc[:, 1]
-    return pd.DatetimeIndex(sorted(pd.to_datetime(dates, format='%Y/%m/%d').unique()))
+    return pd.DatetimeIndex(sorted(pd.to_datetime(dates, format='%Y-%m-%d').unique()))
 
 def weekly_fridays(calendar: pd.DatetimeIndex) -> pd.DatetimeIndex:
     df = pd.DataFrame({"d": calendar})

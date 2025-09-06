@@ -20,10 +20,16 @@ class BTConfig:
     industry_map_file = raw_dir / "stock_industry_map.csv"
     trading_day_file  = raw_dir / "trading_day.csv"
 
+    # 为回测筛选加载原始数据（与训练一致）
+    price_day_file     = raw_dir / "stock_price_day.parquet"
+    stock_info_file    = raw_dir / "stock_info.csv"
+    is_suspended_file  = raw_dir / "is_suspended.csv"
+    is_st_file         = raw_dir / "is_st_stock.csv"
+
     # 选择回测使用的模型：
     # 可填：具体文件名（例如 "model_20200103.pth" / "model_best_20200103.pth"
     #      或固定别名 "best_overall.pth" / "best_recent_5.pth"）
-    model_name     = "best_overall.pth"
+    model_name     = "best_recent_5.pth"
 
     # 回测区间（周五采样日）
     bt_start_date  = "2011-01-01"
@@ -41,16 +47,21 @@ class BTConfig:
 
     # 分组与持仓控制
     top_pct        = 0.1    # 做多比例（0~1），仅在当周股票数足够时生效
-    bottom_pct     = 0.1    # 做空比例（0~1），仅在 mode=="ls" 时使用
+    bottom_pct     = 0.1   # 做空比例（0~1），仅在 mode=="ls" 时使用
     min_n_stocks   = 20     # 每周最少持仓数量（若不足则本周空仓）
     max_n_stocks   = 200    # 每边最多持仓数量（多/空各自限制）
 
     # 交易相关假设
-    # rebalance_day: 使用每个周五的打分，在下一个交易周的第一个可交易日开盘成交（简化为当周收盘->下周收盘收益）
-    # 我们用标签同款“周五对齐法”：从周五到下一个周五的收盘涨跌作为一周收益
-    # 真实滑点与手续费请按需在这里增加假设参数
-    slippage_bps   = 0.0    # 单边滑点，基点
-    fee_bps        = 0.0    # 单边手续费，基点
+    slippage_bps   = 0.005    # 单边滑点，基点
+    fee_bps        = 0.001    # 单边手续费，基点
+
+    # 样本过滤（对回测当周可选股票集合进行过滤，口径与训练一致）
+    enable_filters     = True     # 是否启用筛选
+    ipo_cut_days       = 120      # IPO满多少天才纳入（自然日）
+    suspended_exclude  = True     # 排除停牌
+    st_exclude         = True     # 排除 ST
+    min_daily_turnover = 5e6      # 当日最低成交额阈值（单位与原始数据一致）
+    allow_missing_info = False    # 缺少基础信息是否保留
 
     # 设备
     device         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
