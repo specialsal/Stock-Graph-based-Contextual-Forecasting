@@ -387,8 +387,9 @@ def main():
 
             # ---------------- 记录与选择全局/最近N最优 ---------------- #
             # 载入 best，统一用同一 scaler_d 在验证集上复算一次指标并登记
-            best_state = torch.load(best_path, map_location=CFG.device)
-            model.load_state_dict(best_state, strict=False)
+            payload = torch.load(best_path, map_location=CFG.device)
+            state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
+            model.load_state_dict(state_dict, strict=False)
 
             model.eval()
             per_date = []

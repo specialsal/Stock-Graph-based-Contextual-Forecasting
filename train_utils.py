@@ -210,6 +210,11 @@ def get_flag_at(df_flag: pd.DataFrame, date: pd.Timestamp, code: str) -> int:
 def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd.DataFrame, st_df: pd.DataFrame):
     """
     返回闭包 filter_fn(date, code) -> bool
+    规则（若 CFG.enable_filters=True）：
+      - 板块开关：include_star_market / include_chinext / include_bse / include_neeq
+      - IPO/退市日要求
+      - 停牌/ST 剔除
+      - 成交额阈值
     """
     if not getattr(CFG, "enable_filters", False):
         return None
@@ -217,7 +222,14 @@ def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd
         daily_df = daily_df.set_index(["order_book_id","date"]).sort_index()
 
     def filter_fn(date: pd.Timestamp, code: str) -> bool:
-        # IPO/退市
+        # 1) 板块开关
+        bd = classify_board(code)
+        if bd == "STAR"    and not getattr(CFG, "include_star_market", True): return False
+        if bd == "CHINEXT" and not getattr(CFG, "include_chinext",     True): return False
+        if bd == "BSE"     and not getattr(CFG, "include_bse",         True): return False
+        if bd == "NEEQ"    and not getattr(CFG, "include_neeq",        True): return False
+
+        # 2) IPO/退市
         if stock_info is not None and code in stock_info.index:
             info = stock_info.loc[code]
             ipo = info["ipo_date"]
@@ -230,14 +242,15 @@ def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd
         else:
             if not CFG.allow_missing_info: return False
 
-        # 停牌
+        # 3) 停牌
         if getattr(CFG, "suspended_exclude", True) and susp_df is not None:
             if get_flag_at(susp_df, date, code) == 1: return False
-        # ST
+
+        # 4) ST
         if getattr(CFG, "st_exclude", True) and st_df is not None:
             if get_flag_at(st_df, date, code) == 1: return False
 
-        # 成交额
+        # 5) 成交额
         thr = getattr(CFG, "min_daily_turnover", 0.0) or 0.0
         if thr > 0:
             key = (code, date)
@@ -399,3 +412,33 @@ def iterate_group_minibatches(h5: h5py.File,
                 xb = xb.pin_memory(); ib = ib.pin_memory()
                 cb = cb.pin_memory(); yb = yb.pin_memory()
             yield xb, ib, cb, yb
+
+def classify_board(code: str) -> str:
+    """
+    根据代码推断板块（基于常见编码规则）：
+      - STAR(科创板): 688/689 + .XSHG
+      - CHINEXT(创业板): 300/301 + .XSHE
+      - BSE(北交所): 后缀 .XBEI / .XBSE
+      - NEEQ(新三板): 后缀 .XNE / .XNEE / .XNEQ / .XNEX / NEEQ
+      - 其他返回 "OTHER"
+    """
+    try:
+        s = str(code)
+        parts = s.split(".")
+        prefix = parts[0]
+        suffix = parts[-1].upper() if len(parts) > 1 else ""
+        # 科创板
+        if suffix == "XSHG" and (prefix.startswith("688") or prefix.startswith("689")):
+            return "STAR"
+        # 创业板
+        if suffix == "XSHE" and (prefix.startswith("300") or prefix.startswith("301")):
+            return "CHINEXT"
+        # 北交所
+        if suffix in ("XBEI", "XBSE"):
+            return "BSE"
+        # 新三板（场外）
+        if suffix in ("XNE", "XNEE", "XNEQ", "XNEX", "NEEQ"):
+            return "NEEQ"
+        return "OTHER"
+    except Exception:
+        return "OTHER"

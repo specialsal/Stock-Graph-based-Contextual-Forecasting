@@ -403,6 +403,11 @@ def main():
         CFG.st_exclude = bool(BT_CFG.st_exclude)
         CFG.min_daily_turnover = float(BT_CFG.min_daily_turnover)
         CFG.allow_missing_info = bool(BT_CFG.allow_missing_info)
+        # 板块开关（与训练一致）
+        CFG.include_star_market = bool(getattr(BT_CFG, "include_star_market", True))
+        CFG.include_chinext = bool(getattr(BT_CFG, "include_chinext", True))
+        CFG.include_bse = bool(getattr(BT_CFG, "include_bse", True))
+        CFG.include_neeq = bool(getattr(BT_CFG, "include_neeq", True))
 
         stock_info_df = load_stock_info(BT_CFG.stock_info_file)
         susp_df = load_flag_table(BT_CFG.is_suspended_file)

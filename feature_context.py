@@ -19,11 +19,18 @@ def _ret(s: pd.Series): return s.pct_change()
 def _mean(s: pd.Series, n: int): return s.rolling(n, min_periods=1).mean()
 def _std (s: pd.Series, n: int): return s.rolling(n, min_periods=1).std()
 
+# feature_context.py
 def _prepare_index(index_df: pd.DataFrame):
     if not isinstance(index_df.index, pd.MultiIndex) or index_df.index.nlevels != 2:
-        raise ValueError(f"index_day_file 需要 MultiIndex(order_book_id, date)，当前 index={index_df.index}")
-    if set(index_df.index.names) != set(['order_book_id','date']):
-        raise ValueError(f"index_day_file 索引级别需包含 ['order_book_id','date']，当前 {index_df.index.names}")
+        raise ValueError(f"index_day_file 需要 MultiIndex(order_book_id, date/datetime)，当前 index={index_df.index}")
+
+    names = list(index_df.index.names)
+    # 兼容 ('order_book_id','datetime')
+    if set(names) == set(['order_book_id', 'datetime']):
+        index_df = index_df.copy()
+        index_df.index = index_df.index.set_names(['order_book_id', 'date'])
+    elif set(names) != set(['order_book_id', 'date']):
+        raise ValueError(f"index_day_file 索引级别需包含 ['order_book_id','date'] (或 'datetime')，当前 {names}")
 
     if 'close' not in index_df.columns or 'total_turnover' not in index_df.columns:
         raise ValueError("index_day_file 需要包含列 ['close','total_turnover']")
@@ -34,7 +41,8 @@ def _prepare_index(index_df: pd.DataFrame):
 
     missing_idx = [c for c in INDEXS if c not in close_pivot.columns]
     if missing_idx:
-        raise ValueError(f"指数数据缺少列: {missing_idx}，请确保 index_day_file 包含这些指数的行情")
+        raise ValueError(f"指数数据缺少列: {missing_idx}，请确保 index_day_file 覆盖这些指数")
+
     close_pivot = close_pivot.reindex(columns=INDEXS)
     turn_pivot  = turn_pivot.reindex(columns=INDEXS)
     return close_pivot, turn_pivot

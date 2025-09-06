@@ -63,6 +63,12 @@ class BTConfig:
     min_daily_turnover = 5e6      # 当日最低成交额阈值（单位与原始数据一致）
     allow_missing_info = False    # 缺少基础信息是否保留
 
+    # 板块开关（为 False 则剔除该板块股票）
+    include_star_market = True  # 科创板（688/689.XSHG）
+    include_chinext = True  # 创业板（300/301.XSHE）
+    include_bse = True  # 北交所（*.XBEI / *.XBSE）
+    include_neeq = True  # 新三板（*.XNE / *.XNEE / *.XNEQ / *.XNEX）
+
     # 设备
     device         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

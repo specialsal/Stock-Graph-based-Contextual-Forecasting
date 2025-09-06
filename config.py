@@ -92,6 +92,12 @@ class Config:
     # -------- 损失加权（新增） --------
     ranking_weight  = 0.5           # loss = w*(1 - Pearson) + (1-w)*pairwise_rank
 
+    # -------- 板块开关（为 False 则剔除该板块股票）--------
+    include_star_market = True  # 科创板（688/689.XSHG）
+    include_chinext = True  # 创业板（300/301.XSHE）
+    include_bse = True  # 北交所（*.XBEI / *.XBSE）
+    include_neeq = True  # 新三板（*.XNE / *.XNEE / *.XNEQ / *.XNEX）
+
     # -------- 其他 --------
     seed = 42
 
