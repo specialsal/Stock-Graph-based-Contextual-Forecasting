@@ -2,22 +2,17 @@
 # coding: utf-8
 """
 滚动训练主循环（日频 + 行业图/可关闭）
-本版本特性：
+本版本特性（含测试集与按测试集选优）：
 - 使用 train_utils 抽离通用函数，精简主文件
-- 每个训练窗口仅用“训练分组”拟合 Scaler（避免未来信息泄露）
-- 训练损失：loss = w*(1 - Pearson) + (1 - w)*PairwiseRanking（w=CFG.ranking_weight，默认0.5）
-- 训练进度条与日志同时显示：
-  * 总损失 loss（权重后的总损失）
-  * pairwise 排序损失 pairwise ranking loss（未加权，仅原始 pairwise ranking loss）
-  * ic_p（Pearson相关系数）
-  * ic_r（RankIC）
-- 评估阶段按周五分组计算 MSE / Pearson / RankIC 及 RankIC 的标准差，并输出 pairwise ranking loss 与加权 loss
-- 按验证集指标选择 best 模型，登记全局与最近N窗口最优并复制到固定路径
-- RAM 常驻加速路径（窗口级一次性加载 Train/Val 到内存，epoch 内零 IO），由 CFG.ram_accel_enable 控制；
-  若估算内存超过 CFG.ram_accel_mem_cap_gb 则自动回退为逐组加载
-- 修复：按“真实日期 -> H5组键”的映射取组，避免固定 date_编号导致的“窗口不滚动”问题
+- 每个训练窗口仅用“训练分组”拟合 Scaler（避免未来信息）
+- 训练损失：loss = w*(1 - Pearson) + (1 - w)*PairwiseRanking（w=CFG.ranking_weight）
+- 训练/验证/测试：均以“周”为粒度（周五采样），训练周数=5*52（可调），验证周数=CFG.val_weeks，测试周数=CFG.test_weeks
+- 每个 epoch 打印 Train/Val/Test 指标
+- 最优模型按测试集风险调整分数：test_score = test_avg_rankic - alpha * test_std_rankic 选择与保存
+- 训练结束登记时，同时记录 Val 与 Test 指标；“全局最优/最近N最优”也按 test_score 选择
+- RAM 常驻加速路径（窗口级一次性加载 Train/Val/Test 到内存，epoch 内零 IO），超过内存上限自动回退
+- 修复：按“真实日期 -> H5组键”的映射取组，保证窗口正确滚动
 """
-
 import math, torch, pandas as pd, numpy as np, h5py, shutil
 import torch.nn.functional as F
 from pathlib import Path
@@ -46,10 +41,6 @@ def save_checkpoint(model, path: Path, scaler_d=None):
     torch.save(payload, path)
 
 def build_date_to_group_map(h5: h5py.File) -> dict:
-    """
-    从 H5 的每个 group 的 attrs['date'] 构建 {date(pd.Timestamp) -> group_key(str)} 映射。
-    如果存在同一日期多个组，后出现的会覆盖前者（一般不建议出现重复日期）。
-    """
     d2g = {}
     for k in h5.keys():
         if not k.startswith("date_"):
@@ -106,7 +97,6 @@ def main():
         except Exception as e:
             print(f"torch.compile 启用失败：{e}")
 
-    # 重要：AdamW 使用关键字传入 lr 与 weight_decay；fused 在不支持时自动回退
     opt = try_fused_adamw(model.parameters(), CFG.lr, CFG.weight_decay)
     scaler_grad = torch.amp.GradScaler("cuda", enabled=(amp_dtype == torch.float16))
 
@@ -120,31 +110,39 @@ def main():
         filter_fn = make_filter_fn(daily_price_df, stock_info_df, susp_df, st_df)
         print("[筛选] 已启用股票样本过滤" if filter_fn else "[筛选] 未启用过滤（或配置关闭）")
 
+    train_weeks = CFG.train_years * 52
+    val_weeks   = int(CFG.val_weeks)
+    test_weeks  = int(getattr(CFG, "test_weeks", 52))
+    step_weeks  = int(CFG.step_weeks)
+    alpha       = float(getattr(CFG, "score_alpha", 0.5))
+    w_loss      = float(getattr(CFG, "ranking_weight", 0.5))
+
     # 6) 滚动训练
     with h5py.File(daily_h5, "r") as h5:
-        # 新增：构建真实日期 -> 组键映射
         date2gk_all = build_date_to_group_map(h5)
         if len(date2gk_all) == 0:
             raise RuntimeError(f"H5 中没有任何以 date_* 命名的组：{daily_h5}")
 
-        # 以“训练年数 * 52周”为滑动窗口的训练起点；每次步进 step_weeks
-        for i in range(CFG.train_years * 52,
-                       len(fridays) - CFG.val_weeks - 1,
-                       CFG.step_weeks):
+        # 需要满足：i + val_weeks + test_weeks - 1 < len(fridays)
+        for i in range(train_weeks,
+                       len(fridays) - val_weeks - test_weeks + 1,
+                       step_weeks):
 
             # 时间切片（当前窗口的真实日期列表）
-            train_dates = fridays[i - CFG.train_years * 52 : i]
-            val_dates   = fridays[i : i + CFG.val_weeks]
-            pred_date   = fridays[i + CFG.val_weeks]
+            train_dates = fridays[i - train_weeks : i]
+            val_dates   = fridays[i : i + val_weeks]
+            test_dates  = fridays[i + val_weeks : i + val_weeks + test_weeks]
+            pred_date   = fridays[i + val_weeks]  # 测试集起始周五（命名锚点）
 
-            # 按日期映射到组键（跳过 H5 缺失日期）
+            # 按日期映射到组键
             train_gk = [date2gk_all[d] for d in train_dates if d in date2gk_all]
             val_gk   = [date2gk_all[d] for d in val_dates   if d in date2gk_all]
+            test_gk  = [date2gk_all[d] for d in test_dates  if d in date2gk_all]
 
             # 仅用“训练组”拟合当期标准化 Scaler（避免未来信息）
             scaler_d = fit_scaler_for_groups(h5, train_gk)
 
-            # 粗略样本量统计
+            # 样本计数
             def _count_samples(keys):
                 n = 0
                 for k in keys:
@@ -155,21 +153,21 @@ def main():
             print(f"=== 窗口 {pred_date.strftime('%Y-%m-%d')} === "
                   f"TrainDates={len(train_dates)}(H5命中={len(train_gk)}) "
                   f"ValDates={len(val_dates)}(H5命中={len(val_gk)}) "
-                  f"TrainSamples≈{_count_samples(train_gk)} ValSamples≈{_count_samples(val_gk)}")
+                  f"TestDates={len(test_dates)}(H5命中={len(test_gk)}) "
+                  f"TrainSamples≈{_count_samples(train_gk)} "
+                  f"ValSamples≈{_count_samples(val_gk)} "
+                  f"TestSamples≈{_count_samples(test_gk)}")
 
-            # 若命中率过低，提示并跳过该窗口
-            if len(train_gk) == 0 or len(val_gk) == 0:
-                print("[警告] 该窗口在 H5 中命中组过少，跳过本窗口训练。")
+            # 命中不足则跳过该窗口
+            if len(train_gk) == 0 or len(val_gk) == 0 or len(test_gk) == 0:
+                print("[警告] 该窗口在 H5 中命中组过少（Train/Val/Test 存在空），跳过本窗口。")
                 continue
 
-            # 选择指标：rankic 或 pearson
-            select_metric = getattr(CFG, "select_metric", "rankic")
-            w_loss = float(getattr(CFG, "ranking_weight", 0.5))
-
-            # RAM 分支：根据配置决定是否一次性将 Train/Val 载入内存
+            # RAM 预载
             use_ram = bool(getattr(CFG, "ram_accel_enable", False))
             mem_items_train = None
             mem_items_val = None
+            mem_items_test = None
             if use_ram:
                 mem_items_train, gb_train = load_window_to_ram(
                     h5, train_gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn
@@ -177,18 +175,22 @@ def main():
                 mem_items_val, gb_val = load_window_to_ram(
                     h5, val_gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn
                 )
-                total_gb = gb_train + gb_val
+                mem_items_test, gb_test = load_window_to_ram(
+                    h5, test_gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn
+                )
+                total_gb = gb_train + gb_val + gb_test
                 cap_gb = float(getattr(CFG, "ram_accel_mem_cap_gb", 48))
                 if total_gb > cap_gb:
                     print(f"[RAM预载] 估算内存 {total_gb:.2f} GB 超过上限 {cap_gb:.2f} GB，回退为逐组加载模式")
                     use_ram = False
                     mem_items_train = None
                     mem_items_val = None
+                    mem_items_test = None
                 else:
                     print(f"[RAM预载] 启用 RAM 模式，总内存估算 {total_gb:.2f} GB（<= {cap_gb:.2f} GB）")
 
-            # 训练多个 epoch，保存 best
-            best_metric = -1e9
+            # 训练多个 epoch，按“测试集分数”保存 best
+            best_metric = -1e9   # 测试分数（越大越好）
             best_epoch  = -1
             best_path   = CFG.model_dir / f"model_best_{pred_date.strftime('%Y%m%d')}.pth"
 
@@ -196,12 +198,11 @@ def main():
                 # ---------------- 训练 1 个 epoch ---------------- #
                 model.train()
                 loss_sum = icp_sum = icr_sum = 0.0
-                rank_sum = 0.0  # 额外：统计 pairwise ranking loss 的平均值
+                rank_sum = 0.0
                 n_sum = 0
                 opt.zero_grad(set_to_none=True)
                 step = 0
 
-                # 数据迭代器：RAM 常驻或逐组加载
                 if use_ram:
                     data_iter = iterate_ram_minibatches(mem_items_train, CFG.batch_size, shuffle=True)
                     pbar = tqdm(data_iter, total=None, leave=False, desc="train-fast[RAM]")
@@ -214,12 +215,10 @@ def main():
                         total=None, leave=False, desc="train-fast"
                     )
 
-                # autocast 上下文（在 amp_dtype 不为 None 且启用 CUDA 时启用）
                 autocast_ctx = torch.amp.autocast("cuda", dtype=amp_dtype, enabled=(amp_dtype is not None)) \
                                if (amp_dtype is not None) else nullcontext()
 
                 for fd, ind, ctx, y in pbar:
-                    # 送设备
                     fd = fd.to(CFG.device, non_blocking=HAS_CUDA)
                     ind = ind.to(CFG.device, non_blocking=HAS_CUDA)
                     ctx = ctx.to(CFG.device, non_blocking=HAS_CUDA)
@@ -227,22 +226,17 @@ def main():
 
                     with autocast_ctx:
                         pred = model(fd, ind, ctx)
-                        # Pearson 部分：若无法计算（方差≈0），回退到 MSE
                         cc = pearsonr(pred, y)
                         loss_pearson = (1 - cc) if not torch.isnan(cc) else F.mse_loss(pred, y)
-                        # Pairwise 排序损失（原始未缩放值，用于日志与组合损失）
                         rank_val = pairwise_ranking_loss(pred, y, num_pairs=2048)
-                        # 加权总损失
                         loss = w_loss * loss_pearson + (1 - w_loss) * rank_val
 
-                    # 梯度累积：先缩放后 backward
                     loss_scaled = loss / CFG.grad_accum_steps
                     if amp_dtype == torch.float16:
                         scaler_grad.scale(loss_scaled).backward()
                     else:
                         loss_scaled.backward()
 
-                    # 到达累积步数，执行优化器 step
                     do_step = ((step + 1) % CFG.grad_accum_steps == 0)
                     if do_step:
                         if amp_dtype == torch.float16:
@@ -251,11 +245,9 @@ def main():
                             opt.step()
                         opt.zero_grad(set_to_none=True)
 
-                    # 训练中实时统计
                     with torch.no_grad():
                         bs = y.shape[0]
                         n_sum += bs
-                        # 注意：日志统计使用“未缩放”的 loss 与 rank_val
                         loss_sum += loss.detach().float().item() * bs
                         rank_sum += rank_val.detach().float().item() * bs
                         icp = float(cc.detach().float().item()) if not torch.isnan(cc) else float("nan")
@@ -280,17 +272,15 @@ def main():
                       f"ic_p={icp_sum/max(1,n_sum):.4f} ic_r={icr_sum/max(1,n_sum):.4f} "
                       f"w={w_loss}")
 
-                # ---------------- 验证（按组聚合） ---------------- #
+                # ---------------- 验证评估 ---------------- #
                 model.eval()
-                per_date = []
-                if use_ram:
-                    # RAM 模式：使用内存中的 val items
-                    for it in mem_items_val:
+                def eval_split_ram(mem_items):
+                    per_date = []
+                    for it in mem_items:
                         X = torch.from_numpy(it["X"]).to(CFG.device, non_blocking=HAS_CUDA)
                         ind_t = torch.from_numpy(it["ind"]).to(CFG.device, non_blocking=HAS_CUDA)
                         ctx_t = torch.from_numpy(it["ctx"]).to(CFG.device, non_blocking=HAS_CUDA)
                         y_t  = torch.from_numpy(it["y"]).to(CFG.device, non_blocking=HAS_CUDA)
-
                         preds = []
                         bs = CFG.batch_size
                         for st in range(0, X.shape[0], bs):
@@ -298,7 +288,6 @@ def main():
                             preds.append(p.detach().float().cpu())
                         pred_cpu = torch.cat(preds, 0)
                         y_cpu = y_t.detach().float().cpu()
-
                         mse  = F.mse_loss(pred_cpu, y_cpu).item()
                         cc_t = pearsonr(pred_cpu, y_cpu)
                         cc   = float(cc_t.item()) if not torch.isnan(cc_t) else float("nan")
@@ -308,13 +297,13 @@ def main():
                             loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
                         else:
                             loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
-                        per_date.append({
-                            "mse": mse, "ic_pearson": cc, "ic_rank": ric,
-                            "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)
-                        })
-                else:
-                    # 原逐组加载
-                    for gk in val_gk:
+                        per_date.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
+                                         "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
+                    return per_date
+
+                def eval_split_stream(keys):
+                    per_date = []
+                    for gk in keys:
                         out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
                         if out is None:
                             continue
@@ -323,7 +312,6 @@ def main():
                         ind_t = ind_t.to(CFG.device, non_blocking=HAS_CUDA)
                         ctx_t = ctx_t.to(CFG.device, non_blocking=HAS_CUDA)
                         y_t  = y_t.to(CFG.device, non_blocking=HAS_CUDA)
-
                         preds = []
                         bs = CFG.batch_size
                         for st in range(0, X.shape[0], bs):
@@ -331,7 +319,6 @@ def main():
                             preds.append(p.detach().float().cpu())
                         pred_cpu = torch.cat(preds, 0)
                         y_cpu = y_t.detach().float().cpu()
-
                         mse  = F.mse_loss(pred_cpu, y_cpu).item()
                         cc_t = pearsonr(pred_cpu, y_cpu)
                         cc   = float(cc_t.item()) if not torch.isnan(cc_t) else float("nan")
@@ -341,29 +328,30 @@ def main():
                             loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
                         else:
                             loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
-                        per_date.append({
-                            "mse": mse, "ic_pearson": cc, "ic_rank": ric,
-                            "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)
-                        })
+                        per_date.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
+                                         "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
+                    return per_date
 
-                if len(per_date) == 0:
+                # Val
+                per_date_val = eval_split_ram(mem_items_val) if (use_ram and mem_items_val is not None) else eval_split_stream(val_gk)
+                if len(per_date_val) == 0:
                     valm = {"avg_mse": float("nan"), "avg_ic_pearson": float("nan"),
                             "avg_ic_rank": float("nan"), "std_ic_rank": float("nan"),
                             "avg_pairwise_rank": float("nan"), "avg_loss": float("nan"),
                             "dates": 0}
                 else:
-                    n_total = sum(d["n"] for d in per_date)
-                    wv = [d["n"] / n_total for d in per_date]
-                    avg_mse = sum(d["mse"] * wi for d, wi in zip(per_date, wv))
-                    avg_icp = sum((0.0 if math.isnan(d["ic_pearson"]) else d["ic_pearson"]) * wi for d, wi in zip(per_date, wv))
-                    avg_icr = sum(d["ic_rank"] * wi for d, wi in zip(per_date, wv))
-                    std_icr = float(np.std([d["ic_rank"] for d in per_date], ddof=1)) if len(per_date) > 1 else 0.0
-                    avg_prl = sum(d["pairwise_rank"] * wi for d, wi in zip(per_date, wv))
-                    avg_loss = sum(d["loss"] * wi for d, wi in zip(per_date, wv))
+                    n_total = sum(d["n"] for d in per_date_val)
+                    wv = [d["n"] / n_total for d in per_date_val]
+                    avg_mse = sum(d["mse"] * wi for d, wi in zip(per_date_val, wv))
+                    avg_icp = sum((0.0 if math.isnan(d["ic_pearson"]) else d["ic_pearson"]) * wi for d, wi in zip(per_date_val, wv))
+                    avg_icr = sum(d["ic_rank"] * wi for d, wi in zip(per_date_val, wv))
+                    std_icr = float(np.std([d["ic_rank"] for d in per_date_val], ddof=1)) if len(per_date_val) > 1 else 0.0
+                    avg_prl = sum(d["pairwise_rank"] * wi for d, wi in zip(per_date_val, wv))
+                    avg_loss = sum(d["loss"] * wi for d, wi in zip(per_date_val, wv))
                     valm = {"avg_mse": float(avg_mse), "avg_ic_pearson": float(avg_icp),
                             "avg_ic_rank": float(avg_icr), "std_ic_rank": float(std_icr),
                             "avg_pairwise_rank": float(avg_prl), "avg_loss": float(avg_loss),
-                            "dates": len(per_date)}
+                            "dates": len(per_date_val)}
 
                 print(f"  Val: mse={valm['avg_mse']:.6f} "
                       f"ic_p={valm['avg_ic_pearson']:.4f} "
@@ -373,10 +361,39 @@ def main():
                       f"ic_r_std={valm['std_ic_rank']:.4f} dates={valm['dates']} "
                       f"w={w_loss}")
 
-                # 保存 best（选择指标支持 rankic 或 pearson）
-                sel = valm["avg_ic_rank"] if select_metric == "rankic" else valm["avg_ic_pearson"]
-                if math.isfinite(sel) and sel > best_metric:
-                    best_metric = sel
+                # Test
+                per_date_test = eval_split_ram(mem_items_test) if (use_ram and mem_items_test is not None) else eval_split_stream(test_gk)
+                if len(per_date_test) == 0:
+                    testm = {"avg_mse": float("nan"), "avg_ic_pearson": float("nan"),
+                             "avg_ic_rank": float("nan"), "std_ic_rank": float("nan"),
+                             "avg_pairwise_rank": float("nan"), "avg_loss": float("nan"),
+                             "dates": 0}
+                else:
+                    n_total = sum(d["n"] for d in per_date_test)
+                    wv = [d["n"] / n_total for d in per_date_test]
+                    avg_mse = sum(d["mse"] * wi for d, wi in zip(per_date_test, wv))
+                    avg_icp = sum((0.0 if math.isnan(d["ic_pearson"]) else d["ic_pearson"]) * wi for d, wi in zip(per_date_test, wv))
+                    avg_icr = sum(d["ic_rank"] * wi for d, wi in zip(per_date_test, wv))
+                    std_icr = float(np.std([d["ic_rank"] for d in per_date_test], ddof=1)) if len(per_date_test) > 1 else 0.0
+                    avg_prl = sum(d["pairwise_rank"] * wi for d, wi in zip(per_date_test, wv))
+                    avg_loss = sum(d["loss"] * wi for d, wi in zip(per_date_test, wv))
+                    testm = {"avg_mse": float(avg_mse), "avg_ic_pearson": float(avg_icp),
+                             "avg_ic_rank": float(avg_icr), "std_ic_rank": float(std_icr),
+                             "avg_pairwise_rank": float(avg_prl), "avg_loss": float(avg_loss),
+                             "dates": len(per_date_test)}
+
+                test_score = (testm["avg_ic_rank"] - alpha * testm["std_ic_rank"]) if math.isfinite(testm["avg_ic_rank"]) else -1e9
+                print(f"  Test: mse={testm['avg_mse']:.6f} "
+                      f"ic_p={testm['avg_ic_pearson']:.4f} "
+                      f"ic_r={testm['avg_ic_rank']:.4f} "
+                      f"pairwise ranking loss={testm['avg_pairwise_rank']:.4f} "
+                      f"loss={testm['avg_loss']:.4f} "
+                      f"ic_r_std={testm['std_ic_rank']:.4f} dates={testm['dates']} "
+                      f"score={test_score:.4f} (alpha={alpha})")
+
+                # 保存 best（以测试分数为准）
+                if math.isfinite(test_score) and test_score > best_metric:
+                    best_metric = test_score
                     best_epoch  = ep + 1
                     save_checkpoint(model, best_path, scaler_d=scaler_d)
 
@@ -385,15 +402,35 @@ def main():
             save_checkpoint(model, last_path, scaler_d=scaler_d)
             print(f"窗口结束，已保存：last -> {last_path.name} , best(ep={best_epoch}) -> {best_path.name}")
 
-            # ---------------- 记录与选择全局/最近N最优 ---------------- #
-            # 载入 best，统一用同一 scaler_d 在验证集上复算一次指标并登记
+            # ---------------- 记录与选择全局/最近N最优（按测试分数） ---------------- #
+            # 载入 best 并对 Val/Test 统一评估一次
             payload = torch.load(best_path, map_location=CFG.device)
             state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
             model.load_state_dict(state_dict, strict=False)
-
             model.eval()
-            per_date = []
-            if use_ram:
+
+            def summarize(per_date):
+                if len(per_date) == 0:
+                    return {"avg_mse": float("nan"), "avg_ic_pearson": float("nan"),
+                            "avg_ic_rank": float("nan"), "std_ic_rank": float("nan"),
+                            "avg_pairwise_rank": float("nan"), "avg_loss": float("nan"),
+                            "dates": 0}
+                n_total = sum(d["n"] for d in per_date)
+                wv = [d["n"] / n_total for d in per_date]
+                avg_mse = sum(d["mse"] * wi for d, wi in zip(per_date, wv))
+                avg_icp = sum((0.0 if math.isnan(d["ic_pearson"]) else d["ic_pearson"]) * wi for d, wi in zip(per_date, wv))
+                avg_icr = sum(d["ic_rank"] * wi for d, wi in zip(per_date, wv))
+                std_icr = float(np.std([d["ic_rank"] for d in per_date], ddof=1)) if len(per_date) > 1 else 0.0
+                avg_prl = sum(d["pairwise_rank"] * wi for d, wi in zip(per_date, wv))
+                avg_loss = sum(d["loss"] * wi for d, wi in zip(per_date, wv))
+                return {"avg_mse": float(avg_mse), "avg_ic_pearson": float(avg_icp),
+                        "avg_ic_rank": float(avg_icr), "std_ic_rank": float(std_icr),
+                        "avg_pairwise_rank": float(avg_prl), "avg_loss": float(avg_loss),
+                        "dates": len(per_date)}
+
+            # Val 评估
+            if use_ram and mem_items_val is not None:
+                per_date_val = []
                 for it in mem_items_val:
                     X = torch.from_numpy(it["X"]).to(CFG.device, non_blocking=HAS_CUDA)
                     ind_t = torch.from_numpy(it["ind"]).to(CFG.device, non_blocking=HAS_CUDA)
@@ -415,9 +452,10 @@ def main():
                         loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
                     else:
                         loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
-                    per_date.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
-                                     "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
+                    per_date_val.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
+                                         "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
             else:
+                per_date_val = []
                 for gk in val_gk:
                     out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
                     if out is None: continue
@@ -442,35 +480,77 @@ def main():
                         loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
                     else:
                         loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
-                    per_date.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
-                                     "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
+                    per_date_val.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
+                                         "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
 
-            if len(per_date) == 0:
-                final_val = {"avg_mse": float("nan"), "avg_ic_pearson": float("nan"),
-                             "avg_ic_rank": float("nan"), "std_ic_rank": float("nan"),
-                             "avg_pairwise_rank": float("nan"), "avg_loss": float("nan"),
-                             "dates": 0}
+            final_val = summarize(per_date_val)
+
+            # Test 评估
+            if use_ram and mem_items_test is not None:
+                per_date_test = []
+                for it in mem_items_test:
+                    X = torch.from_numpy(it["X"]).to(CFG.device, non_blocking=HAS_CUDA)
+                    ind_t = torch.from_numpy(it["ind"]).to(CFG.device, non_blocking=HAS_CUDA)
+                    ctx_t = torch.from_numpy(it["ctx"]).to(CFG.device, non_blocking=HAS_CUDA)
+                    y_t  = torch.from_numpy(it["y"]).to(CFG.device, non_blocking=HAS_CUDA)
+                    preds = []
+                    bs = CFG.batch_size
+                    for st in range(0, X.shape[0], bs):
+                        p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
+                        preds.append(p.detach().float().cpu())
+                    pred_cpu = torch.cat(preds, 0)
+                    y_cpu = y_t.detach().float().cpu()
+                    mse  = F.mse_loss(pred_cpu, y_cpu).item()
+                    cc_t = pearsonr(pred_cpu, y_cpu)
+                    cc   = float(cc_t.item()) if not torch.isnan(cc_t) else float("nan")
+                    ric  = rank_ic(pred_cpu, y_cpu)
+                    prl  = float(pairwise_ranking_loss(pred_cpu, y_cpu, num_pairs=2048).item())
+                    if not math.isnan(cc):
+                        loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
+                    else:
+                        loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
+                    per_date_test.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
+                                          "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
             else:
-                n_total = sum(d["n"] for d in per_date)
-                wv = [d["n"] / n_total for d in per_date]
-                avg_mse = sum(d["mse"] * wi for d, wi in zip(per_date, wv))
-                avg_icp = sum((0.0 if math.isnan(d["ic_pearson"]) else d["ic_pearson"]) * wi for d, wi in zip(per_date, wv))
-                avg_icr = sum(d["ic_rank"] * wi for d, wi in zip(per_date, wv))
-                std_icr = float(np.std([d["ic_rank"] for d in per_date], ddof=1)) if len(per_date) > 1 else 0.0
-                avg_prl = sum(d["pairwise_rank"] * wi for d, wi in zip(per_date, wv))
-                avg_loss = sum(d["loss"] * wi for d, wi in zip(per_date, wv))
-                final_val = {"avg_mse": float(avg_mse), "avg_ic_pearson": float(avg_icp),
-                             "avg_ic_rank": float(avg_icr), "std_ic_rank": float(std_icr),
-                             "avg_pairwise_rank": float(avg_prl), "avg_loss": float(avg_loss),
-                             "dates": len(per_date)}
+                per_date_test = []
+                for gk in test_gk:
+                    out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
+                    if out is None: continue
+                    X, ind_t, ctx_t, y_t = [torch.from_numpy(o) for o in out[:4]]
+                    X = X.to(CFG.device, non_blocking=HAS_CUDA)
+                    ind_t = ind_t.to(CFG.device, non_blocking=HAS_CUDA)
+                    ctx_t = ctx_t.to(CFG.device, non_blocking=HAS_CUDA)
+                    y_t  = y_t.to(CFG.device, non_blocking=HAS_CUDA)
+                    preds = []
+                    bs = CFG.batch_size
+                    for st in range(0, X.shape[0], bs):
+                        p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
+                        preds.append(p.detach().float().cpu())
+                    pred_cpu = torch.cat(preds, 0)
+                    y_cpu = y_t.detach().float().cpu()
+                    mse  = F.mse_loss(pred_cpu, y_cpu).item()
+                    cc_t = pearsonr(pred_cpu, y_cpu)
+                    cc   = float(cc_t.item()) if not torch.isnan(cc_t) else float("nan")
+                    ric  = rank_ic(pred_cpu, y_cpu)
+                    prl  = float(pairwise_ranking_loss(pred_cpu, y_cpu, num_pairs=2048).item())
+                    if not math.isnan(cc):
+                        loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
+                    else:
+                        loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
+                    per_date_test.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
+                                          "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
 
-            # 写入登记表
+            final_test = summarize(per_date_test)
+            final_test_score = final_test["avg_ic_rank"] - alpha * final_test["std_ic_rank"]
+
+            # 写入登记表（按测试分数）
             registry_file = getattr(CFG, "registry_file", CFG.model_dir / "model_registry.csv")
             row = {
                 "pred_date": pred_date.strftime("%Y-%m-%d"),
                 "best_epoch": best_epoch,
                 "best_path": str(best_path),
                 "last_path": str(last_path),
+
                 "val_avg_mse": final_val["avg_mse"],
                 "val_avg_pearson": final_val["avg_ic_pearson"],
                 "val_avg_rankic": final_val["avg_ic_rank"],
@@ -478,7 +558,16 @@ def main():
                 "val_avg_pairwise_ranking_loss": final_val["avg_pairwise_rank"],
                 "val_avg_loss": final_val["avg_loss"],
                 "val_dates": final_val["dates"],
-                "ranking_weight": w_loss,  # 记录当前窗口使用的 w
+
+                "test_avg_mse": final_test["avg_mse"],
+                "test_avg_pearson": final_test["avg_ic_pearson"],
+                "test_avg_rankic": final_test["avg_ic_rank"],
+                "test_std_rankic": final_test["std_ic_rank"],
+                "test_avg_pairwise_ranking_loss": final_test["avg_pairwise_rank"],
+                "test_avg_loss": final_test["avg_loss"],
+                "test_dates": final_test["dates"],
+
+                "ranking_weight": w_loss,
             }
             df_new = pd.DataFrame([row])
             if Path(registry_file).exists():
@@ -489,28 +578,29 @@ def main():
             Path(registry_file).parent.mkdir(parents=True, exist_ok=True)
             df_all.to_csv(registry_file, index=False)
 
-            # 选择全局最优与最近N窗口最优，并复制到固定路径
+            # 选择全局最优与最近N最优 —— 按测试分数 score_test
             alpha = getattr(CFG, "score_alpha", 0.5)
             recentN = getattr(CFG, "recent_topN", 5)
             df = df_all.copy()
-            df["score"] = df["val_avg_rankic"] - alpha * df["val_std_rankic"]
-            best_overall = df.loc[df["score"].idxmax()].to_dict()
+            df["score_test"] = df["test_avg_rankic"] - alpha * df["test_std_rankic"]
+
+            best_overall = df.loc[df["score_test"].idxmax()].to_dict()
             best_recent = None
             if recentN > 0 and len(df) >= 1:
                 df_recent = df.sort_values("pred_date").tail(recentN).copy()
-                df_recent["score"] = df_recent["val_avg_rankic"] - alpha * df_recent["val_std_rankic"]
-                best_recent = df_recent.loc[df_recent["score"].idxmax()].to_dict()
+                df_recent["score_test"] = df_recent["test_avg_rankic"] - alpha * df_recent["test_std_rankic"]
+                best_recent = df_recent.loc[df_recent["score_test"].idxmax()].to_dict()
 
-            if best_overall is not None:
+            if best_overall is not None and isinstance(best_overall.get("best_path", None), str) and Path(best_overall["best_path"]).exists():
                 dst = CFG.model_dir / "best_overall.pth"
                 ensure_parent_dir(dst)
                 shutil.copy2(best_overall["best_path"], dst)
-            if best_recent is not None:
+            if best_recent is not None and isinstance(best_recent.get("best_path", None), str) and Path(best_recent["best_path"]).exists():
                 dst = CFG.model_dir / f"best_recent_{recentN}.pth"
                 ensure_parent_dir(dst)
                 shutil.copy2(best_recent["best_path"], dst)
 
-    print("训练完成。全局最优模型：", (CFG.model_dir / "best_overall.pth").as_posix())
+    print("训练完成。全局最优模型（按测试分数）：", (CFG.model_dir / "best_overall.pth").as_posix())
 
 if __name__ == "__main__":
     main()

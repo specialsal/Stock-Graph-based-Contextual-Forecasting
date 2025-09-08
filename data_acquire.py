@@ -11,7 +11,7 @@ import rqdatac as rq
 # 基础配置
 # =========================
 # 如果有账号密码: rq.init('user','pwd')
-rq.init('15005800360','123456')
+rq.init()
 
 DATA_PATH = 'data/raw/'
 os.makedirs(DATA_PATH, exist_ok=True)
@@ -23,13 +23,13 @@ TRADING_DAY_END = '2030-12-31'
 # 是否更新的开关（可按需修改）
 UPDATE_SWITCH = {
     'trading_calendar': True,      # 交易日 & 交易周
-    'stock_info': False,            # 股票信息（聚宽导出覆盖）
-    'stock_price_day': False,       # 股票日行情（parquet, MultiIndex）
-    'suspended': False,             # 停牌（CSV 宽表）
-    'is_st': False,                 # ST（CSV 宽表）
-    'index_components': False,      # 指数成分（快照覆盖）
-    'industry_and_style': False,    # 行业与风格（快照覆盖 + 映射）
-    'index_price_day': False,       # 指数日行情（parquet, MultiIndex）
+    'stock_info': True,            # 股票信息（聚宽导出覆盖）
+    'stock_price_day': True,       # 股票日行情（parquet, MultiIndex）
+    'suspended': True,             # 停牌（CSV 宽表）
+    'is_st': True,                 # ST（CSV 宽表）
+    'index_components': True,      # 指数成分（快照覆盖）
+    'industry_and_style': True,    # 行业与风格（快照覆盖 + 映射）
+    'index_price_day': True,       # 指数日行情（parquet, MultiIndex）
 }
 
 # 可选：在获取行情时过滤无效代码，减少 invalid order_book_id 警告
@@ -173,7 +173,8 @@ def update_trading_calendar(start='2001-01-01', end=TRADING_DAY_END):
     if df_old is not None and not df_old.empty:
         last_day = pd.to_datetime(df_old['trading_day']).max().strftime('%Y-%m-%d')
 
-    fetch_start = start if last_day is None else next_day_str(last_day)
+    # 改为包含 last_day 本身
+    fetch_start = start if last_day is None else last_day
     if pd.to_datetime(fetch_start) <= pd.to_datetime(end):
         new_days = rq.get_trading_dates(start_date=fetch_start.replace('-', ''), end_date=end.replace('-', ''))
         new_days = [d.strftime('%Y-%m-%d') for d in new_days]
@@ -241,7 +242,8 @@ def update_stock_price_day(start='2010-01-01', end=TODAY_STR):
                 df_old = df_old.set_index(['order_book_id', 'datetime']).sort_index()
 
     last_dt = max_datetime_from_multiindex(df_old)
-    fetch_start = start if last_dt is None else next_day_str(last_dt.strftime('%Y-%m-%d'))
+    # 改为包含 last_dt 当天
+    fetch_start = start if last_dt is None else last_dt.strftime('%Y-%m-%d')
     if pd.to_datetime(fetch_start) > pd.to_datetime(end):
         return
 
@@ -299,7 +301,8 @@ def update_suspended(start='2010-01-01', end=TODAY_STR):
             pass
 
     last_day = max_date_from_index_as_str(df_old)
-    fetch_start = start if last_day is None else next_day_str(last_day)
+    # 改为包含 last_day 当天
+    fetch_start = start if last_day is None else last_day
     if pd.to_datetime(fetch_start) > pd.to_datetime(end):
         return
 
@@ -340,7 +343,8 @@ def update_is_st(start='2010-01-01', end=TODAY_STR):
             pass
 
     last_day = max_date_from_index_as_str(df_old)
-    fetch_start = start if last_day is None else next_day_str(last_day)
+    # 改为包含 last_day 当天
+    fetch_start = start if last_day is None else last_day
     if pd.to_datetime(fetch_start) > pd.to_datetime(end):
         return
 
@@ -429,7 +433,8 @@ def update_index_price_day(start='2010-01-01', end=TODAY_STR):
                 df_old = df_old.set_index(['order_book_id', 'datetime']).sort_index()
 
     last_dt = max_datetime_from_multiindex(df_old)
-    fetch_start = start if last_dt is None else next_day_str(last_dt.strftime('%Y-%m-%d'))
+    # 改为包含 last_dt 当天
+    fetch_start = start if last_dt is None else last_dt.strftime('%Y-%m-%d')
     if pd.to_datetime(fetch_start) > pd.to_datetime(end):
         return
 

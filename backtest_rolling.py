@@ -1,15 +1,16 @@
 # coding: utf-8
 """
-滚动回测（与 5+1 滑窗训练对齐）
-- 根据 CFG.train_years / CFG.val_weeks / CFG.step_weeks 构造滚动窗口
+滚动回测（与 5+1+1 滑窗训练对齐：Train+Val+Test）
+- 根据 CFG.train_years / CFG.val_weeks / CFG.test_weeks / CFG.step_weeks 构造滚动窗口
 - 窗口 i:
     * 训练区间: fridays[i - 5y] ~ fridays[i-1]
-    * 验证/回测区间: fridays[i] ~ fridays[i+val_weeks-1]
-    * 模型命名锚点 pred_date = fridays[i + val_weeks]
+    * 验证区间: fridays[i] ~ fridays[i+val_weeks-1]
+    * 测试区间: fridays[i+val_weeks] ~ fridays[i+val_weeks+test_weeks-1]
+    * 模型命名锚点 pred_date = fridays[i + val_weeks]（测试期起点）
       使用模型: model_best_{pred_date:%Y%m%d}.pth（若无则回退 model_{pred_date:%Y%m%d}.pth）
-    * 回测：对 [fridays[i], pred_date)（即验证年整年）逐周打分
-- 筛选逻辑、周收益、净值与图表输出复用 backtest.py 的口径
-- 注意：要求训练期已按上述命名保存模型；否则该年度将跳过（不做 further fallback，避免穿越）
+    * 回测：对“测试期” [pred_date, pred_date + test_weeks) 逐周打分
+- 筛选逻辑、周收益、净值与图表输出与 backtest.py 保持一致
+- 注意：要求训练期按上述命名保存模型；否则该窗口将跳过（不做进一步回退，避免穿越）
 
 运行:
     python backtest_rolling.py
@@ -311,27 +312,27 @@ def save_nav_plot(nav_df: pd.DataFrame, out_png: Path, title: str):
     plt.close(fig)
 
 
-# ---------------- 依据 CFG 的 5+1+步长 构造滚动年度段 ---------------- #
+# ---------------- 依据 CFG 的 Train+Val+Test 构造滚动段（仅测试期） ---------------- #
 def make_rolling_segments(fridays: pd.DatetimeIndex) -> List[Tuple[pd.Timestamp, pd.DatetimeIndex]]:
     """
-    返回列表，每个元素为 (pred_date, fridays_segment)：
-      - pred_date = fridays[i + CFG.val_weeks]
-      - fridays_segment = [fridays[i], ..., fridays[i + CFG.val_weeks - 1]] = [start, pred_date) 闭开
+    返回列表，每个元素为 (pred_date, fridays_test_segment)：
+      - pred_date = fridays[i + CFG.val_weeks]（测试期起点）
+      - fridays_test_segment = fridays[pred_idx : pred_idx + CFG.test_weeks]
     """
     segs = []
     train_weeks = CFG.train_years * 52
     val_weeks = CFG.val_weeks
+    test_weeks = getattr(CFG, "test_weeks", 52)
     step_weeks = CFG.step_weeks
 
-    # 与 train_rolling.py 的循环一致
-    for i in range(train_weeks, len(fridays) - val_weeks, step_weeks):
-        start = fridays[i]
-        pred_date = fridays[i + val_weeks]  # 命名锚点（次年首周五）
-        mask = (fridays >= start) & (fridays < pred_date)
-        fridays_seg = fridays[mask]
-        if len(fridays_seg) == 0:
+    for i in range(train_weeks, len(fridays) - val_weeks - test_weeks + 1, step_weeks):
+        pred_date = fridays[i + val_weeks]  # 测试起点
+        start_idx = i + val_weeks
+        end_idx = i + val_weeks + test_weeks
+        fridays_test = fridays[start_idx:end_idx]
+        if len(fridays_test) == 0:
             continue
-        segs.append((pred_date, fridays_seg))
+        segs.append((pred_date, fridays_test))
     return segs
 
 
@@ -353,11 +354,11 @@ def main():
 
     cal = load_calendar(BT_CFG.trading_day_file if BT_CFG.trading_day_file.exists() else CFG.trading_day_file)
     fridays_all = weekly_fridays(cal)
-    # 依据 CFG.start_date / CFG.end_date（用户要求“参考 config 的参数”）
+    # 参考 config 的时间边界
     mask_cfg = (fridays_all >= pd.Timestamp(CFG.start_date)) & (fridays_all <= pd.Timestamp(CFG.end_date))
     fridays_all = fridays_all[mask_cfg]
-    if len(fridays_all) < (CFG.train_years * 52 + CFG.val_weeks + 1):
-        raise RuntimeError("交易周五数量不足以构造 5+1 滚动窗口，请检查 CFG.start_date / CFG.end_date")
+    if len(fridays_all) < (CFG.train_years * 52 + CFG.val_weeks + getattr(CFG, "test_weeks", 52) + 1):
+        raise RuntimeError("交易周五数量不足以构造 Train+Val+Test 滚动窗口，请检查 CFG.start_date / CFG.end_date")
 
     # 2) 行业映射、ctx_dim、设备
     ind_map = load_industry_map(BT_CFG.industry_map_file)
@@ -369,7 +370,6 @@ def main():
     print("[RB] 载入日行情并计算周收益")
     price_df = pd.read_parquet(BT_CFG.price_day_file)
     if not isinstance(price_df.index, pd.MultiIndex):
-        # 兼容：若未是 MultiIndex，则尝试设置
         if {"order_book_id", "date"}.issubset(price_df.columns):
             price_df = price_df.set_index(["order_book_id", "date"]).sort_index()
         elif {"order_book_id", "datetime"}.issubset(price_df.columns):
@@ -379,16 +379,16 @@ def main():
         else:
             raise ValueError("price_day_file 需为 MultiIndex(order_book_id, date/datetime) 或具备相应列")
 
-    # close 透视（将第二层索引统一到 DatetimeIndex）
+    # close 透视（第二层索引为 DatetimeIndex）
     second_level = price_df.index.names[1]
     close_pivot = price_df["close"].unstack(level=0)
     close_pivot.index = pd.to_datetime(close_pivot.index)
     close_pivot = close_pivot.sort_index()
 
-    # 按全域周五计算一次周收益和口径起点
+    # 按全域周五计算一次周收益和起点映射
     weekly_ret_all, friday_start_map_all = compute_weekly_returns(close_pivot, fridays_all)
 
-    # 4) 构造过滤闭包（口径与训练一致）
+    # 4) 构造过滤闭包（与训练一致）
     filter_fn = None
     if getattr(BT_CFG, "enable_filters", False):
         # 覆写 CFG 的过滤参数，使 make_filter_fn 读到回测用的门槛/板块开关
@@ -409,7 +409,7 @@ def main():
         filter_fn = make_filter_fn(price_df.reset_index().rename(columns={second_level: "date"}).set_index(["order_book_id", "date"]).sort_index(),
                                    stock_info_df, susp_df, st_df)
 
-    # 5) 依据 CFG 的滑窗构造“年度段”（验证年）并逐段切换模型回测
+    # 5) 依据 CFG 的滑窗构造“测试段”并逐段切换模型回测
     segments = make_rolling_segments(fridays_all)
     if not segments:
         raise RuntimeError("未生成任何滚动段，请检查 CFG.* 参数与交易周五覆盖范围")
@@ -418,23 +418,23 @@ def main():
     preds_flt_all = []
 
     with h5py.File(BT_CFG.feat_file, "r") as h5:
-        for pred_date, fridays_year in segments:
+        for pred_date, fridays_test in segments:
             # 限制到回测区间（可选：BT_CFG.bt_start_date / bt_end_date）
-            bt_mask = (fridays_year >= pd.Timestamp(BT_CFG.bt_start_date)) & (fridays_year <= pd.Timestamp(BT_CFG.bt_end_date))
-            fridays_year = fridays_year[bt_mask]
-            if len(fridays_year) < 1:
+            bt_mask = (fridays_test >= pd.Timestamp(BT_CFG.bt_start_date)) & (fridays_test <= pd.Timestamp(BT_CFG.bt_end_date))
+            fridays_test = fridays_test[bt_mask]
+            if len(fridays_test) < 1:
                 continue
 
-            # 寻找年度模型（严格使用 pred_date 命名的文件，不做 further fallback）
+            # 寻找模型（严格使用 pred_date 命名，pred_date=测试起点）
             ymd = pred_date.strftime("%Y%m%d")
             cand_best = CFG.model_dir / f"model_best_{ymd}.pth"
             cand_last = CFG.model_dir / f"model_{ymd}.pth"
             model_path = cand_best if cand_best.exists() else (cand_last if cand_last.exists() else None)
             if model_path is None:
-                print(f"[RB][跳过] 找不到该段模型：{cand_best.name} / {cand_last.name}，年度起点={fridays_year[0].date()} 终点={fridays_year[-1].date()}")
+                print(f"[RB][跳过] 找不到该段模型：{cand_best.name} / {cand_last.name}，测试起点={fridays_test[0].date()} 终点={fridays_test[-1].date()}")
                 continue
 
-            print(f"[RB] 使用模型 {model_path.name} 预测区间 [{fridays_year[0].date()} ~ {fridays_year[-1].date()}]（闭区间，以周五计）")
+            print(f"[RB] 使用模型 {model_path.name} 预测测试期 [{fridays_test[0].date()} ~ {fridays_test[-1].date()}]（闭区间，以周五计）")
 
             # 6) 加载模型 + scaler
             model = GCFNet(
@@ -458,10 +458,10 @@ def main():
                       "为与训练完全一致，建议在训练保存时一起保存 scaler 参数。")
             model.eval()
 
-            # 7) 年度内逐周预测
+            # 7) 测试期内逐周预测
             preds_year_raw = []
             preds_year_flt = []
-            for d in tqdm(fridays_year, desc=f"年度预测 {fridays_year[0].year}", unit="w", leave=False):
+            for d in tqdm(fridays_test, desc=f"测试期预测 {fridays_test[0].year}", unit="w", leave=False):
                 if d not in date2grp:
                     continue
                 gk = date2grp[d]
@@ -474,7 +474,6 @@ def main():
                 # 筛选（使用该周收益起点口径日）
                 if filter_fn is not None:
                     if d not in friday_start_map_all:
-                        # 找不到口径起点，无法筛选；跳过该周
                         continue
                     start_dt = friday_start_map_all[d]
                     mask = []
@@ -522,12 +521,12 @@ def main():
         pred_df_flt.to_parquet(out_pred_filtered)
         print(f"[RB] 已保存筛选后预测：{out_pred_filtered}")
 
-    # 9) 用筛选后的预测构建组合与净值（若筛选后为空，则退回用原始预测）
+    # 9) 用筛选后的预测构建组合与净值（若筛选后为空，则退回原始预测）
     scores_df = pred_df_flt if len(pred_df_flt) > 0 else pred_df_raw
     if len(scores_df) == 0:
         raise RuntimeError("无可用预测样本，无法构建净值。")
 
-    # 只对“有分数的周”子集计算净值，周收益字典用全域已算的 weekly_ret_all
+    # 周收益字典用全域已算的 weekly_ret_all
     ret_df = build_portfolio(
         scores_df, weekly_ret_all,
         mode=BT_CFG.mode,
@@ -550,7 +549,8 @@ def main():
     print(f"[RB] 已保存净值序列：{out_nav_csv}")
 
     out_png = out_dir / f"nav_rolling_{run_name}.png"
-    save_nav_plot(ret_df, out_png, title=f"Rolling[{CFG.train_years}y+{CFG.val_weeks//52}y-step{CFG.step_weeks//52}y] {BT_CFG.mode}")
+    title = f"Rolling[{CFG.train_years}y+{CFG.val_weeks//52}y+{getattr(CFG,'test_weeks',52)//52}y-step{CFG.step_weeks//52}y] {BT_CFG.mode}"
+    save_nav_plot(ret_df, out_png, title=title)
     print(f"[RB] 已保存净值图：{out_png}")
 
     # 11) 指标
