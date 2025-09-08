@@ -6,6 +6,8 @@
 - 滚动训练阶段不再读取 CFG.scaler_file，不再使用“全局 Scaler”
 - 每个训练窗口会在线拟合当期训练集 Scaler，避免未来信息泄漏
 - 新增 ranking_weight: 训练损失 = w*(1 - Pearson) + (1-w)*PairwiseRanking
+- 新增 test_weeks: 每个窗口引入测试集（单位=周，默认52周）
+- 最优模型判据：test_score = test_avg_rankic - alpha * test_std_rankic
 """
 import torch, random, numpy as np
 from dataclasses import dataclass
@@ -19,7 +21,6 @@ class Config:
     raw_dir       = data_dir / "raw"
     processed_dir = data_dir / "processed"
     feat_file     = processed_dir / "features_daily.h5"
-    scaler_file   = processed_dir / "scaler.pkl"  # 兼容旧字段，但训练阶段不会读取/使用
     label_file    = processed_dir / "weekly_labels.parquet"
     universe_file = processed_dir / "universe.pkl"
     model_dir     = processed_dir / "models"
@@ -36,8 +37,8 @@ class Config:
     is_st_file          = raw_dir / "is_st_stock.csv"
 
     # -------- RAM 加速（窗口级一次性常驻内存）--------
-    ram_accel_enable    = True     # 默认关闭；内存大的机器可手动改为 True
-    ram_accel_mem_cap_gb= 48        # RAM 加速单窗口的内存上限（GB）；超过将自动回退为逐组加载
+    ram_accel_enable    = True     # 内存大的机器可开启
+    ram_accel_mem_cap_gb= 48       # RAM 加速单窗口的内存上限（GB）；超过将自动回退为逐组加载
 
     # -------- 股票筛选（可选） --------
     enable_filters      = True       # 是否启用筛选（关闭则与旧逻辑一致）
@@ -49,12 +50,13 @@ class Config:
 
     # -------- 特征窗口 --------
     max_lookback = 120  # 最大回溯天数（确保足够覆盖所有日频特征）在增量更新时使用
-    daily_window = 20  # 日频特征的时间窗口大小
+    daily_window = 20   # 日频特征的时间窗口大小
 
-    # -------- 滚动窗参数 --------
-    train_years = 5
-    val_weeks   = 52
-    step_weeks  = 52
+    # -------- 滚动窗参数（单位=周）--------
+    train_years = 5     # 训练年数（以年计）；实际以 5*52 周计算
+    val_weeks   = 52    # 验证周数
+    test_weeks  = 52    # 测试周数（新增）
+    step_weeks  = 52    # 步长（周）
     start_date  = "2011-01-01"
     end_date    = datetime.today().strftime("%Y-%m-%d")  # 默认到今天为止
 
@@ -63,40 +65,40 @@ class Config:
     ind_emb       = 16  # 行业嵌入维度
     ctx_dim       = 21  # 上下文特征维度
     tr_layers     = 1   # Transformer 层数
-    gat_layers    = 1  # GAT 层数
-    graph_type    = "gat"        # 图模块类型"mean" 或 "gat"
-    topk_per_ind  = 16  # 每个行业选取的TopK股票数量
-    lr            = 3e-4    # 学习率
-    weight_decay  = 1e-2    # 权重衰减
+    gat_layers    = 1   # GAT 层数
+    graph_type    = "gat"        # 图模块类型 "mean" 或 "gat"
+    topk_per_ind  = 16  # 每个行业选取的TopK股票数量（暂未用）
+    lr            = 3e-4
+    weight_decay  = 1e-2
     epochs_warm   = 20  # 每个窗口训练轮数
 
     # -------- 训练细节 --------
     batch_size        = 8196
-    grad_accum_steps  = 4 # 梯度累积步数
+    grad_accum_steps  = 4
     device            = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    num_workers       = 8   # 数据加载进程数
-    prefetch_factor   = 4   # 每个进程预取批次数
-    persistent_workers= True    # 是否保持数据加载进程常驻
-    pin_memory        = True    # 是否固定内存（加速GPU传输）
-    use_amp           = True    # 是否启用混合精度训练
+    num_workers       = 8
+    prefetch_factor   = 4
+    persistent_workers= True
+    pin_memory        = True
+    use_amp           = True
     amp_dtype         = "bf16"           # "bf16" 或 "fp16"
-    use_tf32          = True    # 是否启用TF32精度
-    use_torch_compile = False   # 是否启用TorchCompile加速
-    print_step_interval = 10    # 每多少步打印一次日志
+    use_tf32          = True
+    use_torch_compile = False
+    print_step_interval = 10
 
     # -------- 选择与记录 --------
-    select_metric   = "rankic"  # 基于验证集平均 RankIC 选择
-    score_alpha     = 0.5       # 全局最优时的风险调整：score = mean - alpha * std
+    select_metric   = "rankic"  # 训练/评估时的度量（日志显示）；但best判据固定使用测试集的 test_score
+    score_alpha     = 0.5       # 风险调整参数：score = mean - alpha * std
     recent_topN     = 5         # 最近 N 个窗口里挑一个最优（输出 best_recent_N.pth）
 
-    # -------- 损失加权（新增） --------
-    ranking_weight  = 0.5           # loss = w*(1 - Pearson) + (1-w)*pairwise_rank
+    # -------- 损失加权 --------
+    ranking_weight  = 0.5       # loss = w*(1 - Pearson) + (1-w)*pairwise_rank
 
-    # -------- 板块开关（为 False 则剔除该板块股票）--------
-    include_star_market = True  # 科创板（688/689.XSHG）
-    include_chinext = True  # 创业板（300/301.XSHE）
-    include_bse = True  # 北交所（*.XBEI / *.XBSE）
-    include_neeq = True  # 新三板（*.XNE / *.XNEE / *.XNEQ / *.XNEX）
+    # -------- 板块开关 --------
+    include_star_market = False  # 科创板（688/689.XSHG）
+    include_chinext = False      # 创业板（300/301.XSHE）
+    include_bse = False          # 北交所（*.XBEI / *.XBSE）
+    include_neeq = False         # 新三板（*.XNE / *.XNEE / *.XNEQ / *.XNEX）
 
     # -------- 其他 --------
     seed = 42

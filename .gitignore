@@ -142,3 +142,5 @@ data/processed/backtest_recent_5/metrics_demo.json
 data/processed/backtest_recent_5/nav_demo.csv
 data/processed/backtest_recent_5/nav_demo.png
 data/processed/backtest_recent_5/predictions_demo.parquet
+__pycache__/train_utils.cpython-310.pyc
+__pycache__/train_utils.cpython-310.pyc

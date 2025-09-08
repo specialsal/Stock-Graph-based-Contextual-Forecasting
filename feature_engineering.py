@@ -8,8 +8,12 @@
 - 线程并行对该片段内的每只股票计算全量因子（相对片段），采样时做窗口切片；
 - 一次性 mad_clip，避免重复标准化；不保存全局 Scaler。
 
+改进点（边界修订覆盖）：
+- 从“最后一个已写入周五”起重算该周五并覆盖，避免边界遗漏/修订差异；
+- 覆盖策略：写入前若目标日期已存在，先删除该组再写入（快速、无需重排编号）。
+
 注意：
-- 需要 utils.read_h5_meta / list_missing_fridays / get_required_history_start / ensure_multiindex_price 等新工具函数。
+- 需要 utils.read_h5_meta / list_missing_fridays / get_required_history_start / ensure_multiindex_price 等工具函数。
 - 最长回溯窗口为 120（与当前因子定义一致）；若后续新增更长窗口，请同步更新 CFG.max_lookback。
 """
 import numpy as np
@@ -202,7 +206,7 @@ def enforce_factor_cols_consistency(stock_feat: Dict[str, pd.DataFrame], existed
     sample_stock = next(iter(stock_feat.keys()))
     return stock_feat[sample_stock].columns.tolist()
 
-# ===== 主流程（增量 + 局部片段） =====
+# ===== 主流程（增量 + 局部片段 + 覆盖最后一日） =====
 def main():
     # 1) 读取最新的日频数据并规范索引
     day_df = pd.read_parquet(CFG.price_day_file)
@@ -213,21 +217,29 @@ def main():
     # 2) 已写入的 H5 元信息
     h5_path = Path(CFG.feat_file)
     next_idx, written_dates, existed_cols = read_h5_meta(h5_path)
+    written_dates_idx = pd.DatetimeIndex(sorted(written_dates)) if written_dates else pd.DatetimeIndex([])
+    last_written = written_dates_idx.max() if len(written_dates_idx) > 0 else None
 
-    # 3) 缺失的周五
+    # 3) 缺失的周五（加入 last_written 用于覆盖修订）
     missing_fridays = list_missing_fridays(Path(CFG.trading_day_file), CFG.start_date, CFG.end_date, written_dates)
+    missing_fridays = list(missing_fridays)  # 确保是 list，便于 append
+    if last_written is not None and last_written not in missing_fridays:
+        missing_fridays.append(last_written)
+    # 最终转为 DatetimeIndex，供下游函数（需要 .min()/.max()）使用
+    missing_fridays = pd.DatetimeIndex(sorted(set(missing_fridays)))
     if len(missing_fridays) == 0:
-        print("没有新增的周五采样日需要写入，增量构建完成。")
+        print("没有新增/需覆盖的周五采样日需要写入，增量构建完成。")
         return
 
     # 4) 局部历史片段的起点
     hist_start = get_required_history_start(missing_fridays, max_lookback=CFG.max_lookback)
     hist_end = pd.Timestamp(CFG.end_date)
     # 截取行情片段，仅用这一段计算全量因子
-    print(f"局部历史片段: {hist_start.date()} ~ {hist_end.date()},读取中...")
+    print(f"局部历史片段: {hist_start.date()} ~ {hist_end.date()}, 读取中...")
     sliced = day_df[(day_df.index.get_level_values('datetime') >= hist_start) &
                     (day_df.index.get_level_values('datetime') <= hist_end)]
     print(f"读取局部行情片段: {sliced.index.get_level_values('datetime').min().date()} ~ {sliced.index.get_level_values('datetime').max().date()}, 股票数={sliced.index.get_level_values(0).nunique()}")
+
     # 5) 并行计算“局部片段”的全量因子缓存
     stock_feat: Dict[str, pd.DataFrame] = {}
     with ThreadPoolExecutor(max_workers=CFG.num_workers) as ex:
@@ -245,16 +257,33 @@ def main():
     # 6) 因子列名与历史一致
     factor_cols = enforce_factor_cols_consistency(stock_feat, existed_cols)
 
-    # 7) 逐个周五写入（只处理缺失的）
+    # 7) 逐个周五写入（只处理缺失/需覆盖的）
     str_dt = h5py.string_dtype(encoding='utf-8')
     mode = "a" if h5_path.exists() else "w"
     written_cnt_total = 0
     with h5py.File(h5_path, mode) as h5f:
+        # 建立 date -> group_name 映射（用于覆盖删除）
+        existing_groups: Dict[pd.Timestamp, str] = {}
+        for k in h5f.keys():
+            try:
+                gd = h5f[k].attrs.get('date', None)
+                if gd is not None:
+                    existing_groups[pd.Timestamp(gd)] = k
+            except Exception:
+                continue
+
         if 'factor_cols' not in h5f.attrs:
             h5f.attrs['factor_cols'] = np.asarray(factor_cols, dtype=str_dt)
 
         group_idx = next_idx
         for d in tqdm(missing_fridays, desc="增量写入特征仓"):
+            # 覆盖：如果已存在该日期组，先删除
+            if d in existing_groups:
+                try:
+                    del h5f[existing_groups[d]]
+                except Exception:
+                    pass  # 删除失败则忽略，继续用追加写入覆盖（会留下重复，建议尽量删除成功）
+
             feats_all = []
             stk_list  = []
             # 对所有股票在该日期切出窗口
@@ -303,7 +332,7 @@ def main():
             written_cnt_total += 1
             group_idx += 1
 
-    print(f"增量构建完成：新增周五组数={written_cnt_total}，H5路径={h5_path}")
+    print(f"增量构建完成：新增/覆盖周五组数={written_cnt_total}，H5路径={h5_path}")
 
 if __name__ == "__main__":
     main()

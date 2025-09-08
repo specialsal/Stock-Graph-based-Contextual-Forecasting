@@ -1,7 +1,8 @@
 # coding: utf-8
 """
 增量生成市场/风格上下文特征：context_features.parquet
-- 仅对缺失的周五增量计算并追加保存
+- 对缺失的周五增量计算并追加保存
+- 从“最后一个已存在周五”起重新计算该周五（以覆盖修订），再合并去重
 - 严格校验输入数据；对齐逻辑与原版一致
 """
 import numpy as np
@@ -167,36 +168,42 @@ def main():
         ctx_old = pd.read_parquet(out_path)
         if not isinstance(ctx_old.index, pd.DatetimeIndex):
             raise AssertionError("context_features 的索引必须是 DatetimeIndex")
-        existing_dates = set(ctx_old.index)
+        existing_dates = pd.DatetimeIndex(sorted(set(ctx_old.index)))
+        last_existing = existing_dates.max() if len(existing_dates) > 0 else None
         print(f"[Context增量] 已有行数={len(ctx_old)}, 覆盖周五={len(existing_dates)}")
     else:
         ctx_old = None
-        existing_dates = set()
+        existing_dates = pd.DatetimeIndex([])
+        last_existing = None
 
-    # 需要增量的周五
-    missing = [d for d in fridays_all if d not in existing_dates]
-    missing = pd.DatetimeIndex(sorted(missing))
+    # 需要增量的周五（包含：缺失周五 ∪ 最后一个已存在周五，用于覆盖修订）
+    missing = [d for d in fridays_all if d not in set(existing_dates)]
+    if last_existing is not None and last_existing not in missing:
+        missing.append(last_existing)
+    missing = pd.DatetimeIndex(sorted(set(missing)))
+
     if len(missing) == 0:
-        print("[Context增量] 无缺失周五，跳过。")
+        print("[Context增量] 无需更新，跳过。")
         return
 
-    print(f"[Context增量] 待新增周五数量={len(missing)} (范围: {missing.min().date()} ~ {missing.max().date()})")
+    print(f"[Context增量] 待计算周五数量={len(missing)} (范围: {missing.min().date()} ~ {missing.max().date()})")
 
     # 载入原始数据
     index_df  = pd.read_parquet(CFG.index_day_file)
     sector_df = pd.read_parquet(CFG.style_day_file)
 
-    # 仅对缺失周五计算
+    # 仅对目标周五计算
     ctx_new = build_context_for_dates(index_df, sector_df, missing)
 
-    if ctx_old is None:
+    if ctx_old is None or ctx_old.empty:
         ctx_all = ctx_new
     else:
         ctx_all = pd.concat([ctx_old, ctx_new], axis=0)
-        ctx_all = ctx_all[~ctx_all.index.duplicated(keep='first')].sort_index()
+        # 新结果覆盖旧（从“最后一日”起重算，必须 keep='last'）
+        ctx_all = ctx_all[~ctx_all.index.duplicated(keep='last')].sort_index()
 
     ctx_all.to_parquet(out_path)
-    print(f"[Context增量] 保存完成：{out_path}，总行数={len(ctx_all)}，新增={len(ctx_new)}")
+    print(f"[Context增量] 保存完成：{out_path}，总行数={len(ctx_all)}，新增或覆盖={len(ctx_new)}")
 
 if __name__ == "__main__":
     main()

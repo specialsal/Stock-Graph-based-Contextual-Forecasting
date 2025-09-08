@@ -1,7 +1,7 @@
 # coding: utf-8
 """
 标签生成模块（增量版） - 计算下周收益率
-- 仅对缺失周五生成并追加
+- 对缺失周五增量生成；并从“最后一个已存在周五”起重算该周五覆盖修订
 """
 import pandas as pd
 import numpy as np
@@ -22,19 +22,23 @@ def generate_weekly_labels_incremental(
     save_path: Path
 ) -> pd.DataFrame:
     """
-    增量生成下周收益率标签，仅处理 sample_dates 中尚未存在于 save_path 的周五。
-    返回：新增的标签 DataFrame（若无新增，返回空）
+    增量生成下周收益率标签：
+    - 仅处理 sample_dates 中尚未存在于 save_path 的周五；
+    - 额外包含“最后一个已存在周五”以覆盖修订；
+    返回：新增/覆盖的标签 DataFrame（若无新增，返回空）
     """
     # 已有标签
     if save_path.exists():
         label_old = pd.read_parquet(save_path)
         if not isinstance(label_old.index, pd.MultiIndex):
             raise ValueError("已有标签文件的索引应为 MultiIndex(date, stock)")
-        existing_dates = set(label_old.index.get_level_values('date').unique())
+        existing_dates = pd.DatetimeIndex(sorted(label_old.index.get_level_values('date').unique()))
+        last_existing = existing_dates.max() if len(existing_dates) > 0 else None
         print(f"[Label增量] 已有标签组（周五）数量={len(existing_dates)}")
     else:
         label_old = None
-        existing_dates = set()
+        existing_dates = pd.DatetimeIndex([])
+        last_existing = None
 
     # 仅保留“缺失周五且不是最后一个周五”（因为需要 next Friday）
     if len(sample_dates) < 2:
@@ -42,13 +46,18 @@ def generate_weekly_labels_incremental(
         return pd.DataFrame()
 
     sample_dates = sample_dates.sort_values()
-    missing = [d for d in sample_dates[:-1] if d not in existing_dates]
-    missing = pd.DatetimeIndex(sorted(missing))
+    # 缺失周五（排除最后一个周五）
+    missing = [d for d in sample_dates[:-1] if d not in set(existing_dates)]
+    # 额外加入“最后一个已存在周五”以覆盖修订（但也要保证它不是最后一个 sample 周五）
+    if last_existing is not None and last_existing != sample_dates[-1] and last_existing not in missing:
+        missing.append(last_existing)
+
+    missing = pd.DatetimeIndex(sorted(set(missing)))
     if len(missing) == 0:
-        print("[Label增量] 无缺失周五，跳过。")
+        print("[Label增量] 无缺失或需覆盖的周五，跳过。")
         return pd.DataFrame()
 
-    print(f"[Label增量] 待新增周五数量={len(missing)} (范围: {missing.min().date()} ~ {missing.max().date()})")
+    print(f"[Label增量] 待新增/覆盖周五数量={len(missing)} (范围: {missing.min().date()} ~ {missing.max().date()})")
 
     # pivot close
     if not isinstance(daily_df.index, pd.MultiIndex) or daily_df.index.nlevels != 2:
@@ -64,15 +73,15 @@ def generate_weekly_labels_incremental(
     close_pivot = daily_df['close'].unstack(level='order_book_id')
     available_dates = close_pivot.index
 
-    # 确定片段边界：从最早缺失周五的对齐日起，至“最大缺失周五的下一周五”的对齐日
+    # 确定片段边界：从“最早需要计算的周五”的对齐日起，至“最大周五的下一周五”的对齐日
     first_missing = missing.min()
     last_missing  = missing.max()
     # next Friday of last_missing
     future_mask = sample_dates > last_missing
     next_friday_after_last = sample_dates[future_mask][0] if future_mask.any() else None
     if next_friday_after_last is None:
-        # 理论上不会发生，因为我们已排除最后一个周五，但加一道保护
-        print("[Label增量] 找不到最后缺失周五的下一周五，跳过。")
+        # 防御（正常不会触发，因为已排除最后一个周五）
+        print("[Label增量] 找不到最后周五的下一周五，跳过。")
         return pd.DataFrame()
 
     start_date = _align_to_last_available(available_dates, first_missing)
@@ -86,7 +95,7 @@ def generate_weekly_labels_incremental(
     available_dates_slice = close_pivot_slice.index
 
     weekly_returns = []
-    # 我们只遍历“缺失周五”
+    # 我们只遍历 missing（含“最后一个已存在周五”）
     for d in tqdm(missing, desc="增量计算周收益率"):
         d_next_idx = sample_dates.get_indexer([d])[0] + 1
         next_d = sample_dates[d_next_idx]
@@ -113,21 +122,21 @@ def generate_weekly_labels_incremental(
             weekly_returns.append(sub)
 
     if len(weekly_returns) == 0:
-        print("[Label增量] 本次未生成新增标签。")
+        print("[Label增量] 本次未生成新增/覆盖标签。")
         return pd.DataFrame()
 
     label_new = pd.concat(weekly_returns, ignore_index=True)
     label_new = label_new.set_index(['date','stock']).sort_index()
 
-    # 合并保存
-    if label_old is None:
+    # 合并保存（新覆盖旧）
+    if label_old is None or label_old.empty:
         label_all = label_new
     else:
         label_all = pd.concat([label_old, label_new], axis=0)
-        label_all = label_all[~label_all.index.duplicated(keep='first')].sort_index()
+        label_all = label_all[~label_all.index.duplicated(keep='last')].sort_index()
 
     label_all.to_parquet(save_path)
-    print(f"[Label增量] 保存完成：{save_path}，总行数={len(label_all)}，新增={len(label_new)}")
+    print(f"[Label增量] 保存完成：{save_path}，总行数={len(label_all)}，新增/覆盖={len(label_new)}")
     return label_new
 
 def main():
