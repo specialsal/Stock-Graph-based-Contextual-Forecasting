@@ -404,7 +404,7 @@ def main():
 
             # ---------------- 记录与选择全局/最近N最优（按测试分数） ---------------- #
             # 载入 best 并对 Val/Test 统一评估一次
-            payload = torch.load(best_path, map_location=CFG.device)
+            payload = torch.load(best_path, map_location=CFG.device,weights_only=False)
             state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
             model.load_state_dict(state_dict, strict=False)
             model.eval()

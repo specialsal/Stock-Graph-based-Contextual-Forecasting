@@ -67,10 +67,9 @@ class Config:
     tr_layers     = 1   # Transformer 层数
     gat_layers    = 1   # GAT 层数
     graph_type    = "gat"        # 图模块类型 "mean" 或 "gat"
-    topk_per_ind  = 16  # 每个行业选取的TopK股票数量（暂未用）
     lr            = 3e-4
     weight_decay  = 1e-2
-    epochs_warm   = 20  # 每个窗口训练轮数
+    epochs_warm   = 1  # 每个窗口训练轮数
 
     # -------- 训练细节 --------
     batch_size        = 8196

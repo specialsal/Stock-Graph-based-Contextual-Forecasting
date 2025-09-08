@@ -29,10 +29,10 @@ class BTConfig:
     # 选择回测使用的模型：
     # 可填：具体文件名（例如 "model_20200103.pth" / "model_best_20200103.pth"
     #      或固定别名 "best_overall.pth" / "best_recent_5.pth"）
-    model_name     = "best_recent_5.pth"
+    model_name     = "model_best_20210305.pth"
 
     # 回测区间（周五采样日）
-    bt_start_date  = "2011-01-01"
+    bt_start_date  = "2021-03-05"
     bt_end_date    = datetime.today().strftime("%Y-%m-%d")
 
     # 运行名（用于输出文件命名）
@@ -41,7 +41,7 @@ class BTConfig:
     # 回测模式
     # mode = "long"  仅做多
     # mode = "ls"    多空对冲（多头等权，空头等权，净敞口可通过 long_weight/short_weight 控制）
-    mode           = "ls"
+    mode           = "long"
     long_weight    = 1.0
     short_weight   = 1.0
 
@@ -49,7 +49,7 @@ class BTConfig:
     top_pct        = 0.1    # 做多比例（0~1），仅在当周股票数足够时生效
     bottom_pct     = 0.1   # 做空比例（0~1），仅在 mode=="ls" 时使用
     min_n_stocks   = 20     # 每周最少持仓数量（若不足则本周空仓）
-    max_n_stocks   = 200    # 每边最多持仓数量（多/空各自限制）
+    max_n_stocks   = 500    # 每边最多持仓数量（多/空各自限制）
 
     # 交易相关假设
     slippage_bps   = 0.005    # 单边滑点，基点
@@ -64,10 +64,10 @@ class BTConfig:
     allow_missing_info = False    # 缺少基础信息是否保留
 
     # 板块开关（为 False 则剔除该板块股票）
-    include_star_market = True  # 科创板（688/689.XSHG）
-    include_chinext = True  # 创业板（300/301.XSHE）
-    include_bse = True  # 北交所（*.XBEI / *.XBSE）
-    include_neeq = True  # 新三板（*.XNE / *.XNEE / *.XNEQ / *.XNEX）
+    include_star_market = False  # 科创板（688/689.XSHG）
+    include_chinext = False  # 创业板（300/301.XSHE）
+    include_bse = False  # 北交所（*.XBEI / *.XBSE）
+    include_neeq = False  # 新三板（*.XNE / *.XNEE / *.XNEQ / *.XNEX）
 
     # 设备
     device         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
