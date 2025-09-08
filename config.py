@@ -69,7 +69,7 @@ class Config:
     graph_type    = "gat"        # 图模块类型 "mean" 或 "gat"
     lr            = 3e-4
     weight_decay  = 1e-2
-    epochs_warm   = 1  # 每个窗口训练轮数
+    epochs_warm   = 10  # 每个窗口训练轮数
 
     # -------- 训练细节 --------
     batch_size        = 8196
