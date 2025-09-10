@@ -16,7 +16,7 @@ class BTConfig:
     feat_file      = processed_dir / "features_daily.h5"
     ctx_file       = processed_dir / "context_features.parquet"
     label_file     = processed_dir / "weekly_labels.parquet"  # 可选
-    model_dir      = processed_dir / "models"
+    model_dir      = processed_dir / "models_gat_1_1"
     industry_map_file = raw_dir / "stock_industry_map.csv"
     trading_day_file  = raw_dir / "trading_day.csv"
 
@@ -29,10 +29,10 @@ class BTConfig:
     # 选择回测使用的模型：
     # 可填：具体文件名（例如 "model_20200103.pth" / "model_best_20200103.pth"
     #      或固定别名 "best_overall.pth" / "best_recent_5.pth"）
-    model_name     = "model_best_20210305.pth"
+    model_name     = "model_best_20240403.pth"
 
     # 回测区间（周五采样日）
-    bt_start_date  = "2021-03-05"
+    bt_start_date  = "2024-04-03"
     bt_end_date    = datetime.today().strftime("%Y-%m-%d")
 
     # 运行名（用于输出文件命名）
@@ -49,7 +49,7 @@ class BTConfig:
     top_pct        = 0.1    # 做多比例（0~1），仅在当周股票数足够时生效
     bottom_pct     = 0.1   # 做空比例（0~1），仅在 mode=="ls" 时使用
     min_n_stocks   = 20     # 每周最少持仓数量（若不足则本周空仓）
-    max_n_stocks   = 500    # 每边最多持仓数量（多/空各自限制）
+    max_n_stocks   = 300    # 每边最多持仓数量（多/空各自限制）
 
     # 交易相关假设
     slippage_bps   = 0.005    # 单边滑点，基点

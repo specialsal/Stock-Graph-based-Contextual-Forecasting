@@ -96,11 +96,18 @@ def read_h5_meta(h5_path: Path) -> Tuple[int, Set[pd.Timestamp], Optional[List[s
     written_dates = set()
     factor_cols = None
     with h5py.File(h5_path, "r") as h5f:
+        # 检查根目录属性中是否存在 'factor_cols'（因子列名元数据）
         if 'factor_cols' in h5f.attrs:
+            # 读取因子列名：
+            # 1. 将 h5f.attrs['factor_cols'] 转为 numpy 数组（H5存储格式）
+            # 2. 遍历数组元素，若为bytes类型则解码为utf-8字符串，否则直接转为字符串
+            # 3. 最终得到字符串列表（确保中文/特殊字符正常显示）
             factor_cols = [s.decode('utf-8') if isinstance(s, bytes) else str(s) for s in np.array(h5f.attrs['factor_cols'])]
+        # 遍历 H5 文件中所有顶层键（组名或数据集名）
         for k in h5f.keys():
             if not k.startswith("date_"):
                 continue
+            # 从当前组的属性中获取 'date' 字段（存储该组对应的实际日期）
             d_str = h5f[k].attrs.get('date', None)
             if d_str is None:
                 continue
@@ -159,8 +166,12 @@ class SlidingWindowCache:
     简单的滑窗缓存器：缓存每只股票最近一次切片的（end_date, window_df），
     若下一次请求的 end_date 相同或更晚且窗口相同，则避免重复切 slice。
     """
-    def __init__(self): self.cache: Dict[str, Tuple[pd.Timestamp, pd.DataFrame]] = {}
+    def __init__(self): 
+        # 初始化缓存字典，键为股票代码（str），值为元组 (end_date, window_df)
+        # end_date 是缓存数据的截止日期（pd.Timestamp），window_df 是该股票的历史数据切片（pd.DataFrame）
+        self.cache: Dict[str, Tuple[pd.Timestamp, pd.DataFrame]] = {}
     def get(self, code: str, end_dt: pd.Timestamp, win: int) -> Optional[pd.DataFrame]:
+        # 尝试从缓存中获取股票 code 的数据
         if code not in self.cache: return None
         last_end, last_df = self.cache[code]
         if last_df is None or last_end is None: return None

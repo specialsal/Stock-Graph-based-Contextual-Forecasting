@@ -63,7 +63,7 @@ class Config:
     # -------- 模型超参 --------
     hidden        = 64  # 隐藏层维度
     ind_emb       = 16  # 行业嵌入维度
-    ctx_dim       = 21  # 上下文特征维度
+    ctx_dim       = 21  # 上下文特征维度(实际上还是以ctx真正特征数来，不重要)
     tr_layers     = 1   # Transformer 层数
     gat_layers    = 1   # GAT 层数
     graph_type    = "gat"        # 图模块类型 "mean" 或 "gat"
@@ -73,7 +73,7 @@ class Config:
 
     # -------- 训练细节 --------
     batch_size        = 8196
-    grad_accum_steps  = 4
+    grad_accum_steps  = 1
     device            = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_workers       = 8
     prefetch_factor   = 4

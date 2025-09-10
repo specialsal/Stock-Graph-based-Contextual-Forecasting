@@ -168,6 +168,10 @@ class GCFNet(nn.Module):
         self.ind_proj = nn.Linear(ind_emb_dim, hidden)
 
         self.gate = nn.Linear(hidden * 2, 1)
+
+        # 新增：ctx 归一化层（仅基于当前样本，无未来信息）
+        self.ctx_norm = nn.LayerNorm(ctx_dim)
+
         self.film = FiLM(ctx_dim, hidden)
 
         self.graph_type = graph_type
@@ -190,7 +194,9 @@ class GCFNet(nn.Module):
         g = torch.sigmoid(self.gate(torch.cat([h_d, h_ind], -1))).squeeze(-1)
         h_price = g.unsqueeze(-1) * h_d + (1 - g.unsqueeze(-1)) * h_ind
 
-        h_ctx   = self.film(h_price, ctx_feat)         # [N,H]
+        # 对 ctx 做 LayerNorm，再送入 FiLM
+        ctx_n = self.ctx_norm(ctx_feat)                # [N,C_ctx]
+        h_ctx   = self.film(h_price, ctx_n)            # [N,H]
         h_graph = self.graph_blk(h_ctx, ind_id)        # [N,H]
 
         out = torch.cat([h_price, h_ctx, h_graph], -1) # [N,3H]
