@@ -2,27 +2,28 @@
 # coding: utf-8
 """
 滚动训练主循环（日频 + 行业图/可关闭）
-本版本特性（含测试集与按测试集选优）：
+本版本特性（保留每窗口best/last与登记，移除全局best总体输出 + TensorBoard 全局曲线）：
 - 使用 train_utils 抽离通用函数，精简主文件
 - 每个训练窗口仅用“训练分组”拟合 Scaler（避免未来信息）
 - 训练损失：loss = w*(1 - Pearson) + (1 - w)*PairwiseRanking（w=CFG.ranking_weight）
 - 训练/验证/测试：均以“周”为粒度（周五采样），训练周数=5*52（可调），验证周数=CFG.val_weeks，测试周数=CFG.test_weeks
-- 每个 epoch 打印 Train/Val/Test 指标
-- 最优模型按测试集风险调整分数：test_score = test_avg_rankic - alpha * test_std_rankic 选择与保存
-- 训练结束登记时，同时记录 Val 与 Test 指标；“全局最优/最近N最优”也按 test_score 选择
 - RAM 常驻加速路径（窗口级一次性加载 Train/Val/Test 到内存，epoch 内零 IO），超过内存上限自动回退
 - 修复：按“真实日期 -> H5组键”的映射取组，保证窗口正确滚动
 
 新增：
-- 集成 TensorBoard 记录训练/验证/测试指标、学习率等
+- 集成 TensorBoard：记录“分窗口曲线（YYYYMMDD/*）”与“全局统一时间轴曲线（global/*）”
+修改：
+- 仍保存每个窗口的 best 与 last，并登记到 registry_file；
+- 移除“输出全局 best_overall.pth / best_recent_*.pth”的代码，不再产出这些文件。
 """
-import math, torch, pandas as pd, numpy as np, h5py, shutil
+import math, torch, pandas as pd, numpy as np, h5py
 import torch.nn.functional as F
 from pathlib import Path
 from tqdm import tqdm
 from contextlib import nullcontext
 from torch.utils.tensorboard import SummaryWriter
 import time
+import os
 
 from config import CFG
 from model import GCFNet
@@ -36,10 +37,13 @@ from train_utils import (
     load_window_to_ram, iterate_ram_minibatches
 )
 
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 # --------------------------- 辅助：保存模型 --------------------------- #
 def save_checkpoint(model, path: Path, scaler_d=None):
     ensure_parent_dir(path)
     payload = {"state_dict": model.state_dict()}
+    # 同步保存当期窗口拟合的 scaler（均值/标准差），便于回测/复现标准化口径
     if scaler_d is not None and getattr(scaler_d, "mean", None) is not None and getattr(scaler_d, "std", None) is not None:
         payload["scaler_mean"] = scaler_d.mean.astype("float32")
         payload["scaler_std"]  = scaler_d.std.astype("float32")
@@ -67,11 +71,15 @@ def main():
     # 环境开关（TF32、cudnn.benchmark 等）
     setup_env()
 
-    # TensorBoard: 创建全局 writer
-    log_root = CFG.processed_dir / "tblogs"
+    # TensorBoard: 创建全局 writer（放在模型目录下）
+    log_root = CFG.model_dir / "tblogs"
     log_root.mkdir(parents=True, exist_ok=True)
     run_tag = time.strftime("%Y%m%d_%H%M%S")
     writer = SummaryWriter(log_dir=log_root / f"run_{run_tag}")
+
+    # 全局计数器（用于统一时间轴的曲线：global/*）
+    global_step_step = 0     # 训练 step 级别（跨窗口累积）
+    global_step_epoch = 0    # epoch 级别（跨窗口累积）
 
     # 1) 标签与交易日历
     label_df = pd.read_parquet(CFG.label_file)
@@ -201,12 +209,12 @@ def main():
                 else:
                     print(f"[RAM预载] 启用 RAM 模式，总内存估算 {total_gb:.2f} GB（<= {cap_gb:.2f} GB）")
 
-            # TensorBoard：每个窗口使用 pred_date 作为前缀
+            # TensorBoard：每个窗口使用 pred_date 作为“窗口内”前缀
             tb_prefix = f"{pred_date.strftime('%Y%m%d')}"
-            global_step = 0  # 跨 epoch 递增
+            window_step = 0  # 仅用于“窗口内 step”的 x 轴
 
-            # 训练多个 epoch，按“测试集分数”保存 best
-            best_metric = -1e9   # 测试分数（越大越好）
+            # 训练多个 epoch，按“测试集分数”保存 best（每窗口内部best）
+            best_metric = -1e9
             best_epoch  = -1
             best_path   = CFG.model_dir / f"model_best_{pred_date.strftime('%Y%m%d')}.pth"
 
@@ -272,8 +280,9 @@ def main():
                         icr_sum += icr * bs
 
                     step += 1
+                    window_step += 1
 
-                    # 训练过程日志
+                    # 训练过程日志（按间隔写入）
                     if (step % max(1, getattr(CFG, "print_step_interval", 10))) == 0:
                         pbar.set_postfix(
                             loss=f"{loss_sum/max(1,n_sum):.4f}",
@@ -282,19 +291,30 @@ def main():
                             ic_r=f"{icr_sum/max(1,n_sum):.4f}",
                             w=w_loss
                         )
-                        # TensorBoard: step 级指标与学习率
-                        writer.add_scalar(f"{tb_prefix}/train_step/loss", loss.detach().float().item(), global_step)
-                        writer.add_scalar(f"{tb_prefix}/train_step/pairwise_ranking_loss", rank_val.detach().float().item(), global_step)
+                        # 分窗口：step 级
+                        writer.add_scalar(f"{tb_prefix}/train_step/loss", loss.detach().float().item(), window_step)
+                        writer.add_scalar(f"{tb_prefix}/train_step/pairwise_ranking_loss", rank_val.detach().float().item(), window_step)
                         if not torch.isnan(cc):
-                            writer.add_scalar(f"{tb_prefix}/train_step/ic_pearson", float(cc.detach().float().item()), global_step)
-                        writer.add_scalar(f"{tb_prefix}/train_step/ic_rank", icr, global_step)
+                            writer.add_scalar(f"{tb_prefix}/train_step/ic_pearson", float(cc.detach().float().item()), window_step)
+                        writer.add_scalar(f"{tb_prefix}/train_step/ic_rank", icr, window_step)
                         try:
                             lr_cur = opt.param_groups[0]["lr"]
-                            writer.add_scalar(f"{tb_prefix}/train_step/lr", lr_cur, global_step)
+                            writer.add_scalar(f"{tb_prefix}/train_step/lr", lr_cur, window_step)
+                        except Exception:
+                            pass
+                        # 全局：step 级
+                        writer.add_scalar("global/train_step/loss", loss.detach().float().item(), global_step_step)
+                        writer.add_scalar("global/train_step/pairwise_ranking_loss", rank_val.detach().float().item(), global_step_step)
+                        if not torch.isnan(cc):
+                            writer.add_scalar("global/train_step/ic_pearson", float(cc.detach().float().item()), global_step_step)
+                        writer.add_scalar("global/train_step/ic_rank", icr, global_step_step)
+                        try:
+                            lr_cur = opt.param_groups[0]["lr"]
+                            writer.add_scalar("global/train_step/lr", lr_cur, global_step_step)
                         except Exception:
                             pass
 
-                    global_step += 1
+                    global_step_step += 1  # 全局 step 递增
 
                 print(f"[{pred_date.strftime('%Y-%m-%d')}] "
                       f"epoch {ep+1}/{CFG.epochs_warm} "
@@ -303,13 +323,18 @@ def main():
                       f"ic_p={icp_sum/max(1,n_sum):.4f} ic_r={icr_sum/max(1,n_sum):.4f} "
                       f"w={w_loss}")
 
-                # TensorBoard: epoch 级训练均值
+                # TensorBoard: epoch 级训练均值（分窗口 + 全局）
                 writer.add_scalar(f"{tb_prefix}/train_epoch/loss", loss_sum/max(1,n_sum), ep)
                 writer.add_scalar(f"{tb_prefix}/train_epoch/pairwise_ranking_loss", rank_sum/max(1,n_sum), ep)
                 writer.add_scalar(f"{tb_prefix}/train_epoch/ic_pearson", icp_sum/max(1,n_sum), ep)
                 writer.add_scalar(f"{tb_prefix}/train_epoch/ic_rank", icr_sum/max(1,n_sum), ep)
 
-                # ---------------- 验证评估 ---------------- #
+                writer.add_scalar("global/train_epoch/loss", loss_sum/max(1,n_sum), global_step_epoch)
+                writer.add_scalar("global/train_epoch/pairwise_ranking_loss", rank_sum/max(1,n_sum), global_step_epoch)
+                writer.add_scalar("global/train_epoch/ic_pearson", icp_sum/max(1,n_sum), global_step_epoch)
+                writer.add_scalar("global/train_epoch/ic_rank", icr_sum/max(1,n_sum), global_step_epoch)
+
+                # ---------------- 验证/测试评估 ---------------- #
                 model.eval()
                 def eval_split_ram(mem_items):
                     per_date = []
@@ -370,7 +395,8 @@ def main():
                     return per_date
 
                 # Val
-                per_date_val = eval_split_ram(mem_items_val) if (use_ram and mem_items_val is not None) else eval_split_stream(val_gk)
+                per_date_val = (eval_split_ram(mem_items_val) if (use_ram and mem_items_val is not None)
+                                else eval_split_stream(val_gk))
                 if len(per_date_val) == 0:
                     valm = {"avg_mse": float("nan"), "avg_ic_pearson": float("nan"),
                             "avg_ic_rank": float("nan"), "std_ic_rank": float("nan"),
@@ -390,16 +416,9 @@ def main():
                             "avg_pairwise_rank": float(avg_prl), "avg_loss": float(avg_loss),
                             "dates": len(per_date_val)}
 
-                print(f"  Val: mse={valm['avg_mse']:.6f} "
-                      f"ic_p={valm['avg_ic_pearson']:.4f} "
-                      f"ic_r={valm['avg_ic_rank']:.4f} "
-                      f"pairwise ranking loss={valm['avg_pairwise_rank']:.4f} "
-                      f"loss={valm['avg_loss']:.4f} "
-                      f"ic_r_std={valm['std_ic_rank']:.4f} dates={valm['dates']} "
-                      f"w={w_loss}")
-
                 # Test
-                per_date_test = eval_split_ram(mem_items_test) if (use_ram and mem_items_test is not None) else eval_split_stream(test_gk)
+                per_date_test = (eval_split_ram(mem_items_test) if (use_ram and mem_items_test is not None)
+                                 else eval_split_stream(test_gk))
                 if len(per_date_test) == 0:
                     testm = {"avg_mse": float("nan"), "avg_ic_pearson": float("nan"),
                              "avg_ic_rank": float("nan"), "std_ic_rank": float("nan"),
@@ -420,15 +439,17 @@ def main():
                              "dates": len(per_date_test)}
 
                 test_score = (testm["avg_ic_rank"] - alpha * testm["std_ic_rank"]) if math.isfinite(testm["avg_ic_rank"]) else -1e9
-                print(f"  Test: mse={testm['avg_mse']:.6f} "
-                      f"ic_p={testm['avg_ic_pearson']:.4f} "
-                      f"ic_r={testm['avg_ic_rank']:.4f} "
-                      f"pairwise ranking loss={testm['avg_pairwise_rank']:.4f} "
-                      f"loss={testm['avg_loss']:.4f} "
-                      f"ic_r_std={testm['std_ic_rank']:.4f} dates={testm['dates']} "
-                      f"score={test_score:.4f} (alpha={alpha})")
 
-                # TensorBoard: Val/Test 指标
+                # 打印指标
+                print(f"  Val:  mse={valm['avg_mse']:.6f} ic_p={valm['avg_ic_pearson']:.4f} "
+                      f"ic_r={valm['avg_ic_rank']:.4f} prl={valm['avg_pairwise_rank']:.4f} "
+                      f"loss={valm['avg_loss']:.4f} ic_r_std={valm['std_ic_rank']:.4f} dates={valm['dates']}")
+                print(f"  Test: mse={testm['avg_mse']:.6f} ic_p={testm['avg_ic_pearson']:.4f} "
+                      f"ic_r={testm['avg_ic_rank']:.4f} prl={testm['avg_pairwise_rank']:.4f} "
+                      f"loss={testm['avg_loss']:.4f} ic_r_std={testm['std_ic_rank']:.4f} "
+                      f"dates={testm['dates']} score={test_score:.4f} (alpha={alpha})")
+
+                # TensorBoard：Val/Test（分窗口 + 全局）
                 writer.add_scalar(f"{tb_prefix}/val/mse", valm['avg_mse'], ep)
                 writer.add_scalar(f"{tb_prefix}/val/ic_pearson", valm['avg_ic_pearson'], ep)
                 writer.add_scalar(f"{tb_prefix}/val/ic_rank", valm['avg_ic_rank'], ep)
@@ -444,20 +465,38 @@ def main():
                 writer.add_scalar(f"{tb_prefix}/test/loss", testm['avg_loss'], ep)
                 writer.add_scalar(f"{tb_prefix}/test/score", test_score, ep)
 
-                # 保存 best（以测试分数为准）
+                writer.add_scalar("global/val/mse", valm['avg_mse'], global_step_epoch)
+                writer.add_scalar("global/val/ic_pearson", valm['avg_ic_pearson'], global_step_epoch)
+                writer.add_scalar("global/val/ic_rank", valm['avg_ic_rank'], global_step_epoch)
+                writer.add_scalar("global/val/ic_rank_std", valm['std_ic_rank'], global_step_epoch)
+                writer.add_scalar("global/val/pairwise_ranking_loss", valm['avg_pairwise_rank'], global_step_epoch)
+                writer.add_scalar("global/val/loss", valm['avg_loss'], global_step_epoch)
+
+                writer.add_scalar("global/test/mse", testm['avg_mse'], global_step_epoch)
+                writer.add_scalar("global/test/ic_pearson", testm['avg_ic_pearson'], global_step_epoch)
+                writer.add_scalar("global/test/ic_rank", testm['avg_ic_rank'], global_step_epoch)
+                writer.add_scalar("global/test/ic_rank_std", testm['std_ic_rank'], global_step_epoch)
+                writer.add_scalar("global/test/pairwise_ranking_loss", testm['avg_pairwise_rank'], global_step_epoch)
+                writer.add_scalar("global/test/loss", testm['avg_loss'], global_step_epoch)
+                writer.add_scalar("global/test/score", test_score, global_step_epoch)
+
+                # 每窗口内：保存 best（以测试分数为准）
                 if math.isfinite(test_score) and test_score > best_metric:
                     best_metric = test_score
                     best_epoch  = ep + 1
                     save_checkpoint(model, best_path, scaler_d=scaler_d)
 
+                # 全局 epoch 步进（放在每个 epoch 末）
+                global_step_epoch += 1
+
             # 训练完一个窗口：保存最后一版
             last_path = CFG.model_dir / f"model_{pred_date.strftime('%Y%m%d')}.pth"
             save_checkpoint(model, last_path, scaler_d=scaler_d)
-            print(f"窗口结束，已保存：last -> {last_path.name} , best(ep={best_epoch}) -> {best_path.name}")
+            print(f"窗口结束，已保存：last -> {last_path.name} , best(ep={best_epoch}) -> {Path(best_path).name}")
 
-            # ---------------- 记录与选择全局/最近N最优（按测试分数） ---------------- #
-            # 载入 best 并对 Val/Test 统一评估一次
-            payload = torch.load(best_path, map_location=CFG.device,weights_only=False)
+            # ---------------- 写入登记表（每窗口一行） ---------------- #
+            # 以 best 模型重新评估一次（与训练期口径一致），汇总度量后登记
+            payload = torch.load(best_path, map_location=CFG.device, weights_only=False)
             state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
             model.load_state_dict(state_dict, strict=False)
             model.eval()
@@ -481,35 +520,10 @@ def main():
                         "avg_pairwise_rank": float(avg_prl), "avg_loss": float(avg_loss),
                         "dates": len(per_date)}
 
-            # Val 评估
-            if use_ram and mem_items_val is not None:
-                per_date_val = []
-                for it in mem_items_val:
-                    X = torch.from_numpy(it["X"]).to(CFG.device, non_blocking=HAS_CUDA)
-                    ind_t = torch.from_numpy(it["ind"]).to(CFG.device, non_blocking=HAS_CUDA)
-                    ctx_t = torch.from_numpy(it["ctx"]).to(CFG.device, non_blocking=HAS_CUDA)
-                    y_t  = torch.from_numpy(it["y"]).to(CFG.device, non_blocking=HAS_CUDA)
-                    preds = []
-                    bs = CFG.batch_size
-                    for st in range(0, X.shape[0], bs):
-                        p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
-                        preds.append(p.detach().float().cpu())
-                    pred_cpu = torch.cat(preds, 0)
-                    y_cpu = y_t.detach().float().cpu()
-                    mse  = F.mse_loss(pred_cpu, y_cpu).item()
-                    cc_t = pearsonr(pred_cpu, y_cpu)
-                    cc   = float(cc_t.item()) if not torch.isnan(cc_t) else float("nan")
-                    ric  = rank_ic(pred_cpu, y_cpu)
-                    prl  = float(pairwise_ranking_loss(pred_cpu, y_cpu, num_pairs=2048).item())
-                    if not math.isnan(cc):
-                        loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
-                    else:
-                        loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
-                    per_date_val.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
-                                         "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
-            else:
-                per_date_val = []
-                for gk in val_gk:
+            # 统一评估 val/test（复用窗口内数据/键）
+            def eval_split_stream(keys):
+                per_date = []
+                for gk in keys:
                     out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
                     if out is None: continue
                     X, ind_t, ctx_t, y_t = [torch.from_numpy(o) for o in out[:4]]
@@ -533,70 +547,16 @@ def main():
                         loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
                     else:
                         loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
-                    per_date_val.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
-                                         "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
+                    per_date.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
+                                     "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
+                return per_date
 
+            per_date_val = eval_split_stream(val_gk)
+            per_date_test = eval_split_stream(test_gk)
             final_val = summarize(per_date_val)
-
-            # Test 评估
-            if use_ram and mem_items_test is not None:
-                per_date_test = []
-                for it in mem_items_test:
-                    X = torch.from_numpy(it["X"]).to(CFG.device, non_blocking=HAS_CUDA)
-                    ind_t = torch.from_numpy(it["ind"]).to(CFG.device, non_blocking=HAS_CUDA)
-                    ctx_t = torch.from_numpy(it["ctx"]).to(CFG.device, non_blocking=HAS_CUDA)
-                    y_t  = torch.from_numpy(it["y"]).to(CFG.device, non_blocking=HAS_CUDA)
-                    preds = []
-                    bs = CFG.batch_size
-                    for st in range(0, X.shape[0], bs):
-                        p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
-                        preds.append(p.detach().float().cpu())
-                    pred_cpu = torch.cat(preds, 0)
-                    y_cpu = y_t.detach().float().cpu()
-                    mse  = F.mse_loss(pred_cpu, y_cpu).item()
-                    cc_t = pearsonr(pred_cpu, y_cpu)
-                    cc   = float(cc_t.item()) if not torch.isnan(cc_t) else float("nan")
-                    ric  = rank_ic(pred_cpu, y_cpu)
-                    prl  = float(pairwise_ranking_loss(pred_cpu, y_cpu, num_pairs=2048).item())
-                    if not math.isnan(cc):
-                        loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
-                    else:
-                        loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
-                    per_date_test.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
-                                          "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
-            else:
-                per_date_test = []
-                for gk in test_gk:
-                    out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
-                    if out is None: continue
-                    X, ind_t, ctx_t, y_t = [torch.from_numpy(o) for o in out[:4]]
-                    X = X.to(CFG.device, non_blocking=HAS_CUDA)
-                    ind_t = ind_t.to(CFG.device, non_blocking=HAS_CUDA)
-                    ctx_t = ctx_t.to(CFG.device, non_blocking=HAS_CUDA)
-                    y_t  = y_t.to(CFG.device, non_blocking=HAS_CUDA)
-                    preds = []
-                    bs = CFG.batch_size
-                    for st in range(0, X.shape[0], bs):
-                        p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
-                        preds.append(p.detach().float().cpu())
-                    pred_cpu = torch.cat(preds, 0)
-                    y_cpu = y_t.detach().float().cpu()
-                    mse  = F.mse_loss(pred_cpu, y_cpu).item()
-                    cc_t = pearsonr(pred_cpu, y_cpu)
-                    cc   = float(cc_t.item()) if not torch.isnan(cc_t) else float("nan")
-                    ric  = rank_ic(pred_cpu, y_cpu)
-                    prl  = float(pairwise_ranking_loss(pred_cpu, y_cpu, num_pairs=2048).item())
-                    if not math.isnan(cc):
-                        loss_val = float((w_loss * (1 - cc) + (1 - w_loss) * prl))
-                    else:
-                        loss_val = float((w_loss * F.mse_loss(pred_cpu, y_cpu).item() + (1 - w_loss) * prl))
-                    per_date_test.append({"mse": mse, "ic_pearson": cc, "ic_rank": ric,
-                                          "pairwise_rank": prl, "loss": loss_val, "n": len(y_cpu)})
-
             final_test = summarize(per_date_test)
-            final_test_score = final_test["avg_ic_rank"] - alpha * final_test["std_ic_rank"]
 
-            # 写入登记表（按测试分数）
+            # 写入登记表（仅登记，不再选择/复制全局best/recent）
             registry_file = getattr(CFG, "registry_file", CFG.model_dir / "model_registry.csv")
             row = {
                 "pred_date": pred_date.strftime("%Y-%m-%d"),
@@ -610,7 +570,7 @@ def main():
                 "val_std_rankic": final_val["std_ic_rank"],
                 "val_avg_pairwise_ranking_loss": final_val["avg_pairwise_rank"],
                 "val_avg_loss": final_val["avg_loss"],
-                "val_dates": final_val["dates"],
+                "val_dates": final_val["dates"] ,
 
                 "test_avg_mse": final_test["avg_mse"],
                 "test_avg_pearson": final_test["avg_ic_pearson"],
@@ -623,38 +583,15 @@ def main():
                 "ranking_weight": w_loss,
             }
             df_new = pd.DataFrame([row])
+            Path(registry_file).parent.mkdir(parents=True, exist_ok=True)
             if Path(registry_file).exists():
                 df_old = pd.read_csv(registry_file)
                 df_all = pd.concat([df_old, df_new], ignore_index=True)
             else:
                 df_all = df_new
-            Path(registry_file).parent.mkdir(parents=True, exist_ok=True)
             df_all.to_csv(registry_file, index=False)
 
-            # 选择全局最优与最近N最优 —— 按测试分数 score_test
-            alpha = getattr(CFG, "score_alpha", 0.5)
-            recentN = getattr(CFG, "recent_topN", 5)
-            df = df_all.copy()
-            df["score_test"] = df["test_avg_rankic"] - alpha * df["test_std_rankic"]
-
-            best_overall = df.loc[df["score_test"].idxmax()].to_dict()
-            best_recent = None
-            if recentN > 0 and len(df) >= 1:
-                df_recent = df.sort_values("pred_date").tail(recentN).copy()
-                df_recent["score_test"] = df_recent["test_avg_rankic"] - alpha * df_recent["test_std_rankic"]
-                best_recent = df_recent.loc[df_recent["score_test"].idxmax()].to_dict()
-
-            if best_overall is not None and isinstance(best_overall.get("best_path", None), str) and Path(best_overall["best_path"]).exists():
-                dst = CFG.model_dir / "best_overall.pth"
-                ensure_parent_dir(dst)
-                shutil.copy2(best_overall["best_path"], dst)
-            if best_recent is not None and isinstance(best_recent.get("best_path", None), str) and Path(best_recent["best_path"]).exists():
-                dst = CFG.model_dir / f"best_recent_{recentN}.pth"
-                ensure_parent_dir(dst)
-                shutil.copy2(best_recent["best_path"], dst)
-
-    print("训练完成。全局最优模型（按测试分数）：", (CFG.model_dir / "best_overall.pth").as_posix())
-    # 关闭 TensorBoard writer
+    print("训练完成。")
     writer.close()
 
 if __name__ == "__main__":

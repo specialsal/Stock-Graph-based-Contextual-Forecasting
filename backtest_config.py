@@ -16,7 +16,7 @@ class BTConfig:
     feat_file      = processed_dir / "features_daily.h5"
     ctx_file       = processed_dir / "context_features.parquet"
     label_file     = processed_dir / "weekly_labels.parquet"  # 可选
-    model_dir      = processed_dir / "models_gat_1_1"
+    model_dir      = Path("./models")
     industry_map_file = raw_dir / "stock_industry_map.csv"
     trading_day_file  = raw_dir / "trading_day.csv"
 
@@ -30,15 +30,14 @@ class BTConfig:
 
     # 选择回测使用的模型：
     # 可填：具体文件名（例如 "model_20200103.pth" / "model_best_20200103.pth"
-    #      或固定别名 "best_overall.pth" / "best_recent_5.pth"）
-    model_name     = "model_best_20240403.pth"
+    model_name     = "model_best_20210305.pth"
 
     # 回测区间（周五采样日）
-    bt_start_date  = "2024-04-03"
+    bt_start_date  = "2021-03-05"
     bt_end_date    = datetime.today().strftime("%Y-%m-%d")
 
     # 运行名（用于输出文件命名）
-    run_name       = "demo"
+    run_name       = "gat_1_1"
 
     # 回测模式
     # mode = "long"  仅做多

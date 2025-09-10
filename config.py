@@ -2,12 +2,12 @@
 # coding: utf-8
 """
 全局配置 —— 提速版（含图模块简化、AMP/Loader优化、指标与模型选择）
-本版本说明：
-- 滚动训练阶段不再读取 CFG.scaler_file，不再使用“全局 Scaler”
-- 每个训练窗口会在线拟合当期训练集 Scaler，避免未来信息泄漏
-- 新增 ranking_weight: 训练损失 = w*(1 - Pearson) + (1-w)*PairwiseRanking
-- 新增 test_weeks: 每个窗口引入测试集（单位=周，默认52周）
-- 最优模型判据：test_score = test_avg_rankic - alpha * test_std_rankic
+说明：
+- 每个训练窗口在线拟合当期训练集 Scaler（避免未来信息泄漏）
+- ranking_weight: 训练损失 = w*(1 - Pearson) + (1-w)*PairwiseRanking
+- test_weeks: 每个窗口引入测试集（单位=周，默认52周）
+- 保存策略：每窗口保存 best（按测试集风险调整分数）与 last，并登记到 registry_file
+- 本版已移除“全局最优(best_overall)/最近N最优(best_recent_N)”的输出逻辑相关配置
 """
 import torch, random, numpy as np
 from dataclasses import dataclass
@@ -20,11 +20,11 @@ class Config:
     data_dir      = Path("./data")
     raw_dir       = data_dir / "raw"
     processed_dir = data_dir / "processed"
-    model_dir = Path("./models")
+    model_dir     = Path("./models")                      # 模型输出目录
     feat_file     = processed_dir / "features_daily.h5"
     label_file    = processed_dir / "weekly_labels.parquet"
     universe_file = processed_dir / "universe.pkl"
-    registry_file = model_dir / "model_registry.csv"
+    registry_file = model_dir / "model_registry.csv"      # 窗口登记表（保留）
 
     # -------- 原始数据文件 --------
     price_day_file     = raw_dir / "stock_price_day.parquet"
@@ -37,8 +37,8 @@ class Config:
     is_st_file          = raw_dir / "is_st_stock.csv"
 
     # -------- RAM 加速（窗口级一次性常驻内存）--------
-    ram_accel_enable    = True     # 内存大的机器可开启
-    ram_accel_mem_cap_gb= 48       # RAM 加速单窗口的内存上限（GB）；超过将自动回退为逐组加载
+    ram_accel_enable     = True     # 内存大的机器可开启
+    ram_accel_mem_cap_gb = 48       # RAM 加速单窗口的内存上限（GB）；超过将自动回退为逐组加载
 
     # -------- 股票筛选（可选） --------
     enable_filters      = True       # 是否启用筛选（关闭则与旧逻辑一致）
@@ -55,7 +55,7 @@ class Config:
     # -------- 滚动窗参数（单位=周）--------
     train_years = 5     # 训练年数（以年计）；实际以 5*52 周计算
     val_weeks   = 52    # 验证周数
-    test_weeks  = 52    # 测试周数（新增）
+    test_weeks  = 52    # 测试周数
     step_weeks  = 52    # 步长（周）
     start_date  = "2011-01-01"
     end_date    = datetime.today().strftime("%Y-%m-%d")  # 默认到今天为止
@@ -63,7 +63,7 @@ class Config:
     # -------- 模型超参 --------
     hidden        = 64  # 隐藏层维度
     ind_emb       = 16  # 行业嵌入维度
-    ctx_dim       = 21  # 上下文特征维度(实际上还是以ctx真正特征数来，不重要)
+    ctx_dim       = 21  # 上下文特征维度
     tr_layers     = 1   # Transformer 层数
     gat_layers    = 1   # GAT 层数
     graph_type    = "gat"        # 图模块类型 "mean" 或 "gat"
@@ -85,12 +85,8 @@ class Config:
     use_torch_compile = False
     print_step_interval = 10
 
-    # -------- 选择与记录 --------
-    select_metric   = "rankic"  # 训练/评估时的度量（日志显示）；但best判据固定使用测试集的 test_score
-    score_alpha     = 0.5       # 风险调整参数：score = mean - alpha * std
-    recent_topN     = 5         # 最近 N 个窗口里挑一个最优（输出 best_recent_N.pth）
-
-    # -------- 损失加权 --------
+    # -------- 选择与记录（风险调整权重） --------
+    score_alpha     = 0.5       # 风险调整参数：score = mean - alpha * std（用于每窗口best的评判）
     ranking_weight  = 0.5       # loss = w*(1 - Pearson) + (1-w)*pairwise_rank
 
     # -------- 板块开关 --------
