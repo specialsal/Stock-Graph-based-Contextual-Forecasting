@@ -12,12 +12,17 @@
 - 训练结束登记时，同时记录 Val 与 Test 指标；“全局最优/最近N最优”也按 test_score 选择
 - RAM 常驻加速路径（窗口级一次性加载 Train/Val/Test 到内存，epoch 内零 IO），超过内存上限自动回退
 - 修复：按“真实日期 -> H5组键”的映射取组，保证窗口正确滚动
+
+新增：
+- 集成 TensorBoard 记录训练/验证/测试指标、学习率等
 """
 import math, torch, pandas as pd, numpy as np, h5py, shutil
 import torch.nn.functional as F
 from pathlib import Path
 from tqdm import tqdm
 from contextlib import nullcontext
+from torch.utils.tensorboard import SummaryWriter
+import time
 
 from config import CFG
 from model import GCFNet
@@ -61,6 +66,12 @@ def build_date_to_group_map(h5: h5py.File) -> dict:
 def main():
     # 环境开关（TF32、cudnn.benchmark 等）
     setup_env()
+
+    # TensorBoard: 创建全局 writer
+    log_root = CFG.processed_dir / "tblogs"
+    log_root.mkdir(parents=True, exist_ok=True)
+    run_tag = time.strftime("%Y%m%d_%H%M%S")
+    writer = SummaryWriter(log_dir=log_root / f"run_{run_tag}")
 
     # 1) 标签与交易日历
     label_df = pd.read_parquet(CFG.label_file)
@@ -121,6 +132,7 @@ def main():
     with h5py.File(daily_h5, "r") as h5:
         date2gk_all = build_date_to_group_map(h5)
         if len(date2gk_all) == 0:
+            writer.close()
             raise RuntimeError(f"H5 中没有任何以 date_* 命名的组：{daily_h5}")
 
         # 需要满足：i + val_weeks + test_weeks - 1 < len(fridays)
@@ -189,6 +201,10 @@ def main():
                 else:
                     print(f"[RAM预载] 启用 RAM 模式，总内存估算 {total_gb:.2f} GB（<= {cap_gb:.2f} GB）")
 
+            # TensorBoard：每个窗口使用 pred_date 作为前缀
+            tb_prefix = f"{pred_date.strftime('%Y%m%d')}"
+            global_step = 0  # 跨 epoch 递增
+
             # 训练多个 epoch，按“测试集分数”保存 best
             best_metric = -1e9   # 测试分数（越大越好）
             best_epoch  = -1
@@ -256,6 +272,8 @@ def main():
                         icr_sum += icr * bs
 
                     step += 1
+
+                    # 训练过程日志
                     if (step % max(1, getattr(CFG, "print_step_interval", 10))) == 0:
                         pbar.set_postfix(
                             loss=f"{loss_sum/max(1,n_sum):.4f}",
@@ -264,6 +282,19 @@ def main():
                             ic_r=f"{icr_sum/max(1,n_sum):.4f}",
                             w=w_loss
                         )
+                        # TensorBoard: step 级指标与学习率
+                        writer.add_scalar(f"{tb_prefix}/train_step/loss", loss.detach().float().item(), global_step)
+                        writer.add_scalar(f"{tb_prefix}/train_step/pairwise_ranking_loss", rank_val.detach().float().item(), global_step)
+                        if not torch.isnan(cc):
+                            writer.add_scalar(f"{tb_prefix}/train_step/ic_pearson", float(cc.detach().float().item()), global_step)
+                        writer.add_scalar(f"{tb_prefix}/train_step/ic_rank", icr, global_step)
+                        try:
+                            lr_cur = opt.param_groups[0]["lr"]
+                            writer.add_scalar(f"{tb_prefix}/train_step/lr", lr_cur, global_step)
+                        except Exception:
+                            pass
+
+                    global_step += 1
 
                 print(f"[{pred_date.strftime('%Y-%m-%d')}] "
                       f"epoch {ep+1}/{CFG.epochs_warm} "
@@ -271,6 +302,12 @@ def main():
                       f"pairwise ranking loss={rank_sum/max(1,n_sum):.4f} "
                       f"ic_p={icp_sum/max(1,n_sum):.4f} ic_r={icr_sum/max(1,n_sum):.4f} "
                       f"w={w_loss}")
+
+                # TensorBoard: epoch 级训练均值
+                writer.add_scalar(f"{tb_prefix}/train_epoch/loss", loss_sum/max(1,n_sum), ep)
+                writer.add_scalar(f"{tb_prefix}/train_epoch/pairwise_ranking_loss", rank_sum/max(1,n_sum), ep)
+                writer.add_scalar(f"{tb_prefix}/train_epoch/ic_pearson", icp_sum/max(1,n_sum), ep)
+                writer.add_scalar(f"{tb_prefix}/train_epoch/ic_rank", icr_sum/max(1,n_sum), ep)
 
                 # ---------------- 验证评估 ---------------- #
                 model.eval()
@@ -390,6 +427,22 @@ def main():
                       f"loss={testm['avg_loss']:.4f} "
                       f"ic_r_std={testm['std_ic_rank']:.4f} dates={testm['dates']} "
                       f"score={test_score:.4f} (alpha={alpha})")
+
+                # TensorBoard: Val/Test 指标
+                writer.add_scalar(f"{tb_prefix}/val/mse", valm['avg_mse'], ep)
+                writer.add_scalar(f"{tb_prefix}/val/ic_pearson", valm['avg_ic_pearson'], ep)
+                writer.add_scalar(f"{tb_prefix}/val/ic_rank", valm['avg_ic_rank'], ep)
+                writer.add_scalar(f"{tb_prefix}/val/ic_rank_std", valm['std_ic_rank'], ep)
+                writer.add_scalar(f"{tb_prefix}/val/pairwise_ranking_loss", valm['avg_pairwise_rank'], ep)
+                writer.add_scalar(f"{tb_prefix}/val/loss", valm['avg_loss'], ep)
+
+                writer.add_scalar(f"{tb_prefix}/test/mse", testm['avg_mse'], ep)
+                writer.add_scalar(f"{tb_prefix}/test/ic_pearson", testm['avg_ic_pearson'], ep)
+                writer.add_scalar(f"{tb_prefix}/test/ic_rank", testm['avg_ic_rank'], ep)
+                writer.add_scalar(f"{tb_prefix}/test/ic_rank_std", testm['std_ic_rank'], ep)
+                writer.add_scalar(f"{tb_prefix}/test/pairwise_ranking_loss", testm['avg_pairwise_rank'], ep)
+                writer.add_scalar(f"{tb_prefix}/test/loss", testm['avg_loss'], ep)
+                writer.add_scalar(f"{tb_prefix}/test/score", test_score, ep)
 
                 # 保存 best（以测试分数为准）
                 if math.isfinite(test_score) and test_score > best_metric:
@@ -601,6 +654,8 @@ def main():
                 shutil.copy2(best_recent["best_path"], dst)
 
     print("训练完成。全局最优模型（按测试分数）：", (CFG.model_dir / "best_overall.pth").as_posix())
+    # 关闭 TensorBoard writer
+    writer.close()
 
 if __name__ == "__main__":
     main()

@@ -20,11 +20,11 @@ class Config:
     data_dir      = Path("./data")
     raw_dir       = data_dir / "raw"
     processed_dir = data_dir / "processed"
+    model_dir = Path("./models")
     feat_file     = processed_dir / "features_daily.h5"
     label_file    = processed_dir / "weekly_labels.parquet"
     universe_file = processed_dir / "universe.pkl"
-    model_dir     = processed_dir / "models"
-    registry_file = processed_dir / "models" / "model_registry.csv"
+    registry_file = model_dir / "model_registry.csv"
 
     # -------- 原始数据文件 --------
     price_day_file     = raw_dir / "stock_price_day.parquet"

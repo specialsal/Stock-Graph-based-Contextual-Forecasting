@@ -234,7 +234,7 @@ def save_nav_plot(nav_df: pd.DataFrame, out_png: Path, title: str):
 
 
 def main():
-    out_dir = BT_CFG.processed_dir / "backtest"
+    out_dir = BT_CFG.backtest_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # 1) 读取 H5 / 上下文 / 交易日历

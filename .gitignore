@@ -216,3 +216,5 @@ data/processed/models_gat_2_1/model_best_20240403.pth
 data/processed/models_gat_2_1/model_registry.csv
 __pycache__/train_utils.cpython-310.pyc
 data/processed/ctx_selected_cols.txt
+backtest.py
+__pycache__/train_utils.cpython-310.pyc

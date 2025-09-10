@@ -20,6 +20,8 @@ class BTConfig:
     industry_map_file = raw_dir / "stock_industry_map.csv"
     trading_day_file  = raw_dir / "trading_day.csv"
 
+    backtest_dir = Path("./backtest")
+
     # 为回测筛选加载原始数据（与训练一致）
     price_day_file     = raw_dir / "stock_price_day.parquet"
     stock_info_file    = raw_dir / "stock_info.csv"
