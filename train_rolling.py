@@ -152,7 +152,7 @@ def main():
             train_dates = fridays[i - train_weeks : i]
             val_dates   = fridays[i : i + val_weeks]
             test_dates  = fridays[i + val_weeks : i + val_weeks + test_weeks]
-            pred_date   = fridays[i + val_weeks]  # 测试集起始周五（命名锚点）
+            pred_date   = fridays[i + val_weeks + test_weeks]  # 测试集起始周五（命名锚点）
 
             # 按日期映射到组键
             train_gk = [date2gk_all[d] for d in train_dates if d in date2gk_all]

@@ -9,6 +9,17 @@ from datetime import datetime
 
 @dataclass
 class BTConfig:
+    model_dir      = Path("./models/models_gat_1_1_40")
+    backtest_dir = Path("./backtest/gat_1_1_40")
+    # 选择回测使用的模型：
+    # 可填：具体文件名（例如 "model_20210305.pth" / "model_best_20250403.pth"
+    model_name     = "model_best_20210305.pth"
+    # 回测区间（周五采样日）
+    bt_start_date  = "2021-03-05"
+    bt_end_date    = datetime.today().strftime("%Y-%m-%d")
+    # 运行名（用于输出文件命名）
+    run_name       = "gat_1_1_40"
+
     # 基础路径（沿用训练配置目录结构）
     data_dir       = Path("./data")
     processed_dir  = data_dir / "processed"
@@ -16,28 +27,13 @@ class BTConfig:
     feat_file      = processed_dir / "features_daily.h5"
     ctx_file       = processed_dir / "context_features.parquet"
     label_file     = processed_dir / "weekly_labels.parquet"  # 可选
-    model_dir      = Path("./models")
     industry_map_file = raw_dir / "stock_industry_map.csv"
     trading_day_file  = raw_dir / "trading_day.csv"
-
-    backtest_dir = Path("./backtest")
-
     # 为回测筛选加载原始数据（与训练一致）
     price_day_file     = raw_dir / "stock_price_day.parquet"
     stock_info_file    = raw_dir / "stock_info.csv"
     is_suspended_file  = raw_dir / "is_suspended.csv"
     is_st_file         = raw_dir / "is_st_stock.csv"
-
-    # 选择回测使用的模型：
-    # 可填：具体文件名（例如 "model_20200103.pth" / "model_best_20200103.pth"
-    model_name     = "model_best_20210305.pth"
-
-    # 回测区间（周五采样日）
-    bt_start_date  = "2021-03-05"
-    bt_end_date    = datetime.today().strftime("%Y-%m-%d")
-
-    # 运行名（用于输出文件命名）
-    run_name       = "gat_1_1"
 
     # 回测模式
     # mode = "long"  仅做多
