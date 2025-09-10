@@ -1,13 +1,13 @@
 # ====================== config.py ======================
 # coding: utf-8
 """
-全局配置 —— 提速版（含图模块简化、AMP/Loader优化、指标与模型选择）
+全局配置 —— 早停版（在原基础上加入早停参数）
 说明：
 - 每个训练窗口在线拟合当期训练集 Scaler（避免未来信息泄漏）
 - ranking_weight: 训练损失 = w*(1 - Pearson) + (1-w)*PairwiseRanking
 - test_weeks: 每个窗口引入测试集（单位=周，默认52周）
 - 保存策略：每窗口保存 best（按测试集风险调整分数）与 last，并登记到 registry_file
-- 本版已移除“全局最优(best_overall)/最近N最优(best_recent_N)”的输出逻辑相关配置
+- 新增：早停参数（按窗口早停、不固定总轮数）
 """
 import torch, random, numpy as np
 from dataclasses import dataclass
@@ -67,11 +67,10 @@ class Config:
     tr_layers     = 1   # Transformer 层数
     gat_layers    = 1   # GAT 层数
     graph_type    = "gat"        # 图模块类型 "mean" 或 "gat"
-    lr            = 3e-4
+    lr            = 1e-4
     weight_decay  = 1e-2
-    epochs_warm   = 10  # 每个窗口训练轮数
 
-    # -------- 训练细节 --------
+    # -------- 训练细节（不再固定总轮数） --------
     batch_size        = 8196
     grad_accum_steps  = 1
     device            = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -88,6 +87,13 @@ class Config:
     # -------- 选择与记录（风险调整权重） --------
     score_alpha     = 0.5       # 风险调整参数：score = mean - alpha * std（用于每窗口best的评判）
     ranking_weight  = 0.5       # loss = w*(1 - Pearson) + (1-w)*pairwise_rank
+
+    # -------- 早停参数（按窗口早停，不固定总轮数） --------
+    # 早停判据：以“验证集 avg_ic_rank”（越大越好）为目标，达到 patience 或 max_epochs 即停止
+    early_stop_min_epochs  = 2        # 每窗口最少训练轮数
+    early_stop_max_epochs  = 10       # 每窗口最多训练轮数
+    early_stop_patience    = 2        # 验证指标无提升的容忍轮数
+    early_stop_min_delta   = 1e-4     # 视为“提升”的最小改进幅度
 
     # -------- 板块开关 --------
     include_star_market = False  # 科创板（688/689.XSHG）
