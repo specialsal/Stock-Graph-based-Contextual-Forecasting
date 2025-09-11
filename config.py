@@ -93,9 +93,9 @@ class Config:
 
     # -------- 早停参数（按窗口早停，不固定总轮数） --------
     # 早停判据：以“验证集 avg_ic_rank”（越大越好）为目标，达到 patience 或 max_epochs 即停止
-    early_stop_min_epochs  = 2        # 每窗口最少训练轮数
+    early_stop_min_epochs  = 3        # 每窗口最少训练轮数
     early_stop_max_epochs  = 10       # 每窗口最多训练轮数
-    early_stop_patience    = 2        # 验证指标无提升的容忍轮数
+    early_stop_patience    = 3        # 验证指标无提升的容忍轮数
     early_stop_min_delta   = 1e-4     # 视为“提升”的最小改进幅度
 
     # -------- 板块开关 --------

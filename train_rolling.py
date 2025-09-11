@@ -429,15 +429,16 @@ def main():
                 writer.add_scalar("global/val/ic_rank_std", valm['std_ic_rank'], global_step_epoch)
                 writer.add_scalar("global/val/pairwise_ranking_loss", valm['avg_pairwise_rank'], global_step_epoch)
                 writer.add_scalar("global/val/loss", valm['avg_loss'], global_step_epoch)
-
+                
+                prev_best = best_val_score
                 # 每窗口内：保存 best（以“验证集 avg_ic_rank”为准）
                 if math.isfinite(val_target) and val_target > best_val_score:
                     best_val_score = val_target
-                    best_epoch  = epoch_id
+                    best_epoch = epoch_id
                     save_checkpoint(model, best_path, scaler_d=scaler_d)
 
                 # ---------------- 早停判断（基于验证集 avg_ic_rank） ---------------- #
-                improved = (val_target > best_val_score + float(CFG.early_stop_min_delta))
+                improved = (math.isfinite(val_target) and (val_target > prev_best + float(CFG.early_stop_min_delta)))
                 if improved:
                     # 注意：best_val_score 已在保存 best 时更新，这里不重复更新
                     epochs_no_improve = 0
