@@ -9,8 +9,8 @@ from datetime import datetime
 
 @dataclass
 class BTConfig:
-    model_dir      = Path("./models/models_gat_1_1_40")
-    backtest_dir = Path("./backtest/gat_1_1_40")
+    model_dir      = Path("./models/model_gat_1_1_20_lr1e-4_rolling")
+    backtest_dir = Path("./backtest/ggat_1_1_20_lr1e-4_rolling")
     # 选择回测使用的模型：
     # 可填：具体文件名（例如 "model_20210305.pth" / "model_best_20250403.pth"
     model_name     = "model_best_20210305.pth"
@@ -18,7 +18,7 @@ class BTConfig:
     bt_start_date  = "2021-03-05"
     bt_end_date    = datetime.today().strftime("%Y-%m-%d")
     # 运行名（用于输出文件命名）
-    run_name       = "gat_1_1_40"
+    run_name       = "gat_1_1_20_lr1e-4_rolling"
 
     # 基础路径（沿用训练配置目录结构）
     data_dir       = Path("./data")

@@ -2,12 +2,12 @@
 # coding: utf-8
 """
 全局配置 —— 早停版（在原基础上加入早停参数）
-说明：
-- 每个训练窗口在线拟合当期训练集 Scaler（避免未来信息泄漏）
-- ranking_weight: 训练损失 = w*(1 - Pearson) + (1-w)*PairwiseRanking
-- test_weeks: 每个窗口引入测试集（单位=周，默认52周）
-- 保存策略：每窗口保存 best（按测试集风险调整分数）与 last，并登记到 registry_file
-- 新增：早停参数（按窗口早停、不固定总轮数）
+修改点：
+- 去掉测试集与风险调整分数相关参数：不再使用 test_weeks 与 score_alpha；
+- 新增 run_name，并将 model_dir 定义为 models/model_{run_name}；
+- 训练保存的 best/last 与 TensorBoard 写入策略：模型保存在 models/model_{run_name}，
+  TensorBoard 仍统一写在 models/tblogs；
+- 其它参数与说明保持一致。
 """
 import torch, random, numpy as np
 from dataclasses import dataclass
@@ -16,11 +16,16 @@ from datetime import datetime
 
 @dataclass
 class Config:
+    # -------- 运行命名（影响模型输出路径）--------
+    # 建议每次实验设置不同 run_name，训练时的 best/last 将写入 models/model_{run_name}
+    run_name = "tr1gat1"
+
     # -------- 路径 --------
     data_dir      = Path("./data")
     raw_dir       = data_dir / "raw"
     processed_dir = data_dir / "processed"
-    model_dir     = Path("./models")                      # 模型输出目录
+    # 模型输出目录（按 run_name 组织）
+    model_dir     = Path(f"./models/model_{run_name}")
     feat_file     = processed_dir / "features_daily.h5"
     label_file    = processed_dir / "weekly_labels.parquet"
     universe_file = processed_dir / "universe.pkl"
@@ -55,7 +60,6 @@ class Config:
     # -------- 滚动窗参数（单位=周）--------
     train_years = 5     # 训练年数（以年计）；实际以 5*52 周计算
     val_weeks   = 52    # 验证周数
-    test_weeks  = 52    # 测试周数
     step_weeks  = 52    # 步长（周）
     start_date  = "2011-01-01"
     end_date    = datetime.today().strftime("%Y-%m-%d")  # 默认到今天为止
@@ -84,8 +88,7 @@ class Config:
     use_torch_compile = False
     print_step_interval = 10
 
-    # -------- 选择与记录（风险调整权重） --------
-    score_alpha     = 0.5       # 风险调整参数：score = mean - alpha * std（用于每窗口best的评判）
+    # -------- 排序损失权重 --------
     ranking_weight  = 0.5       # loss = w*(1 - Pearson) + (1-w)*pairwise_rank
 
     # -------- 早停参数（按窗口早停，不固定总轮数） --------
@@ -107,6 +110,8 @@ class Config:
     def __post_init__(self):
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         self.model_dir.mkdir(parents=True, exist_ok=True)
+        # tblogs 放在 ./models/tblogs 下（不和 run_name 绑定），由 train_rolling 使用
+        (Path("./models") / "tblogs").mkdir(parents=True, exist_ok=True)
         random.seed(self.seed)
         np.random.seed(self.seed)
         torch.manual_seed(self.seed)

@@ -1,16 +1,15 @@
 # ====================== train_rolling.py ======================
 # coding: utf-8
 """
-滚动训练主循环（日频 + 行业图/可关闭）— 早停版（每窗口按验证集早停，不固定总轮数）
+滚动训练主循环（日频 + 行业图/可关闭）— 验证集早停版（取消测试集）
 要点：
-- 训练循环从固定 epochs_warm 改为“按窗口早停”：以验证集 avg_ic_rank（越大越好）作为早停判据；
-- 每个 epoch 结束后评估 Val/Test：
-  - 保存 best：仍以测试集风险调整分数 score = avg_ic_rank - alpha * std_ic_rank 选择（与原一致）；
-  - 最后保存 last；
-- 不引入学习率调度（按需求）；
-- 写入登记表时，新增登记该窗口内“实际训练轮数（epoch_count）”；另外按“年份”聚合当年各窗口的训练轮数并登记 year_epoch_total
-  （year = 窗口的 pred_date.year），便于观察年度训练开销；
-- 早停参数直接读取 CFG.early_stop_min_epochs / CFG.early_stop_max_epochs / CFG.early_stop_patience / CFG.early_stop_min_delta；
+- 仅使用训练集与验证集（取消测试集切分与评估）；
+- 每个 epoch 结束后评估验证集：以验证集 avg_ic_rank（越大越好）作为早停与 best 判据；
+- best/last 模型保存日期 pred_date = fridays[i + val_weeks]（与窗口验证终点对齐）；
+- 去除“风险调整分数 score / alpha / test_weeks”等逻辑与参数；
+- 写入登记表时，仅记录：best_epoch、val_avg_pearson、val_avg_rankic、val_std_rankic、
+  val_avg_pairwise_ranking_loss、val_avg_loss、epoch_count；
+- 其它训练细节（标准化口径、过滤、RAM 模式、日志/TensorBoard、pairwise loss 等）保持不变。
 """
 
 import math, torch, pandas as pd, numpy as np, h5py
@@ -33,8 +32,6 @@ from train_utils import (
     # RAM 模式
     load_window_to_ram, iterate_ram_minibatches
 )
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 
 # --------------------------- 辅助：保存模型 --------------------------- #
 def save_checkpoint(model, path: Path, scaler_d=None):
@@ -68,8 +65,8 @@ def main():
     # 环境开关（TF32、cudnn.benchmark 等）
     setup_env()
 
-    # TensorBoard: 创建全局 writer（放在模型目录下）
-    log_root = CFG.model_dir / "tblogs"
+    # TensorBoard: 创建全局 writer（放在 models/tblogs 目录下）
+    log_root = Path("./models") / "tblogs"
     log_root.mkdir(parents=True, exist_ok=True)
     run_tag = time.strftime("%Y%m%d_%H%M%S")
     writer = SummaryWriter(log_dir=log_root / f"run_{run_tag}")
@@ -128,33 +125,32 @@ def main():
 
     train_weeks = CFG.train_years * 52
     val_weeks   = int(CFG.val_weeks)
-    test_weeks  = int(getattr(CFG, "test_weeks", 52))
     step_weeks  = int(CFG.step_weeks)
-    alpha       = float(getattr(CFG, "score_alpha", 0.5))
     w_loss      = float(getattr(CFG, "ranking_weight", 0.5))
 
-    # 6) 滚动训练
+    # 训练输出路径（按 run_name 组织）
+    out_model_dir = Path(CFG.model_dir)
+    out_model_dir.mkdir(parents=True, exist_ok=True)
+    registry_file = Path(CFG.registry_file)
+
+    # 6) 滚动训练（仅 Train/Val）
     with h5py.File(daily_h5, "r") as h5:
         date2gk_all = build_date_to_group_map(h5)
         if len(date2gk_all) == 0:
             writer.close()
             raise RuntimeError(f"H5 中没有任何以 date_* 命名的组：{daily_h5}")
 
-        # 需要满足：i + val_weeks + test_weeks - 1 < len(fridays)
-        for i in range(train_weeks,
-                       len(fridays) - val_weeks - test_weeks + 1,
-                       step_weeks):
-
+        # 循环上限：保证 i + val_weeks < len(fridays)
+        for i in range(train_weeks, len(fridays) - val_weeks, step_weeks):
             # 时间切片（当前窗口的真实日期列表）
             train_dates = fridays[i - train_weeks : i]
             val_dates   = fridays[i : i + val_weeks]
-            test_dates  = fridays[i + val_weeks : i + val_weeks + test_weeks]
-            pred_date   = fridays[i + val_weeks + test_weeks]  # 测试集起始周五（命名锚点）
+            # 模型命名锚点（与验证终点对齐）
+            pred_date   = fridays[i + val_weeks]
 
             # 按日期映射到组键
             train_gk = [date2gk_all[d] for d in train_dates if d in date2gk_all]
             val_gk   = [date2gk_all[d] for d in val_dates   if d in date2gk_all]
-            test_gk  = [date2gk_all[d] for d in test_dates  if d in date2gk_all]
 
             # 仅用“训练组”拟合当期标准化 Scaler（避免未来信息）
             scaler_d = fit_scaler_for_groups(h5, train_gk)
@@ -170,21 +166,18 @@ def main():
             print(f"=== 窗口 {pred_date.strftime('%Y-%m-%d')} === "
                   f"TrainDates={len(train_dates)}(H5命中={len(train_gk)}) "
                   f"ValDates={len(val_dates)}(H5命中={len(val_gk)}) "
-                  f"TestDates={len(test_dates)}(H5命中={len(test_gk)}) "
                   f"TrainSamples≈{_count_samples(train_gk)} "
-                  f"ValSamples≈{_count_samples(val_gk)} "
-                  f"TestSamples≈{_count_samples(test_gk)}")
+                  f"ValSamples≈{_count_samples(val_gk)}")
 
             # 命中不足则跳过该窗口
-            if len(train_gk) == 0 or len(val_gk) == 0 or len(test_gk) == 0:
-                print("[警告] 该窗口在 H5 中命中组过少（Train/Val/Test 存在空），跳过本窗口。")
+            if len(train_gk) == 0 or len(val_gk) == 0:
+                print("[警告] 该窗口在 H5 中命中组过少（Train/Val 存在空），跳过本窗口。")
                 continue
 
             # RAM 预载
             use_ram = bool(getattr(CFG, "ram_accel_enable", False))
             mem_items_train = None
             mem_items_val = None
-            mem_items_test = None
             if use_ram:
                 mem_items_train, gb_train = load_window_to_ram(
                     h5, train_gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn
@@ -192,17 +185,13 @@ def main():
                 mem_items_val, gb_val = load_window_to_ram(
                     h5, val_gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn
                 )
-                mem_items_test, gb_test = load_window_to_ram(
-                    h5, test_gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn
-                )
-                total_gb = gb_train + gb_val + gb_test
+                total_gb = gb_train + gb_val
                 cap_gb = float(getattr(CFG, "ram_accel_mem_cap_gb", 48))
                 if total_gb > cap_gb:
                     print(f"[RAM预载] 估算内存 {total_gb:.2f} GB 超过上限 {cap_gb:.2f} GB，回退为逐组加载模式")
                     use_ram = False
                     mem_items_train = None
                     mem_items_val = None
-                    mem_items_test = None
                 else:
                     print(f"[RAM预载] 启用 RAM 模式，总内存估算 {total_gb:.2f} GB（<= {cap_gb:.2f} GB）")
 
@@ -211,15 +200,11 @@ def main():
             window_step = 0  # 仅用于“窗口内 step”的 x 轴
 
             # 训练（按窗口早停）
-            best_metric = -1e9      # 用于保存 best（测试分数）
+            best_val_score = -1e9   # 验证集 avg_ic_rank（越大越好）
             best_epoch  = -1
-            best_path   = CFG.model_dir / f"model_best_{pred_date.strftime('%Y%m%d')}.pth"
+            best_path   = out_model_dir / f"model_best_{pred_date.strftime('%Y%m%d')}.pth"
 
-            # 早停追踪（以验证 avg_ic_rank 为准）
-            best_val_score = -1e9
             epochs_no_improve = 0
-
-            # 实际 epoch 计数（本窗口）
             epoch_id = 0
 
             while True:
@@ -339,8 +324,9 @@ def main():
                 writer.add_scalar("global/train_epoch/ic_pearson", icp_sum/max(1,n_sum), global_step_epoch)
                 writer.add_scalar("global/train_epoch/ic_rank", icr_sum/max(1,n_sum), global_step_epoch)
 
-                # ---------------- 验证/测试评估 ---------------- #
+                # ---------------- 验证评估（用于早停与 best） ---------------- #
                 model.eval()
+
                 def eval_split_ram(mem_items):
                     per_date = []
                     for it in mem_items:
@@ -421,42 +407,14 @@ def main():
                             "avg_ic_rank": float(avg_icr), "std_ic_rank": float(std_icr),
                             "avg_pairwise_rank": float(avg_prl), "avg_loss": float(avg_loss),
                             "dates": len(per_date_val)}
-                    val_target = float(avg_icr)  # 早停目标：验证集 avg_ic_rank（越大越好）
-
-                # Test
-                per_date_test = (eval_split_ram(mem_items_test) if (use_ram and mem_items_test is not None)
-                                 else eval_split_stream(test_gk))
-                if len(per_date_test) == 0:
-                    testm = {"avg_mse": float("nan"), "avg_ic_pearson": float("nan"),
-                             "avg_ic_rank": float("nan"), "std_ic_rank": float("nan"),
-                             "avg_pairwise_rank": float("nan"), "avg_loss": float("nan"),
-                             "dates": 0}
-                    test_score = -1e9
-                else:
-                    n_total = sum(d["n"] for d in per_date_test)
-                    wv = [d["n"] / n_total for d in per_date_test]
-                    avg_mse = sum(d["mse"] * wi for d, wi in zip(per_date_test, wv))
-                    avg_icp = sum((0.0 if math.isnan(d["ic_pearson"]) else d["ic_pearson"]) * wi for d, wi in zip(per_date_test, wv))
-                    avg_icr = sum(d["ic_rank"] * wi for d, wi in zip(per_date_test, wv))
-                    std_icr = float(np.std([d["ic_rank"] for d in per_date_test], ddof=1)) if len(per_date_test) > 1 else 0.0
-                    avg_prl = sum(d["pairwise_rank"] * wi for d, wi in zip(per_date_test, wv))
-                    avg_loss = sum(d["loss"] * wi for d, wi in zip(per_date_test, wv))
-                    testm = {"avg_mse": float(avg_mse), "avg_ic_pearson": float(avg_icp),
-                             "avg_ic_rank": float(avg_icr), "std_ic_rank": float(std_icr),
-                             "avg_pairwise_rank": float(avg_prl), "avg_loss": float(avg_loss),
-                             "dates": len(per_date_test)}
-                    test_score = (testm["avg_ic_rank"] - alpha * testm["std_ic_rank"]) if math.isfinite(testm["avg_ic_rank"]) else -1e9
+                    val_target = float(avg_icr)  # 早停与 best 目标：验证集 avg_ic_rank（越大越好）
 
                 # 打印指标
                 print(f"  Val:  mse={valm['avg_mse']:.6f} ic_p={valm['avg_ic_pearson']:.4f} "
                       f"ic_r={valm['avg_ic_rank']:.4f} prl={valm['avg_pairwise_rank']:.4f} "
                       f"loss={valm['avg_loss']:.4f} ic_r_std={valm['std_ic_rank']:.4f} dates={valm['dates']}")
-                print(f"  Test: mse={testm['avg_mse']:.6f} ic_p={testm['avg_ic_pearson']:.4f} "
-                      f"ic_r={testm['avg_ic_rank']:.4f} prl={testm['avg_pairwise_rank']:.4f} "
-                      f"loss={testm['avg_loss']:.4f} ic_r_std={testm['std_ic_rank']:.4f} "
-                      f"dates={testm['dates']} score={test_score:.4f} (alpha={alpha})")
 
-                # TensorBoard：Val/Test（分窗口 + 全局）
+                # TensorBoard：Val（分窗口 + 全局）
                 ep = epoch_id - 1
                 writer.add_scalar(f"{tb_prefix}/val/mse", valm['avg_mse'], ep)
                 writer.add_scalar(f"{tb_prefix}/val/ic_pearson", valm['avg_ic_pearson'], ep)
@@ -465,14 +423,6 @@ def main():
                 writer.add_scalar(f"{tb_prefix}/val/pairwise_ranking_loss", valm['avg_pairwise_rank'], ep)
                 writer.add_scalar(f"{tb_prefix}/val/loss", valm['avg_loss'], ep)
 
-                writer.add_scalar(f"{tb_prefix}/test/mse", testm['avg_mse'], ep)
-                writer.add_scalar(f"{tb_prefix}/test/ic_pearson", testm['avg_ic_pearson'], ep)
-                writer.add_scalar(f"{tb_prefix}/test/ic_rank", testm['avg_ic_rank'], ep)
-                writer.add_scalar(f"{tb_prefix}/test/ic_rank_std", testm['std_ic_rank'], ep)
-                writer.add_scalar(f"{tb_prefix}/test/pairwise_ranking_loss", testm['avg_pairwise_rank'], ep)
-                writer.add_scalar(f"{tb_prefix}/test/loss", testm['avg_loss'], ep)
-                writer.add_scalar(f"{tb_prefix}/test/score", test_score, ep)
-
                 writer.add_scalar("global/val/mse", valm['avg_mse'], global_step_epoch)
                 writer.add_scalar("global/val/ic_pearson", valm['avg_ic_pearson'], global_step_epoch)
                 writer.add_scalar("global/val/ic_rank", valm['avg_ic_rank'], global_step_epoch)
@@ -480,24 +430,16 @@ def main():
                 writer.add_scalar("global/val/pairwise_ranking_loss", valm['avg_pairwise_rank'], global_step_epoch)
                 writer.add_scalar("global/val/loss", valm['avg_loss'], global_step_epoch)
 
-                writer.add_scalar("global/test/mse", testm['avg_mse'], global_step_epoch)
-                writer.add_scalar("global/test/ic_pearson", testm['avg_ic_pearson'], global_step_epoch)
-                writer.add_scalar("global/test/ic_rank", testm['avg_ic_rank'], global_step_epoch)
-                writer.add_scalar("global/test/ic_rank_std", testm['std_ic_rank'], global_step_epoch)
-                writer.add_scalar("global/test/pairwise_ranking_loss", testm['avg_pairwise_rank'], global_step_epoch)
-                writer.add_scalar("global/test/loss", testm['avg_loss'], global_step_epoch)
-                writer.add_scalar("global/test/score", test_score, global_step_epoch)
-
-                # 每窗口内：保存 best（以“测试集风险调整分数”为准）
-                if math.isfinite(test_score) and test_score > best_metric:
-                    best_metric = test_score
+                # 每窗口内：保存 best（以“验证集 avg_ic_rank”为准）
+                if math.isfinite(val_target) and val_target > best_val_score:
+                    best_val_score = val_target
                     best_epoch  = epoch_id
                     save_checkpoint(model, best_path, scaler_d=scaler_d)
 
                 # ---------------- 早停判断（基于验证集 avg_ic_rank） ---------------- #
                 improved = (val_target > best_val_score + float(CFG.early_stop_min_delta))
                 if improved:
-                    best_val_score = val_target
+                    # 注意：best_val_score 已在保存 best 时更新，这里不重复更新
                     epochs_no_improve = 0
                 else:
                     epochs_no_improve += 1
@@ -511,16 +453,16 @@ def main():
                 if patience_out or maxed_out:
                     reason = "patience" if patience_out else "max_epochs"
                     print(f"[早停] 窗口 {pred_date.strftime('%Y-%m-%d')} 在 epoch={epoch_id} 触发早停（原因：{reason}）。"
-                          f" best_on_test_score={best_metric:.4f} (best_epoch={best_epoch})")
+                          f" best_on_val_ic_rank={best_val_score:.4f} (best_epoch={best_epoch})")
                     break
 
             # 训练完一个窗口：保存最后一版
-            last_path = CFG.model_dir / f"model_{pred_date.strftime('%Y%m%d')}.pth"
+            last_path = out_model_dir / f"model_{pred_date.strftime('%Y%m%d')}.pth"
             save_checkpoint(model, last_path, scaler_d=scaler_d)
             print(f"窗口结束，已保存：last -> {last_path.name} , best(ep={best_epoch}) -> {Path(best_path).name}")
 
-            # ---------------- 写入登记表（每窗口一行 + 当年累计训练轮数） ---------------- #
-            # 以 best 模型重新评估一次（与训练期口径一致），汇总度量后登记
+            # ---------------- 写入登记表（每窗口一行） ---------------- #
+            # 以 best 模型重新评估一次验证集（与训练期口径一致），汇总度量后登记
             payload = torch.load(best_path, map_location=CFG.device, weights_only=False)
             state_dict = payload["state_dict"] if isinstance(payload, dict) and "state_dict" in payload else payload
             model.load_state_dict(state_dict, strict=False)
@@ -576,56 +518,24 @@ def main():
                 return per_date
 
             per_date_val = eval_split_stream(val_gk)
-            per_date_test = eval_split_stream(test_gk)
             final_val = summarize(per_date_val)
-            final_test = summarize(per_date_test)
 
-            # 读取历史登记以统计“该年累计训练轮数”
-            registry_file = getattr(CFG, "registry_file", CFG.model_dir / "model_registry.csv")
-            pred_year = pd.Timestamp(pred_date).year
-            year_epoch_total = epoch_id
-            if Path(registry_file).exists():
-                try:
-                    df_reg_old = pd.read_csv(registry_file)
-                    if "pred_date" in df_reg_old.columns and "epoch_count" in df_reg_old.columns:
-                        df_reg_old["year"] = pd.to_datetime(df_reg_old["pred_date"]).dt.year
-                        year_epoch_total += int(df_reg_old.loc[df_reg_old["year"] == pred_year, "epoch_count"].sum())
-                except Exception:
-                    pass
-
-            # 写入登记表
+            # 写入登记表（仅保留指定字段）
             row = {
                 "pred_date": pred_date.strftime("%Y-%m-%d"),
                 "best_epoch": best_epoch,
-                "best_path": str(best_path),
-                "last_path": str(last_path),
 
-                "val_avg_mse": final_val["avg_mse"],
                 "val_avg_pearson": final_val["avg_ic_pearson"],
                 "val_avg_rankic": final_val["avg_ic_rank"],
                 "val_std_rankic": final_val["std_ic_rank"],
                 "val_avg_pairwise_ranking_loss": final_val["avg_pairwise_rank"],
                 "val_avg_loss": final_val["avg_loss"],
-                "val_dates": final_val["dates"] ,
 
-                "test_avg_mse": final_test["avg_mse"],
-                "test_avg_pearson": final_test["avg_ic_pearson"],
-                "test_avg_rankic": final_test["avg_ic_rank"],
-                "test_std_rankic": final_test["std_ic_rank"],
-                "test_avg_pairwise_ranking_loss": final_test["avg_pairwise_rank"],
-                "test_avg_loss": final_test["avg_loss"],
-                "test_dates": final_test["dates"],
-
-                "ranking_weight": w_loss,
-
-                # 新增：窗口内实际训练轮数与该年累计训练轮数
                 "epoch_count": epoch_id,
-                "year": pred_year,
-                "year_epoch_total": year_epoch_total,
             }
             df_new = pd.DataFrame([row])
-            Path(registry_file).parent.mkdir(parents=True, exist_ok=True)
-            if Path(registry_file).exists():
+            registry_file.parent.mkdir(parents=True, exist_ok=True)
+            if registry_file.exists():
                 df_old = pd.read_csv(registry_file)
                 df_all = pd.concat([df_old, df_new], ignore_index=True)
             else:
