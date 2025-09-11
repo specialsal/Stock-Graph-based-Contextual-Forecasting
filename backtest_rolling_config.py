@@ -13,14 +13,14 @@ from datetime import datetime
 @dataclass
 class BTRollingConfig:
     # 与训练一致的 run_name（用于定位模型目录）
-    run_name      = "default_run"
+    run_name      = "tr1gat1"
 
     # 路径
     model_dir     = Path(f"./models/model_{run_name}")
     backtest_dir  = Path(f"./backtest_rolling/{run_name}")
 
     # 回测区间（周五采样日）
-    bt_start_date = "2015-01-02"
+    bt_start_date = "2017-02-10"
     bt_end_date   = datetime.today().strftime("%Y-%m-%d")
 
     # 运行名（用于输出文件命名）
