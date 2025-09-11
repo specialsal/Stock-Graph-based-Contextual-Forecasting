@@ -18,7 +18,7 @@ from datetime import datetime
 @dataclass
 class Config:
     # -------- 运行命名（影响模型输出路径）--------
-    run_name = "default_run"
+    run_name = "tr1gat1"
 
     # -------- 路径 --------
     data_dir      = Path("./data")
@@ -27,7 +27,6 @@ class Config:
     model_dir     = Path(f"./models/model_{run_name}")     # 按 run_name 组织
     feat_file     = processed_dir / "features_daily.h5"
     label_file    = processed_dir / "weekly_labels.parquet"
-    universe_file = processed_dir / "universe.pkl"
     registry_file = model_dir / "model_registry.csv"       # 窗口登记表
 
     # -------- 原始数据文件 --------
@@ -91,9 +90,9 @@ class Config:
     ranking_weight  = 0.5
 
     # -------- 早停参数 --------
-    early_stop_min_epochs  = 2
-    early_stop_max_epochs  = 10
-    early_stop_patience    = 2
+    early_stop_min_epochs  = 3
+    early_stop_max_epochs  = 15
+    early_stop_patience    = 3
     early_stop_min_delta   = 1e-4
 
     # -------- Warm Start 开关 --------
