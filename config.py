@@ -33,6 +33,7 @@ class Config:
     price_day_file     = raw_dir / "stock_price_day.parquet"
     index_day_file     = raw_dir / "index_price_day.parquet"
     style_day_file     = raw_dir / "sector_price_day.parquet"
+    funda_day_file     = raw_dir / "funda_factors.parquet"
     trading_day_file   = raw_dir / "trading_day.csv"
     industry_map_file  = raw_dir / "stock_industry_map.csv"
     stock_info_file     = raw_dir / "stock_info.csv"

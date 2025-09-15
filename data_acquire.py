@@ -1,7 +1,23 @@
 # -*- coding: utf-8 -*-
+"""
+data_acquire.py
+
+在你现有数据获取流程基础上，新增：
+- 基本面因子（8 个源字段）的增量拉取与落盘：
+  pb_ratio_lf, ps_ratio_ttm, operating_revenue_ttm_0, net_profit_parent_company_ttm_0,
+  cash_flow_from_operating_activities_ttm_0, total_liabilities_mrq_0, ev_ttm, r_n_d
+
+输出：
+- data/raw/funda_factors.parquet（MultiIndex: order_book_id, datetime；列为 8 源字段）
+
+其它原有功能保持不变。
+"""
+
 import os
 import warnings
 from datetime import datetime, timedelta
+from pathlib import Path
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -30,11 +46,23 @@ UPDATE_SWITCH = {
     'index_components': True,      # 指数成分（快照覆盖）
     'industry_and_style': True,    # 行业与风格（快照覆盖 + 映射）
     'index_price_day': True,       # 指数日行情（parquet, MultiIndex）
+    'funda_factors': True,         # 新增：基本面源字段（parquet, MultiIndex）
 }
 
 # 可选：在获取行情时过滤无效代码，减少 invalid order_book_id 警告
 FILTER_INVALID_CODES = True
 
+# 基本面字段清单（与你确认一致）
+DEFAULT_FUNDA_FIELDS = [
+    "pb_ratio_lf",
+    "ps_ratio_ttm",
+    "operating_revenue_ttm_0",
+    "net_profit_parent_company_ttm_0",
+    "cash_flow_from_operating_activities_ttm_0",
+    "total_liabilities_mrq_0",
+    "ev_ttm",
+    "r_n_d",
+]
 
 # =========================
 # 通用工具
@@ -468,6 +496,103 @@ def update_index_price_day(start='2010-01-01', end=TODAY_STR):
 
 
 # =========================
+# 9) 基本面源字段（MultiIndex 增量）—— 新增
+# =========================
+def _ensure_factor_multiindex(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    将 rq.get_factor 返回的数据规范化为 MultiIndex(order_book_id, datetime) 宽表。
+    兼容：
+    - 已是 MultiIndex 索引；
+    - 长表：包含列 ['order_book_id','datetime'] 或 ['order_book_id','date']。
+    """
+    if isinstance(df.index, pd.MultiIndex):
+        names = list(df.index.names)
+        std_names = ['order_book_id', 'datetime']
+        if names != std_names:
+            try:
+                df.index = df.index.set_names(std_names)
+            except Exception:
+                pass
+        dt = df.index.get_level_values('datetime')
+        if not np.issubdtype(dt.dtype, np.datetime64):
+            df.index = pd.MultiIndex.from_tuples([(sid, pd.to_datetime(x)) for sid, x in df.index],
+                                                 names=std_names)
+        return df.sort_index()
+
+    # 长表
+    if {'order_book_id', 'datetime'}.issubset(df.columns):
+        df = df.copy()
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        df = df.set_index(['order_book_id', 'datetime']).sort_index()
+        return df
+    if {'order_book_id', 'date'}.issubset(df.columns):
+        df = df.copy()
+        df['datetime'] = pd.to_datetime(df['date'])
+        df = df.set_index(['order_book_id', 'datetime']).sort_index()
+        df = df.drop(columns=['date'])
+        return df
+    raise ValueError("rq.get_factor 返回的数据需包含 'order_book_id' 与 'datetime/date' 列，或为 MultiIndex 索引。")
+
+def update_fundamental_factors(start='2010-01-01', end=TODAY_STR, factors: Optional[List[str]] = None):
+    """
+    拉取并增量合并 8 个基本面源字段，写入 data/raw/funda_factors.parquet。
+    - 数据口径：PIT/日频（已由 rq 保证）
+    - 索引：MultiIndex(order_book_id, datetime)
+    - 列：factors（默认 DEFAULT_FUNDA_FIELDS）
+    """
+    if not UPDATE_SWITCH.get('funda_factors', True):
+        return
+    stock_info_path = os.path.join(DATA_PATH, 'stock_info.csv')
+    stock_info = read_csv_safe(stock_info_path, index_col=0, encoding='gbk')
+    if stock_info is None or stock_info.empty:
+        warnings.warn('stock_info.csv 不存在或为空，跳过基本面源字段更新')
+        return
+    stock_list = stock_info['code'].dropna().unique().tolist()
+
+    out_path = os.path.join(DATA_PATH, 'funda_factors.parquet')
+    df_old = read_parquet_safe(out_path)
+
+    # 旧数据索引规范
+    if df_old is not None and not df_old.empty:
+        if not isinstance(df_old.index, pd.MultiIndex):
+            try:
+                df_old.index = pd.MultiIndex.from_tuples(df_old.index, names=['order_book_id', 'datetime'])
+            except Exception:
+                pass
+        # 确保 datetime 类型
+        if isinstance(df_old.index, pd.MultiIndex):
+            dt = df_old.index.get_level_values('datetime')
+            if not np.issubdtype(dt.dtype, np.datetime64):
+                df_old.index = pd.MultiIndex.from_tuples(
+                    [(sid, pd.to_datetime(x)) for sid, x in df_old.index],
+                    names=['order_book_id', 'datetime']
+                )
+        df_old = df_old.sort_index()
+
+    # 增量起点——包含最后一天（以便覆盖修订）
+    last_dt = max_datetime_from_multiindex(df_old)
+    fetch_start = start if last_dt is None else last_dt.strftime('%Y-%m-%d')
+    if pd.to_datetime(fetch_start) > pd.to_datetime(end):
+        return
+
+    # 拉取
+    facs = factors or DEFAULT_FUNDA_FIELDS
+    try:
+        df_new = rq.get_factor(stock_list, facs, start_date=fetch_start, end_date=end, expect_df=True)
+    except Exception as e:
+        warnings.warn(f'get_factor error: {e}')
+        return
+    if df_new is None or (isinstance(df_new, pd.DataFrame) and df_new.empty):
+        return
+
+    df_new = _ensure_factor_multiindex(df_new)
+
+    # 合并与去重
+    df_all = concat_dedup_multiindex(df_old, df_new, sort_index=True)
+    write_parquet(df_all, out_path)
+
+
+# =========================
 # 主流程
 # =========================
 def main():
@@ -502,6 +627,10 @@ def main():
     # 8) 指数日行情（MultiIndex）
     print('更新指数日行情...')
     update_index_price_day(start='2010-01-01', end=TODAY_STR)
+
+    # 9) 基本面源字段（MultiIndex）
+    print('更新基本面源字段...')
+    update_fundamental_factors(start='2010-01-01', end=TODAY_STR, factors=DEFAULT_FUNDA_FIELDS)
 
 
 if __name__ == '__main__':
