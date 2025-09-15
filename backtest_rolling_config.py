@@ -13,7 +13,7 @@ from datetime import datetime
 @dataclass
 class BTRollingConfig:
     # 与训练一致的 run_name（用于定位模型目录）
-    run_name      = "tr1gat1"
+    run_name      = "tr1gat1win50"
 
     # 路径
     model_dir     = Path(f"./models/model_{run_name}")
@@ -51,12 +51,12 @@ class BTRollingConfig:
     # 分组与持仓控制
     top_pct        = 0.1    # 做多比例（0~1）
     bottom_pct     = 0.1    # 做空比例（0~1），仅在 mode=="ls" 时使用
-    min_n_stocks   = 20     # 每周最少持仓数量（若不足则本周空仓）
-    max_n_stocks   = 300    # 每边最多持仓数量（多/空各自限制）
+    min_n_stocks   = 50     # 每周最少持仓数量（若不足则本周空仓) 50
+    max_n_stocks   = 300    # 每边最多持仓数量（多/空各自限制）300
 
     # 交易相关假设
-    slippage_bps   = 0.005  # 单边滑点，基点
-    fee_bps        = 0.001  # 单边手续费，基点
+    slippage_bps   = 8  # 单边滑点，基点
+    fee_bps        = 3  # 单边手续费，基点
 
     # 样本过滤（与训练一致）
     enable_filters     = True

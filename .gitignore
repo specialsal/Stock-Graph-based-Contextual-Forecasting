@@ -4,4 +4,4 @@ md
 models
 backtest
 backtest_rolling
-select_stock copy.ipynb
+select_stock.ipynb

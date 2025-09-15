@@ -18,7 +18,7 @@ from datetime import datetime
 @dataclass
 class Config:
     # -------- 运行命名（影响模型输出路径）--------
-    run_name = "tr1gat1"
+    run_name = "tr1gat1warm"
 
     # -------- 路径 --------
     data_dir      = Path("./data")
@@ -97,7 +97,7 @@ class Config:
 
     # -------- Warm Start 开关 --------
     # 若为 True，则每个窗口训练前尝试加载“上一个窗口”的 best 作为初始化
-    warm_start_enable = False
+    warm_start_enable = True
     # strict=True 时要求完全匹配 state_dict；False 则允许部分加载（推荐 False，更稳健）
     warm_start_strict = False
 
