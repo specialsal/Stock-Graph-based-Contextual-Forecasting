@@ -5,3 +5,5 @@ models
 backtest
 backtest_rolling
 select_stock.ipynb
+diagnose
+diag_chase.py

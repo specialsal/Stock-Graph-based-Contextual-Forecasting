@@ -69,9 +69,10 @@ def build_portfolio_with_weights(scores: pd.DataFrame,
     """
     返回：
       - nav_df: index=date, cols=[ret_long, ret_short, ret_total, nav, n_long]
-      - pos_df: 每周持仓与权重明细（date, stock, weight, score）
+      - pos_df: 每周持仓与权重明细（date, stock, weight, score, next_week_ret）
     说明：
       - 本函数实现 long-only（ret_short 固定为 0），保留 ret_short 字段以便扩展。
+      - next_week_ret = 从当周（周五）到下一周（周五）的 close-to-close 收益
     """
     if scores.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -120,7 +121,13 @@ def build_portfolio_with_weights(scores: pd.DataFrame,
 
         recs.append({"date": d, "ret_long": long_ret, "ret_short": 0.0, "ret_total": total, "n_long": len(df_sel)})
         for _, r in df_sel.iterrows():
-            pos_rows.append({"date": d, "stock": r["stock"], "weight": float(r["weight"]), "score": float(r["score"])})
+            pos_rows.append({
+                "date": d,
+                "stock": r["stock"],
+                "weight": float(r["weight"]),
+                "score": float(r["score"]),
+                "next_week_ret": float(r["ret"])  # 新增：记录下一周收益
+            })
 
     # 2) 追加仅持仓不计收益的最后一周（若存在）
     if include_last_no_return_week:
@@ -149,7 +156,13 @@ def build_portfolio_with_weights(scores: pd.DataFrame,
                             w = np.full(len(df_sel), 1.0 / len(df_sel), dtype=float) if ssum <= 0 else s / ssum
                         df_sel = df_sel.assign(weight=w)
                         for _, r in df_sel.iterrows():
-                            pos_rows.append({"date": last_d, "stock": r["stock"], "weight": float(r["weight"]), "score": float(r["score"])})
+                            pos_rows.append({
+                                "date": last_d,
+                                "stock": r["stock"],
+                                "weight": float(r["weight"]),
+                                "score": float(r["score"]),
+                                "next_week_ret": float("nan")  # 最后一周没有 next 周收益，置为 NaN
+                            })
 
     # 输出
     if not recs:

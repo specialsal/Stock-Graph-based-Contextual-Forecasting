@@ -49,8 +49,8 @@ class BTRollingConfig:
     short_weight   = 1.0
 
     # 分组与持仓控制
-    top_pct        = 0.1    # 做多比例（0~1）
-    bottom_pct     = 0.1    # 做空比例（0~1），仅在 mode=="ls" 时使用
+    top_pct        = 0.05    # 做多比例（0~1）
+    bottom_pct     = 0.05    # 做空比例（0~1），仅在 mode=="ls" 时使用
     min_n_stocks   = 50     # 每周最少持仓数量（若不足则本周空仓) 50
     max_n_stocks   = 300    # 每边最多持仓数量（多/空各自限制）300
 

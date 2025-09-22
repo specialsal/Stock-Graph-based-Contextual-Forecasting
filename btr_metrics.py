@@ -3,7 +3,7 @@
 btr_metrics.py
 基于一个主策略 nav.csv，叠加若干对比 nav.csv，并可指定一个主基准用于超额计算。
 输出（写入主策略 nav 同级目录的 metrics_{run_name}/ 子目录）：
-- metrics_{run_name}.json（总 + 年度 + 最大回撤起止 + 恢复周期）
+- metrics_{run_name}.json（总 + 年度 + 最大回撤起止 + 恢复周期 + 胜率）
 - metrics_by_year_{run_name}.csv
 - nav_{run_name}.png（主策略 + 对比 + 超额（若有））
 - nav_marked_{run_name}.png（带窗口色块）
@@ -12,8 +12,10 @@ btr_metrics.py
   - excess_metrics_{run_name}_vs_{bench}.json
   - excess_metrics_by_year_{run_name}_vs_{bench}.csv
 
-使用方法：
-- 直接在 IDE 中打开本文件，修改“用户配置”段的参数，然后运行 main()。
+新增：
+- 总体与年度的两类胜率：
+  - 周度组合加权胜率：win_rate_weekly_weighted
+  - 个股层面胜率：win_rate_stockwise
 """
 
 from pathlib import Path
@@ -21,6 +23,7 @@ from typing import Dict, List, Optional, Tuple
 import json
 
 import pandas as pd
+import numpy as np
 
 from config import CFG
 from utils import load_calendar, weekly_fridays
@@ -73,6 +76,107 @@ def to_path_or_none(p: Optional[str]) -> Optional[Path]:
     return Path(p).resolve()
 
 
+def _read_positions(positions_csv: Path) -> Optional[pd.DataFrame]:
+    if positions_csv is None or (not positions_csv.exists()):
+        return None
+    try:
+        pos = pd.read_csv(positions_csv)
+        if pos is None or pos.empty:
+            return None
+        # 需要 date, weight, next_week_ret
+        req = {"date", "weight", "next_week_ret"}
+        if not req.issubset(set(pos.columns)):
+            return None
+        pos["date"] = pd.to_datetime(pos["date"], errors="coerce")
+        pos = pos.dropna(subset=["date"])
+        pos = pos.replace([np.inf, -np.inf], np.nan)
+        # 类型统一
+        pos["weight"] = pd.to_numeric(pos["weight"], errors="coerce")
+        pos["next_week_ret"] = pd.to_numeric(pos["next_week_ret"], errors="coerce")
+        return pos
+    except Exception:
+        return None
+
+
+def compute_win_rates_from_positions(pos: Optional[pd.DataFrame]) -> Dict[str, float]:
+    """
+    从 positions DataFrame 计算总体胜率（两类）。
+    返回：
+      - win_rate_weekly_weighted, n_weeks_for_winrate
+      - win_rate_stockwise, n_stocks_for_winrate
+    """
+    out = {
+        "win_rate_weekly_weighted": float("nan"),
+        "n_weeks_for_winrate": 0,
+        "win_rate_stockwise": float("nan"),
+        "n_stocks_for_winrate": 0
+    }
+    if pos is None or pos.empty:
+        return out
+
+    # 个股层面胜率
+    pos_valid = pos[pd.notna(pos["next_week_ret"])].copy()
+    n_obs = int(pos_valid.shape[0])
+    out["n_stocks_for_winrate"] = n_obs
+    if n_obs > 0:
+        out["win_rate_stockwise"] = float((pos_valid["next_week_ret"] > 0).mean())
+
+    # 周度组合加权胜率（按 date 聚合）：无 apply 警告版本
+    sub = pos_valid.dropna(subset=["weight"]).copy()
+    if not sub.empty:
+        proxy_week_ret = (
+            sub.assign(prod=sub["weight"] * sub["next_week_ret"])
+               .groupby("date", sort=True)["prod"].sum()
+        )
+        proxy_week_ret = proxy_week_ret.replace([np.inf, -np.inf], np.nan).dropna()
+        n_weeks = int(proxy_week_ret.shape[0])
+        out["n_weeks_for_winrate"] = n_weeks
+        if n_weeks > 0:
+            out["win_rate_weekly_weighted"] = float((proxy_week_ret > 0).mean())
+    return out
+
+
+def compute_yearly_win_rates_from_positions(pos: Optional[pd.DataFrame]) -> Dict[str, Dict[str, float]]:
+    """
+    逐年胜率（两类），返回 dict: year -> {win_rate_weekly_weighted, n_weeks_for_winrate_year,
+                                            win_rate_stockwise, n_stocks_for_winrate_year}
+    """
+    if pos is None or pos.empty or ("date" not in pos.columns):
+        return {}
+    out: Dict[str, Dict[str, float]] = {}
+    pos_year = pos.copy()
+    pos_year["year"] = pos_year["date"].dt.year
+
+    for y, g in pos_year.groupby("year"):
+        g = g.replace([np.inf, -np.inf], np.nan)
+        # 个股层面（忽略 NaN）
+        gv = g[pd.notna(g["next_week_ret"])]
+        n_stk = int(gv.shape[0])
+        win_stock = float((gv["next_week_ret"] > 0).mean()) if n_stk > 0 else float("nan")
+
+        # 周度组合加权（无 apply 警告版本）
+        gv2 = gv.dropna(subset=["weight"]).copy()
+        if not gv2.empty:
+            proxy_week = (
+                gv2.assign(prod=gv2["weight"] * gv2["next_week_ret"])
+                   .groupby("date", sort=True)["prod"].sum()
+            )
+            proxy_week = proxy_week.replace([np.inf, -np.inf], np.nan).dropna()
+            n_wk = int(proxy_week.shape[0])
+            win_week = float((proxy_week > 0).mean()) if n_wk > 0 else float("nan")
+        else:
+            n_wk = 0
+            win_week = float("nan")
+
+        out[str(int(y))] = {
+            "win_rate_weekly_weighted": win_week,
+            "n_weeks_for_winrate_year": n_wk,
+            "win_rate_stockwise": win_stock,
+            "n_stocks_for_winrate_year": n_stk
+        }
+    return out
+
+
 def main():
     # 解析路径
     main_path = Path(MAIN_NAV_PATH).resolve()
@@ -116,28 +220,58 @@ def main():
     out_dir = main_path.parent / f"metrics_{run_name}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 计算主策略指标
+    # 计算主策略指标（收益/波动/回撤等）
     total_metrics, metrics_by_year, dd_info = calc_full_metrics(
         df_main, ret_col="ret_total", freq_per_year=ANNUAL_FREQ, rf_annual=RISK_FREE_ANNUAL
     )
 
+    # 胜率：读取 positions 并计算 overall + yearly
+    positions_csv = main_path.parent / f"positions_{run_name}.csv"
+    pos_df = _read_positions(positions_csv)
+    win_overall = compute_win_rates_from_positions(pos_df)
+    win_yearly = compute_yearly_win_rates_from_positions(pos_df)
+
     # 写主 metrics JSON / 年度 CSV
     out_json = out_dir / f"metrics_{run_name}.json"
+
+    # 合并 overall
+    overall_payload = dict(total_metrics)
+    overall_payload.update({
+        "win_rate_weekly_weighted": win_overall.get("win_rate_weekly_weighted", float("nan")),
+        "n_weeks_for_winrate": win_overall.get("n_weeks_for_winrate", 0),
+        "win_rate_stockwise": win_overall.get("win_rate_stockwise", float("nan")),
+        "n_stocks_for_winrate": win_overall.get("n_stocks_for_winrate", 0)
+    })
+
+    # 合并 yearly：将胜率信息并入 metrics_by_year 的每一年 dict 中
+    metrics_by_year_aug: Dict[str, Dict[str, float]] = {}
+    for y, m in metrics_by_year.items():
+        add = win_yearly.get(y, {})
+        m2 = dict(m)
+        m2.update({
+            "win_rate_weekly_weighted": add.get("win_rate_weekly_weighted", float("nan")),
+            "n_weeks_for_winrate_year": add.get("n_weeks_for_winrate_year", 0),
+            "win_rate_stockwise": add.get("win_rate_stockwise", float("nan")),
+            "n_stocks_for_winrate_year": add.get("n_stocks_for_winrate_year", 0),
+        })
+        metrics_by_year_aug[y] = m2
+
     payload = {
-        "overall": total_metrics,
+        "overall": overall_payload,
         "max_drawdown": {
             "drawdown": dd_info.drawdown,
             "start_date": None if dd_info.start_date is None else str(dd_info.start_date.date()),
             "end_date": None if dd_info.end_date is None else str(dd_info.end_date.date()),
-            "recovery_days": dd_info.recovery_periods  # 此处变量仍叫 recovery_periods，但含义已是天数
+            "recovery_days": dd_info.recovery_periods  # 此处变量仍叫 recovery_periods，但含义为天数
         },
-        "by_year": metrics_by_year
+        "by_year": metrics_by_year_aug
     }
     ensure_dir(out_json)
     with open(out_json, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
-    df_year = metrics_by_year_to_df(metrics_by_year)
+    # 年度 CSV 也包含新增的胜率列
+    df_year = metrics_by_year_to_df(metrics_by_year_aug)
     out_year_csv = out_dir / f"metrics_by_year_{run_name}.csv"
     ensure_dir(out_year_csv)
     df_year.to_csv(out_year_csv, index=False)
@@ -146,7 +280,7 @@ def main():
     excess_series = None
     if df_bench is not None:
         # 与主策略按交集对齐
-        [df_main_ex, df_bench_ex] = align_nav_frames([df_main, df_bench], how="intersection")
+        [df_main_ex, df_bench_ex] = align_nav_frames([df_main, df_bench], how=ALIGN_MODE)
         ex_nav = excess_nav_from_returns(df_main_ex["ret_total"], df_bench_ex["ret_total"])
         bench_name = infer_run_name_from_nav_path(bench_path)
         ex_name = f"Excess vs {bench_name}"
