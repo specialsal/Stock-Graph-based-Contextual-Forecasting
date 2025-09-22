@@ -23,10 +23,8 @@ from model import GCFNet
 from utils import load_calendar, weekly_fridays, load_industry_map
 from train_utils import make_filter_fn, load_stock_info, load_flag_table  # 复用筛选逻辑
 
-
 def ensure_dir(p: Path):
     p.parent.mkdir(parents=True, exist_ok=True)
-
 
 def list_h5_groups(h5: h5py.File) -> pd.DataFrame:
     rows = []
@@ -44,11 +42,9 @@ def list_h5_groups(h5: h5py.File) -> pd.DataFrame:
     df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
     return df
 
-
 def date_to_group(h5: h5py.File) -> Dict[pd.Timestamp, str]:
     df = list_h5_groups(h5)
     return {row["date"]: row["group"] for _, row in df.iterrows()}
-
 
 def infer_factor_dim(h5: h5py.File) -> int:
     if "factor_cols" in h5.attrs:
@@ -59,7 +55,6 @@ def infer_factor_dim(h5: h5py.File) -> int:
             arr = np.squeeze(arr)
             return int(arr.shape[-1])
     raise RuntimeError("无法推断因子维度")
-
 
 class ScalerPayload:
     """
@@ -93,7 +88,6 @@ class ScalerPayload:
         if self.mean is None or self.std is None:
             return X.astype(np.float32)
         return ((X - self.mean) / (self.std + 1e-6)).astype(np.float32)
-
 
 def main():
     cfg = BT_ROLL_CFG
@@ -198,6 +192,24 @@ def main():
         ok = h5_idx[h5_idx <= target_date]
         return ok[-1] if len(ok) > 0 else None
 
+    # 快速过滤中使用的“接近涨停/跌停”近似判定
+    def is_limit_like_at(date: pd.Timestamp, code: str) -> bool:
+        try:
+            row = price_df.loc[(code, date)]
+        except Exception:
+            return False
+        for c in ["open","high","low","close"]:
+            if c not in price_df.columns:
+                return False
+        # 与 train_utils 的逻辑保持一致
+        o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
+        day_ret = (c / o - 1.0) if o > 0 else 0.0
+        up_th = 0.098
+        near_eps = 0.001
+        lim_up = (day_ret >= up_th and c >= h * (1 - near_eps)) or (abs(o - h) <= near_eps * max(1.0, h) and abs(c - h) <= near_eps * max(1.0, h))
+        lim_dn = (day_ret <= -up_th and c <= l * (1 + near_eps)) or (abs(o - l) <= near_eps * max(1.0, l) and abs(c - l) <= near_eps * max(1.0, l))
+        return bool(lim_up or lim_dn)
+
     # 遍历窗口，仅推理并保存打分
     for pred_dt, model_path in tqdm(window_pred_dates, desc="滚动预测 - 窗口", unit="win"):
         # 构造该窗口的预测周五序列：pred_dt 开始的 step_weeks 个周五
@@ -256,7 +268,7 @@ def main():
                 pool = stocks_all.tolist()
 
                 if filter_fn is not None and len(pool) > 0:
-                    # 1) 板块开关
+                    # 1) 板块开关（保持原逻辑）
                     if (not CFG.include_star_market) or (not CFG.include_chinext) or (not CFG.include_bse) or (not CFG.include_neeq):
                         codes = np.asarray(pool, dtype=str)
                         keep_mask = np.ones(codes.shape[0], dtype=bool)
@@ -315,7 +327,20 @@ def main():
                         except Exception:
                             pass
 
-                    # 4) IPO/缺信息等逐只兜底
+                    # 4) 新增：接近涨停/接近跌停 禁买（按参考日 start_dt）
+                    pool2 = []
+                    for s in pool:
+                        try:
+                            if not is_limit_like_at(start_dt, s):
+                                pool2.append(s)
+                        except Exception:
+                            # 异常时保守纳入（不误杀）
+                            pool2.append(s)
+                    pool = pool2
+                    if not pool:
+                        continue
+
+                    # 5) IPO/缺信息等逐只兜底（沿用原有闭包，保证一致）
                     if (not CFG.allow_missing_info) or (CFG.ipo_cut_days and CFG.ipo_cut_days > 0):
                         pool_fast = []
                         for s in pool:
@@ -380,7 +405,6 @@ def main():
     ensure_dir(out_pred_filtered)
     pred_df_filtered.to_parquet(out_pred_filtered)
     print(f"[BTRoll-Min] 已保存池内预测：{out_pred_filtered}")
-
 
 if __name__ == "__main__":
     main()

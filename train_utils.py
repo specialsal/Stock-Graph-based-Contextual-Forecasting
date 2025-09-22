@@ -207,6 +207,24 @@ def get_flag_at(df_flag: pd.DataFrame, date: pd.Timestamp, code: str) -> int:
             except Exception: pass
     return 0
 
+def _is_limit_like_row(row: pd.Series, up_th: float = 0.098, near_eps: float = 0.001) -> Tuple[bool, bool]:
+    """
+    近似判定：接近涨停/接近跌停
+    - up_th: 涨停阈值（约 9.8%）
+    - near_eps: 贴近高/低的相对阈值（0.1%）
+    需要列: open/high/low/close（缺失则返回 False, False）
+    """
+    req = ["open","high","low","close"]
+    if any(c not in row or pd.isna(row[c]) for c in req):
+        return False, False
+    o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
+    # 涨跌幅（以昨收无法直接获得时，近似用 (close/open - 1) 作为替代信号，保守但不严谨）
+    # 若有 pre_close 可替代更好；这里采用 open->close 的日内涨跌幅近似：
+    day_ret = (c / o - 1.0) if o > 0 else 0.0
+    limit_up_like = (day_ret >= up_th and c >= h * (1 - near_eps)) or (abs(o - h) <= near_eps * max(1.0, h) and abs(c - h) <= near_eps * max(1.0, h))
+    limit_dn_like = (day_ret <= -up_th and c <= l * (1 + near_eps)) or (abs(o - l) <= near_eps * max(1.0, l) and abs(c - l) <= near_eps * max(1.0, l))
+    return bool(limit_up_like), bool(limit_dn_like)
+
 def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd.DataFrame, st_df: pd.DataFrame):
     """
     返回闭包 filter_fn(date, code) -> bool
@@ -215,14 +233,23 @@ def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd
       - IPO/退市日要求
       - 停牌/ST 剔除
       - 成交额阈值
+      - 新增：接近涨停/接近跌停 禁买
     """
     if not getattr(CFG, "enable_filters", False):
         return None
     if not isinstance(daily_df.index, pd.MultiIndex):
         daily_df = daily_df.set_index(["order_book_id","date"]).sort_index()
 
+    # 预先准备：快速 xs 按日期切片
+    def get_row_by_code_date(code: str, date: pd.Timestamp):
+        try:
+            return daily_df.loc[(code, date)]
+        except Exception:
+            return None
+
     def filter_fn(date: pd.Timestamp, code: str) -> bool:
         # 1) 板块开关
+        from train_utils import classify_board
         bd = classify_board(code)
         if bd == "STAR"    and not getattr(CFG, "include_star_market", True): return False
         if bd == "CHINEXT" and not getattr(CFG, "include_chinext",     True): return False
@@ -257,6 +284,17 @@ def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd
             if key not in daily_df.index: return False
             to = daily_df.loc[key, "total_turnover"] if "total_turnover" in daily_df.columns else np.nan
             if pd.isna(to) or float(to) < float(thr): return False
+
+        # 6) 新增：接近涨停/接近跌停 禁买（按当日口径）
+        # 若存在 open/high/low/close，则判定；否则跳过该规则（不报错）
+        row = get_row_by_code_date(code, date)
+        if row is not None:
+            try:
+                lim_up, lim_dn = _is_limit_like_row(row)
+                if lim_up or lim_dn:
+                    return False
+            except Exception:
+                pass
 
         return True
     return filter_fn
