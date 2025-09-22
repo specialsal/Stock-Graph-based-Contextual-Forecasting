@@ -55,7 +55,7 @@ class BTRollingConfig:
     max_n_stocks   = 300    # 每边最多持仓数量（多/空各自限制）300
 
     # 交易相关假设
-    slippage_bps   = 8  # 单边滑点，基点
+    slippage_bps   = 5  # 单边滑点，基点
     fee_bps        = 3  # 单边手续费，基点
 
     # 样本过滤（与训练一致）

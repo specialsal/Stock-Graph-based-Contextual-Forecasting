@@ -2,6 +2,9 @@
 """
 标签生成模块（增量版） - 计算下周收益率
 - 对缺失周五增量生成；并从“最后一个已存在周五”起重算该周五覆盖修订
+
+本版本修改：标签口径由“周五收盘->下周五收盘（C2C）”
+调整为“周五下一交易日开盘->下周五收盘（O2C）”。
 """
 import pandas as pd
 import numpy as np
@@ -22,7 +25,10 @@ def generate_weekly_labels_incremental(
     save_path: Path
 ) -> pd.DataFrame:
     """
-    增量生成下周收益率标签：
+    增量生成下周收益率标签（O2C 口径）：
+    起点：信号周五后的“下一交易日”的开盘价
+    终点：下一个周五（或不晚于它的最后一个交易日）的收盘价
+
     - 仅处理 sample_dates 中尚未存在于 save_path 的周五；
     - 额外包含“最后一个已存在周五”以覆盖修订；
     返回：新增/覆盖的标签 DataFrame（若无新增，返回空）
@@ -59,7 +65,7 @@ def generate_weekly_labels_incremental(
 
     print(f"[Label增量] 待新增/覆盖周五数量={len(missing)} (范围: {missing.min().date()} ~ {missing.max().date()})")
 
-    # pivot close
+    # daily_df 预处理
     if not isinstance(daily_df.index, pd.MultiIndex) or daily_df.index.nlevels != 2:
         raise ValueError("daily_df 必须是 MultiIndex(order_book_id, date)")
 
@@ -70,7 +76,11 @@ def generate_weekly_labels_incremental(
         except Exception:
             pass
 
+    # 构造开盘/收盘 pivot
+    if 'close' not in daily_df.columns or 'open' not in daily_df.columns:
+        raise ValueError("daily_df 需包含 'open' 与 'close' 列")
     close_pivot = daily_df['close'].unstack(level='order_book_id')
+    open_pivot  = daily_df['open'].unstack(level='order_book_id')
     available_dates = close_pivot.index
 
     # 确定片段边界：从“最早需要计算的周五”的对齐日起，至“最大周五的下一周五”的对齐日
@@ -90,29 +100,43 @@ def generate_weekly_labels_incremental(
         print("[Label增量] 价格数据覆盖不足，无法计算增量标签。")
         return pd.DataFrame()
 
-    # 截取必要片段
-    close_pivot_slice = close_pivot.loc[(close_pivot.index >= start_date) & (close_pivot.index <= end_date)]
+    # 截取必要片段（同一日期范围）
+    mask_slice = (close_pivot.index >= start_date) & (close_pivot.index <= end_date)
+    close_pivot_slice = close_pivot.loc[mask_slice]
+    open_pivot_slice  = open_pivot.loc[mask_slice]
     available_dates_slice = close_pivot_slice.index
 
     weekly_returns = []
     # 我们只遍历 missing（含“最后一个已存在周五”）
-    for d in tqdm(missing, desc="增量计算周收益率"):
+    for d in tqdm(missing, desc="增量计算周收益率（O2C）"):
+        # 找到下一周五
         d_next_idx = sample_dates.get_indexer([d])[0] + 1
         next_d = sample_dates[d_next_idx]
 
+        # 对齐到不晚于各自周五的最后一个交易日
         cur_aligned = _align_to_last_available(available_dates_slice, d)
         nxt_aligned = _align_to_last_available(available_dates_slice, next_d)
-        if cur_aligned is None or nxt_aligned is None or cur_aligned >= nxt_aligned:
+        if cur_aligned is None or nxt_aligned is None:
+            continue
+
+        # 起点改为：cur_aligned 的“下一交易日”
+        pos = available_dates_slice.get_indexer([cur_aligned])[0]
+        if pos < 0 or pos + 1 >= len(available_dates_slice):
+            continue
+        cur_aligned_next = available_dates_slice[pos + 1]
+
+        # 若下一交易日已超过终点，则跳过
+        if cur_aligned_next > nxt_aligned:
             continue
 
         try:
-            start_price = close_pivot_slice.loc[cur_aligned]
-            end_price   = close_pivot_slice.loc[nxt_aligned]
+            start_open = open_pivot_slice.loc[cur_aligned_next]
+            end_close  = close_pivot_slice.loc[nxt_aligned]
         except KeyError:
             continue
 
-        returns = (end_price / start_price - 1).replace([np.inf, -np.inf], np.nan)
-        valid = (~returns.isna()) & (~start_price.isna())
+        returns = (end_close / start_open - 1).replace([np.inf, -np.inf], np.nan)
+        valid = (~returns.isna()) & (~start_open.isna()) & (~end_close.isna())
         if valid.any():
             sub = pd.DataFrame({
                 'date': d,

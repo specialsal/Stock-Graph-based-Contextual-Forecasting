@@ -32,10 +32,12 @@ from utils_backtest import (
     align_nav_frames, excess_nav_from_returns, plot_nav_compare,
     recover_window_spans_from_models
 )
+from backtest_rolling_config import BT_ROLL_CFG
 
 # ========= 用户配置（请修改这里） =========
-# 主策略 nav.csv 路径（必填）
-MAIN_NAV_PATH = r"./backtest_rolling/tr1gat1win50/nav_tr1gat1win50.csv"
+# 主策略 nav.csv 路径
+cfg = BT_ROLL_CFG
+MAIN_NAV_PATH = f"./backtest_rolling/{cfg.run_name}/nav_{cfg.run_name}.csv"
 
 # 对比 nav.csv 路径列表（可为空；仅用于绘图对比，不参与“超额”的运算）
 COMPARISON_NAV_PATHS = [

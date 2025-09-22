@@ -6,6 +6,9 @@ btr_backtest.py
 - backtest_rolling/{run_name}/positions_{run_name}.csv
 - backtest_rolling/{run_name}/nav_{run_name}.csv
 图与指标由 btr_metrics.py 统一处理。
+
+本版本修改：收益口径由“周五收盘->下周五收盘（C2C）”
+调整为“周五下一交易日开盘->下周五收盘（O2C）”。
 """
 
 import math
@@ -29,28 +32,58 @@ def ensure_dir(p: Path):
 
 
 def compute_weekly_returns(close_pivot: pd.DataFrame,
-                           fridays: pd.DatetimeIndex):
+                           fridays: pd.DatetimeIndex,
+                           open_pivot: pd.DataFrame):
     """
+    计算周度个股收益（O2C 口径）：
+      起点：信号周五之后的“下一交易日”的开盘价
+      终点：下一个周五（或不晚于下个周五的最后一个交易日）的收盘价
+
+    参数：
+      - close_pivot: 行为交易日、列为股票的收盘价透视表
+      - fridays: 周五日期索引（锚点）
+      - open_pivot: 行为交易日、列为股票的开盘价透视表
+
     返回：
-      - weekly_ret: dict[周五 -> pd.Series(index=stock, value=ret)]
-      - start_date_map: dict[周五 -> 实际起始交易日]
+      - weekly_ret: dict[周五锚点 -> pd.Series(index=stock, value=ret)]
+      - start_date_map: dict[周五锚点 -> 实际起始交易日（下一交易日）]
     """
-    avail = close_pivot.index
+    avail = close_pivot.index  # 所有可用交易日
     out = {}
     start_date_map = {}
     for i in range(len(fridays) - 1):
-        f0 = fridays[i]; f1 = fridays[i+1]
-        i0 = avail[avail <= f0]; i1 = avail[avail <= f1]
+        f0 = fridays[i]
+        f1 = fridays[i + 1]
+
+        # 找到不晚于 f0 和 f1 的最后一个交易日（用于终点对齐）
+        i0 = avail[avail <= f0]
+        i1 = avail[avail <= f1]
         if len(i0) == 0 or len(i1) == 0:
             continue
-        d0 = i0[-1]; d1 = i1[-1]
-        if d0 >= d1:
+        d0 = i0[-1]  # 不晚于 f0 的最后一个交易日
+        d1 = i1[-1]  # 不晚于 f1 的最后一个交易日（终点）
+
+        # 找到 d0 的下一交易日作为“开盘口径日”
+        pos = avail.get_indexer([d0])[0]
+        if pos < 0 or pos + 1 >= len(avail):
             continue
-        start = close_pivot.loc[d0]
-        end   = close_pivot.loc[d1]
-        ret = (end / start - 1).replace([np.inf, -np.inf], np.nan)
+        start_day = avail[pos + 1]
+
+        # 若因长假导致下一交易日已经超过终点，则跳过该周
+        if start_day > d1:
+            continue
+
+        # 取开盘与收盘；若缺数据则跳过该周
+        try:
+            start_open = open_pivot.loc[start_day]
+            end_close = close_pivot.loc[d1]
+        except KeyError:
+            continue
+
+        ret = (end_close / start_open - 1).replace([np.inf, -np.inf], np.nan)
         out[f0] = ret
-        start_date_map[f0] = d0
+        start_date_map[f0] = start_day
+
     return out, start_date_map
 
 
@@ -72,7 +105,7 @@ def build_portfolio_with_weights(scores: pd.DataFrame,
       - pos_df: 每周持仓与权重明细（date, stock, weight, score, next_week_ret）
     说明：
       - 本函数实现 long-only（ret_short 固定为 0），保留 ret_short 字段以便扩展。
-      - next_week_ret = 从当周（周五）到下一周（周五）的 close-to-close 收益
+      - next_week_ret = 从当周（周五）到下一周（周五）的 O2C 收益（已由 weekly_ret 提供）
     """
     if scores.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -92,7 +125,7 @@ def build_portfolio_with_weights(scores: pd.DataFrame,
             recs.append({"date": d, "ret_long": 0.0, "ret_short": 0.0, "ret_total": 0.0, "n_long": 0})
             continue
 
-        df_d = df_d.sort_values(["score","stock"], ascending=[False, True])
+        df_d = df_d.sort_values(["score", "stock"], ascending=[False, True])
         n = len(df_d)
         n_target = max(0, min(int(math.floor(n * top_pct)), max_n))
         if n_target == 0 and n >= min_n:
@@ -126,7 +159,7 @@ def build_portfolio_with_weights(scores: pd.DataFrame,
                 "stock": r["stock"],
                 "weight": float(r["weight"]),
                 "score": float(r["score"]),
-                "next_week_ret": float(r["ret"])  # 新增：记录下一周收益
+                "next_week_ret": float(r["ret"])  # O2C 的下一周收益
             })
 
     # 2) 追加仅持仓不计收益的最后一周（若存在）
@@ -138,7 +171,7 @@ def build_portfolio_with_weights(scores: pd.DataFrame,
                 df_last = scores[scores["date"] == last_d].copy()
                 df_last = df_last.dropna(subset=["score"])
                 if len(df_last) >= min_n:
-                    df_last = df_last.sort_values(["score","stock"], ascending=[False, True])
+                    df_last = df_last.sort_values(["score", "stock"], ascending=[False, True])
                     n = len(df_last)
                     n_target = max(0, min(int(math.floor(n * top_pct)), max_n))
                     if n_target == 0 and n >= min_n:
@@ -166,7 +199,7 @@ def build_portfolio_with_weights(scores: pd.DataFrame,
 
     # 输出
     if not recs:
-        return pd.DataFrame(columns=["ret_long","ret_short","ret_total","nav","n_long"]), pd.DataFrame(pos_rows)
+        return pd.DataFrame(columns=["ret_long", "ret_short", "ret_total", "nav", "n_long"]), pd.DataFrame(pos_rows)
 
     df_ret = pd.DataFrame(recs).set_index("date").sort_index()
     df_ret["nav"] = (1.0 + df_ret["ret_total"]).cumprod()
@@ -197,15 +230,16 @@ def main():
     if scores.empty:
         raise RuntimeError("回测区间内打分为空")
 
-    # 周度收益
+    # 周度收益（构造 O2C 所需的开/收盘透视表）
     price_df = pd.read_parquet(cfg.price_day_file)
     if not isinstance(price_df.index, pd.MultiIndex):
         price_df = price_df.set_index(["order_book_id", "date"]).sort_index()
     close_pivot = price_df["close"].unstack(0).sort_index()
+    open_pivot = price_df["open"].unstack(0).sort_index()
 
     cal = load_calendar(cfg.trading_day_file)
     fridays_all = weekly_fridays(cal)
-    weekly_ret_all, _ = compute_weekly_returns(close_pivot, fridays_all)
+    weekly_ret_all, _ = compute_weekly_returns(close_pivot, fridays_all, open_pivot=open_pivot)
     weekly_ret = {d: s for d, s in weekly_ret_all.items()
                   if (d >= pd.Timestamp(cfg.bt_start_date)) and (d <= pd.Timestamp(cfg.bt_end_date))}
 

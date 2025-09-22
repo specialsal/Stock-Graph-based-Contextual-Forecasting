@@ -7,3 +7,5 @@ backtest_rolling
 select_stock.ipynb
 diagnose
 diag_chase.py
+stock_test
+single_stock_test.py
