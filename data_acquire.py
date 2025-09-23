@@ -1,11 +1,12 @@
 # -*- coding: utf-8 -*-
 import os
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 import numpy as np
 import pandas as pd
 import rqdatac as rq
+import akshare as ak
 
 # =========================
 # 基础配置
@@ -30,6 +31,7 @@ UPDATE_SWITCH = {
     'index_components': True,      # 指数成分（快照覆盖）
     'industry_and_style': True,    # 行业与风格（快照覆盖 + 映射）
     'index_price_day': True,       # 指数日行情（parquet, MultiIndex）
+    'sector_price_day': True,      # 新增：风格日行情（增量聚合）
 }
 
 # 可选：在获取行情时过滤无效代码，减少 invalid order_book_id 警告
@@ -468,6 +470,152 @@ def update_index_price_day(start='2010-01-01', end=TODAY_STR):
 
 
 # =========================
+# 9) 新增：风格日行情（增量聚合到 sector_price_day.parquet）
+# =========================
+def update_sector_price_day(start='2010-01-01', end=TODAY_STR):
+    if not UPDATE_SWITCH.get('sector_price_day', True):
+        return
+
+    # 依赖输入
+    stock_price_path = os.path.join(DATA_PATH, 'stock_price_day.parquet')
+    style_map_path   = os.path.join(DATA_PATH, 'stock_style_map.csv')
+
+    price_df = read_parquet_safe(stock_price_path)
+    if price_df is None or price_df.empty:
+        warnings.warn('缺少或空的 stock_price_day.parquet，跳过 sector_price_day 生成')
+        return
+
+    # MultiIndex(order_book_id, datetime)
+    if not isinstance(price_df.index, pd.MultiIndex):
+        idx_cols = [c for c in price_df.columns if c in ['order_book_id', 'datetime']]
+        if set(idx_cols) == {'order_book_id', 'datetime'}:
+            price_df['datetime'] = pd.to_datetime(price_df['datetime'])
+            price_df = price_df.set_index(['order_book_id', 'datetime']).sort_index()
+        else:
+            warnings.warn('stock_price_day.parquet 非 MultiIndex 结构，跳过 sector 生成')
+            return
+
+    style_map = read_csv_safe(style_map_path, encoding='gbk')
+    if style_map is None or style_map.empty or ('order_book_id' not in style_map.columns) or ('sector' not in style_map.columns):
+        warnings.warn('缺少 stock_style_map.csv 或列不正确，跳过 sector 生成')
+        return
+    style_map['order_book_id'] = style_map['order_book_id'].astype(str).str.strip()
+    style_map['sector'] = style_map['sector'].astype(str).str.strip()
+
+    # 目标风格枚举（固定五类）
+    TARGET_SECTORS = ['周期风格', '成长风格', '消费风格', '稳定风格', '金融风格']
+
+    # 取出我们需要的行情列
+    cols_needed = []
+    for c in ['open', 'close', 'high', 'low', 'volume', 'total_turnover', 'num_trades']:
+        if c in price_df.columns:
+            cols_needed.append(c)
+    if not cols_needed or ('close' not in cols_needed) or ('total_turnover' not in cols_needed):
+        warnings.warn('price_day 缺少必要列（至少需要 close 与 total_turnover），跳过 sector 生成')
+        return
+    price_small = price_df[cols_needed].copy()
+
+    # 把 MultiIndex 拆成列，便于合并风格映射
+    price_small = price_small.reset_index()
+    price_small['order_book_id'] = price_small['order_book_id'].astype(str).str.strip()
+    price_small['date'] = pd.to_datetime(price_small['date'])
+
+    # 合并 sector
+    price_small = price_small.merge(style_map[['order_book_id', 'sector']], on='order_book_id', how='left')
+    price_small['sector'] = price_small['sector'].fillna('')  # 无风格的剔除
+    price_small = price_small[price_small['sector'].isin(TARGET_SECTORS)]
+
+    if price_small.empty:
+        warnings.warn('按风格过滤后为空，跳过 sector 生成')
+        return
+
+    # 读取已有 sector 文件
+    out_path = os.path.join(DATA_PATH, 'sector_price_day.parquet')
+    sector_old = read_parquet_safe(out_path)
+    last_day = None
+    if sector_old is not None and not sector_old.empty:
+        try:
+            last_day = pd.to_datetime(sector_old['date']).max().strftime('%Y-%m-%d') if 'date' in sector_old.columns else pd.to_datetime(sector_old.index).max().strftime('%Y-%m-%d')
+        except Exception:
+            last_day = None
+
+    # 增量区间（包含 last_day 当天以便覆盖）
+    fetch_start = start if last_day is None else last_day
+    price_small = price_small[(price_small['date'] >= pd.to_datetime(fetch_start)) & (price_small['date'] <= pd.to_datetime(end))]
+    if price_small.empty:
+        return
+
+    # 当日每风格聚合：成交额权重聚合 close；成交额/成交量/笔数直接求和；成分数量记有效样本数
+    def _agg_one_day(df_day: pd.DataFrame) -> pd.DataFrame:
+        rows = []
+        for sec in TARGET_SECTORS:
+            sub = df_day[df_day['sector'] == sec]
+            if sub.empty:
+                continue
+            # 有效样本：需要 close 与 total_turnover 有效
+            sub = sub.copy()
+            sub = sub.replace([np.inf, -np.inf], np.nan)
+            sub = sub.dropna(subset=['close', 'total_turnover'])
+            if sub.empty:
+                continue
+
+            tot = float(sub['total_turnover'].sum())
+            if tot <= 0:
+                # 无成交额：close 用简单平均兜底
+                close_val = float(sub['close'].mean())
+            else:
+                w = sub['total_turnover'].values.astype(float) / tot
+                close_val = float(np.sum(sub['close'].values.astype(float) * w))
+
+            volume_sum = float(sub['volume'].sum()) if 'volume' in sub.columns else np.nan
+            turnover_sum = float(sub['total_turnover'].sum())
+            trades_sum = float(sub['num_trades'].sum()) if 'num_trades' in sub.columns else np.nan
+            cnt = int(len(sub))
+
+            rows.append({
+                'sector': sec,
+                'date': df_day['date'].iloc[0],
+                'close': close_val,
+                'total_turnover': turnover_sum,
+                'volume': volume_sum,
+                'num_trades': trades_sum,
+                'constituents_count': cnt
+            })
+        if not rows:
+            return pd.DataFrame(columns=['sector','date','close','total_turnover','volume','num_trades','constituents_count'])
+        return pd.DataFrame(rows)
+
+    # 对每日进行聚合
+    grouped = price_small.groupby('date', sort=True)
+    out_parts = []
+    for dt, df_day in grouped:
+        out_parts.append(_agg_one_day(df_day))
+
+    if not out_parts:
+        return
+    sector_new = pd.concat(out_parts, ignore_index=True)
+    sector_new = sector_new.sort_values(['date','sector'])
+
+    # 合并旧数据并去重（保留新行覆盖）
+    if sector_old is None or sector_old.empty:
+        sector_all = sector_new
+    else:
+        # 统一列顺序
+        base_cols = ['sector','date','close','total_turnover','volume','num_trades','constituents_count']
+        for c in base_cols:
+            if c not in sector_old.columns:
+                sector_old[c] = np.nan
+        sector_old = sector_old[base_cols].copy()
+
+        sector_all = pd.concat([sector_old, sector_new], axis=0, ignore_index=True)
+        sector_all['date'] = pd.to_datetime(sector_all['date'])
+        sector_all = sector_all.drop_duplicates(subset=['sector','date'], keep='last').sort_values(['date','sector'])
+
+    write_parquet(sector_all, out_path)
+    print(f'[DATA] 已更新风格日行情：{out_path}，总行数={len(sector_all)}，新增/覆盖={len(sector_new)}')
+
+
+# =========================
 # 主流程
 # =========================
 def main():
@@ -502,6 +650,29 @@ def main():
     # 8) 指数日行情（MultiIndex）
     print('更新指数日行情...')
     update_index_price_day(start='2010-01-01', end=TODAY_STR)
+
+    # 9) 新增：风格日行情（增量聚合）
+    print('更新风格日行情（sector_price_day）...')
+    update_sector_price_day(start='2010-01-01', end=TODAY_STR)
+
+    # 10) 指数净值序列
+    print('更新指数净值序列...')
+    indexs = pd.read_parquet('data/raw/index_price_day.parquet').reset_index()
+    # 确保 df300 是独立的 DataFrame（避免视图问题）
+    for id in ['000300.XSHG','000852.XSHG','000905.XSHG']:
+        df = indexs[indexs['order_book_id'] == id].copy()
+        df['ret'] = (df['close'] - df['prev_close']) / df['prev_close']
+        df['nav'] = (1 + df['ret']).cumprod()
+
+        selected_columns = df[['date', 'ret', 'nav']].rename(columns={'ret': 'ret_total'})
+        selected_columns.to_csv('backtest_rolling/others/500_index_nav.csv', index=False)
+
+    # 11) 更新黄金ETF
+    print('更新黄金ETF')
+    gold_etf = ak.fund_etf_hist_em(symbol="159934", period="daily", start_date="20100101", end_date=date.today().strftime("%Y%m%d"), adjust="qfq")
+    gold_etf = gold_etf[['日期','开盘','收盘']]
+    gold_etf.columns = ['date','open','close']
+    gold_etf.to_parquet('data/raw/gold_etf_day.parquet')
 
 
 if __name__ == '__main__':

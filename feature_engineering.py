@@ -1,659 +1,338 @@
-# -*- coding: utf-8 -*-
-import os
-import warnings
-from datetime import datetime, timedelta
+# coding: utf-8
+"""
+增量版: 生成/追加 features_daily.h5
 
+提速策略：
+- 只对“缺失的周五采样日”进行追加；
+- 仅计算满足这些采样日所需的“局部历史片段”: [history_start, end_date]；
+- 线程并行对该片段内的每只股票计算全量因子（相对片段），采样时做窗口切片；
+- 一次性 mad_clip，避免重复标准化；不保存全局 Scaler。
+
+改进点（边界修订覆盖）：
+- 从“最后一个已写入周五”起重算该周五并覆盖，避免边界遗漏/修订差异；
+- 覆盖策略：写入前若目标日期已存在，先删除该组再写入（快速、无需重排编号）。
+
+注意：
+- 需要 utils.read_h5_meta / list_missing_fridays / get_required_history_start / ensure_multiindex_price 等工具函数。
+- 最长回溯窗口为 120（与当前因子定义一致）；若后续新增更长窗口，请同步更新 CFG.max_lookback。
+"""
 import numpy as np
 import pandas as pd
-import rqdatac as rq
+import h5py
+from tqdm import tqdm
+from pathlib import Path
+from typing import List, Tuple, Dict, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# =========================
-# 基础配置
-# =========================
-# 如果有账号密码: rq.init('user','pwd')
-rq.init()
+from config import CFG
+from utils import (
+    mad_clip, weekly_fridays, load_calendar,
+    read_h5_meta, list_missing_fridays, get_required_history_start,
+    ensure_multiindex_price, SlidingWindowCache
+)
 
-DATA_PATH = 'data/raw/'
-os.makedirs(DATA_PATH, exist_ok=True)
+# ===== 数值稳定工具 =====
+EPS = 1e-12
+def _safe_div(a, b): return a / (b.replace(0, np.nan) + EPS)
+def _ema(s: pd.Series, span: int) -> pd.Series: return s.ewm(span=span, adjust=False, min_periods=1).mean()
+def _std_rolling(s: pd.Series, win: int) -> pd.Series: return s.rolling(win, min_periods=1).std()
+def _mean_rolling(s: pd.Series, win: int) -> pd.Series: return s.rolling(win, min_periods=1).mean()
+def _max_rolling(s: pd.Series, win: int) -> pd.Series: return s.rolling(win, min_periods=1).max()
+def _min_rolling(s: pd.Series, win: int) -> pd.Series: return s.rolling(win, min_periods=1).min()
+def _returns(close: pd.Series) -> pd.Series: return close.pct_change()
 
-TODAY_STR = datetime.today().strftime('%Y-%m-%d')
-FREQ_DAY = '1d'
-TRADING_DAY_END = '2030-12-31'
+def _true_range(high, low, close):
+    prev_close = close.shift(1)
+    tr = pd.concat([high - low, (high - prev_close).abs(), (low - prev_close).abs()], axis=1).max(axis=1)
+    return tr
 
-# 是否更新的开关（可按需修改）
-UPDATE_SWITCH = {
-    'trading_calendar': False,      # 交易日 & 交易周
-    'stock_info': False,            # 股票信息（聚宽导出覆盖）
-    'stock_price_day': False,       # 股票日行情（parquet, MultiIndex）
-    'suspended': False,             # 停牌（CSV 宽表）
-    'is_st': False,                 # ST（CSV 宽表）
-    'index_components': False,      # 指数成分（快照覆盖）
-    'industry_and_style': False,    # 行业与风格（快照覆盖 + 映射）
-    'index_price_day': False,       # 指数日行情（parquet, MultiIndex）
-    'sector_price_day': True,      # 新增：风格日行情（增量聚合）
-}
+def _rsi(close: pd.Series, n: int = 14) -> pd.Series:
+    ret = close.diff()
+    up = ret.clip(lower=0.0); dn = (-ret).clip(lower=0.0)
+    ema_up = _ema(up, n); ema_dn = _ema(dn, n)
+    rs = ema_up / (ema_dn + EPS)
+    return 100 - 100 / (1 + rs)
 
-# 可选：在获取行情时过滤无效代码，减少 invalid order_book_id 警告
-FILTER_INVALID_CODES = True
+def _macd(close: pd.Series, fast=12, slow=26, signal=9):
+    ema_fast = _ema(close, fast); ema_slow = _ema(close, slow)
+    dif = ema_fast - ema_slow; dea = _ema(dif, signal); hist = dif - dea
+    return dif, dea, hist
 
+def _boll(close: pd.Series, n=20, k=2.0):
+    ma = _mean_rolling(close, n); sd = _std_rolling(close, n)
+    upper = ma + k * sd; lower = ma - k * sd
+    width = (upper - lower) / (ma + EPS)
+    pctb = (close - lower) / (upper - lower + EPS)
+    return ma, upper, lower, width, pctb
 
-# =========================
-# 通用工具
-# =========================
-def to_date_str(d):
-    if isinstance(d, (pd.Timestamp, datetime, np.datetime64)):
-        return pd.to_datetime(d).strftime('%Y-%m-%d')
-    if isinstance(d, str):
-        return d[:10]
-    return str(d)
+def _kurtosis(series: pd.Series, win: int) -> pd.Series: return series.rolling(win, min_periods=1).kurt()
+def _skew(series: pd.Series, win: int) -> pd.Series: return series.rolling(win, min_periods=1).skew()
+def _corr(a: pd.Series, b: pd.Series, win: int) -> pd.Series: return a.rolling(win, min_periods=2).corr(b)
+def _zscore(s: pd.Series, win: int) -> pd.Series:
+    m = _mean_rolling(s, win); sd = _std_rolling(s, win)
+    return (s - m) / (sd + EPS)
 
-def next_day_str(date_str):
-    return (pd.to_datetime(date_str) + timedelta(days=1)).strftime('%Y-%m-%d')
+# ===== 因子计算（与原版一致） =====
+def calc_factors_one_stock_full(df: pd.DataFrame) -> pd.DataFrame:
+    out = pd.DataFrame(index=df.index)
+    O, H, L, C = df['open'], df['high'], df['low'], df['close']
+    V, NT, TT = df['volume'], df['num_trades'], df['total_turnover']
 
-def read_csv_safe(path, **kwargs):
-    if not os.path.exists(path):
-        return None
-    return pd.read_csv(path, **kwargs)
+    ret = _returns(C)
+    out['ret'] = ret
+    out['ret_abs'] = ret.abs()
 
-def read_parquet_safe(path):
-    if not os.path.exists(path):
-        return None
-    return pd.read_parquet(path)
+    ema5_c = _ema(C, 5)
+    ma20_v = _mean_rolling(V.replace(0, np.nan), 20)
+    out['pvo'] = (C - ema5_c) / (ma20_v + EPS)
 
-def write_csv(df, path, **kwargs):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    df.to_csv(path, **kwargs)
+    max20_c = _max_rolling(C, 20); min20_c = _min_rolling(C, 20)
+    out['sse'] = (max20_c - min20_c) / (ma20_v + EPS)
 
-def write_parquet(df, path):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    df.to_parquet(path)
+    std20_v = _std_rolling(V, 20)
+    out['liq'] = (V - V.shift(1)).abs() / (std20_v + EPS)
 
-def max_date_from_index_as_str(df):
-    # 适用于 index 为日期（DatetimeIndex 或可转日期的字符串）
-    if df is None or df.empty:
-        return None
+    out['skew'] = _skew(ret, 20)
+    out['gap']  = (O - C.shift(1)) / (C.shift(1) + EPS)
+
+    std10_ret = _std_rolling(ret, 10); std30_ret = _std_rolling(ret, 30)
+    out['vts'] = std10_ret / (std30_ret + EPS)
+
+    out['vcll'] = _safe_div(V, ma20_v)
+
+    std20_ret = _std_rolling(ret, 20)
+    out['rvr'] = ret / (std20_ret + EPS)
+
+    ma60_c = _mean_rolling(C, 60)
+    out['csl'] = (C - ma60_c) / (ma60_c + EPS)
+
+    out['rev'] = _corr(ret, ret.shift(1), 20)
+
+    std5_ret = _std_rolling(ret, 5)
+    out['vcbl'] = std5_ret / (std20_ret + EPS)
+
+    out['kurtosis'] = _kurtosis(ret, 20)
+
+    liq = out['liq']
+    out['lip'] = 0.5 * liq + 0.3 * liq.shift(1) + 0.2 * liq.shift(2)
+
+    out['vol_per_trade'] = V / (NT.replace(0, np.nan) + EPS)
+
+    for n in [5, 10, 20, 30, 60]:
+        out[f'ma{n}'] = _mean_rolling(C, n)
+        out[f'ema{n}'] = _ema(C, n)
+        out[f'price_ma{n}_ratio'] = C / (out[f'ma{n}'] + EPS)
+        out[f'ma{n}_slope'] = out[f'ma{n}'].pct_change()
+
+    out['ma5_10_cross']  = (out['ma5']  - out['ma10']) / (out['ma10'] + EPS)
+    out['ma10_20_cross'] = (out['ma10'] - out['ma20']) / (out['ma20'] + EPS)
+    out['ma20_60_cross'] = (out['ma20'] - out['ma60']) / (out['ma60'] + EPS)
+
+    out['rsi14'] = _rsi(C, 14)
+    out['rsi5']  = _rsi(C, 5)
+
+    dif, dea, hist = _macd(C, 12, 26, 9)
+    out['macd_dif']  = dif
+    out['macd_dea']  = dea
+    out['macd_hist'] = hist
+
+    boll_ma, boll_up, boll_dn, boll_w, boll_pctb = _boll(C, 20, 2.0)
+    out['boll_ma20']  = boll_ma
+    out['boll_width'] = boll_w
+    out['boll_pctb']  = boll_pctb
+
+    tr = _true_range(H, L, C)
+    out['atr14'] = _mean_rolling(tr, 14)
+    out['hl_range'] = (H - L) / (C.shift(1).abs() + EPS)
+
+    body = (C - O).abs()
+    upper_shadow = (H - C.where(C >= O, O)).clip(lower=0)
+    lower_shadow = (O.where(C >= O, C) - L).clip(lower=0)
+    out['candle_body']  = body
+    out['candle_upper'] = upper_shadow
+    out['candle_lower'] = lower_shadow
+    out['body_ratio']   = body / (H - L + EPS)
+    out['upper_ratio']  = upper_shadow / (H - L + EPS)
+    out['lower_ratio']  = lower_shadow / (H - L + EPS)
+
+    out['turnover'] = TT
+    out['turnover_ma20_ratio'] = TT / (_mean_rolling(TT, 20) + EPS)
+    out['turnover_std20_ratio'] = _std_rolling(TT, 20) / (TT.abs() + EPS)
+    out['price_turnover_corr20'] = _corr(C.pct_change(), TT.pct_change(), 20)
+    out['volume_price_corr20']   = _corr(V.pct_change(), C.pct_change(), 20)
+
+    out['vol_std20_over_mean20'] = _std_rolling(V, 20) / (_mean_rolling(V, 20) + EPS)
+    out['vol_cv_20'] = out['vol_std20_over_mean20']
+
+    for n in [5, 10, 20, 30, 60]:
+        r = C.pct_change(n)
+        out[f'mom{n}']   = r
+        out[f'mom{n}_z'] = _zscore(r, 60)
+
+    for n in [5, 10, 20, 30, 60]:
+        out[f'ret_std{n}']  = _std_rolling(ret, n)
+        out[f'ret_mean{n}'] = _mean_rolling(ret, n)
+
+    for n in [5, 10, 20, 30, 60]:
+        out[f'turnover_mean_ratio_{n}'] = _mean_rolling(TT, n) / (TT + EPS)
+        out[f'turnover_std_ratio_{n}']  = _std_rolling(TT, n) / (TT.abs() + EPS)
+
+    for n in [20, 60, 120]:
+        roll_max = _max_rolling(C, n); roll_min = _min_rolling(C, n)
+        out[f'price_pos_{n}'] = (C - roll_min) / (roll_max - roll_min + EPS)
+
+    out['vol_ret_corr20_lag1']  = _corr(V.pct_change(), ret.shift(1), 20)
+
+    out = out.replace([np.inf, -np.inf], np.nan)
+    return out
+
+# ===== 并行包装 =====
+def _compute_one(stock: str, df_all: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
     try:
-        return pd.to_datetime(df.index).max().strftime('%Y-%m-%d')
+        hist = df_all.loc[stock]
+        if isinstance(hist, pd.Series):
+            hist = hist.to_frame().T
+        hist = hist.sort_index()
+        fct = calc_factors_one_stock_full(hist)
+        return stock, fct
     except Exception:
-        return None
-
-def max_datetime_from_multiindex(df):
-    # 适用于 MultiIndex(levels: order_book_id, datetime)
-    if df is None or df.empty or not isinstance(df.index, pd.MultiIndex):
-        return None
-    if 'datetime' in df.index.names:
-        dt = df.index.get_level_values('datetime')
-    else:
-        # 兼容第二层
-        dt = df.index.get_level_values(1)
-    return pd.to_datetime(dt).max()
-
-def align_columns_union(df_old, df_new):
-    # 行情类列名可能不一致，做并集对齐
-    cols = sorted(set(df_old.columns) | set(df_new.columns))
-    df_old_aligned = df_old.reindex(columns=cols)
-    df_new_aligned = df_new.reindex(columns=cols)
-    return df_old_aligned, df_new_aligned
-
-def concat_dedup_multiindex(df_old, df_new, sort_index=True):
-    # 专用于 MultiIndex(order_book_id, datetime) 的增量合并
-    if df_old is None or df_old.empty:
-        df = df_new.copy()
-    elif df_new is None or df_new.empty:
-        df = df_old.copy()
-    else:
-        # 对齐列
-        df_old2, df_new2 = align_columns_union(df_old, df_new)
-        df = pd.concat([df_old2, df_new2], axis=0)
-        # 按索引去重，保留最后
-        df = df[~df.index.duplicated(keep='last')]
-    if sort_index and df is not None and not df.empty:
-        df = df.sort_index()
-    return df
-
-def concat_dedup_wide_by_index(df_old, df_new, sort_index=True):
-    # 停牌 / ST 宽表：index=日期，columns=股票代码
-    if df_old is None or df_old.empty:
-        df = df_new.copy()
-    elif df_new is None or df_new.empty:
-        df = df_old.copy()
-    else:
-        cols = sorted(set(df_old.columns) | set(df_new.columns))
-        idx = sorted(set(pd.to_datetime(df_old.index)) | set(pd.to_datetime(df_new.index)))
-        df_old2 = df_old.copy()
-        df_old2.index = pd.to_datetime(df_old2.index)
-        df_new2 = df_new.copy()
-        df_new2.index = pd.to_datetime(df_new2.index)
-        df_old2 = df_old2.reindex(index=idx, columns=cols)
-        df_new2 = df_new2.reindex(index=idx, columns=cols)
-        # 新数据优先覆盖旧数据
-        df = df_old2.combine_first(df_new2)
-        df = df_new2.combine_first(df)
-    if sort_index and df is not None and not df.empty:
-        df = df.sort_index()
-    return df
-
-def get_price_safe(codes, start_date, end_date, frequency='1d', fields=None,
-                   adjust_type='pre', skip_suspended=False, market='cn',
-                   expect_df=True, time_slice=None, filter_codes=True):
-    code_list = list(codes)
-    if filter_codes and FILTER_INVALID_CODES:
-        if len(code_list) == 0:
-            return None
-    try:
-        df = rq.get_price(
-            code_list, start_date=start_date, end_date=end_date,
-            frequency=frequency, fields=fields, adjust_type=adjust_type,
-            skip_suspended=skip_suspended, market=market,
-            expect_df=expect_df, time_slice=time_slice
-        )
-        if df is None:
-            return None
-        if isinstance(df, pd.DataFrame) and df.empty:
-            return None
-        return df
-    except Exception as e:
-        warnings.warn(f'get_price_safe error: {e}')
-        return None
-
-
-# =========================
-# 1) 交易日与交易周（增量）
-# =========================
-def update_trading_calendar(start='2001-01-01', end=TRADING_DAY_END):
-    if not UPDATE_SWITCH.get('trading_calendar', True):
-        return
-    # 交易日
-    path_day = os.path.join(DATA_PATH, 'trading_day.csv')
-    df_old = read_csv_safe(path_day, index_col=0)
-    if df_old is not None:
-        # 兼容旧格式
-        if 'trading_day' not in df_old.columns and df_old.shape[1] == 1:
-            df_old.columns = ['trading_day']
-    last_day = None
-    if df_old is not None and not df_old.empty:
-        last_day = pd.to_datetime(df_old['trading_day']).max().strftime('%Y-%m-%d')
-
-    # 改为包含 last_day 本身
-    fetch_start = start if last_day is None else last_day
-    if pd.to_datetime(fetch_start) <= pd.to_datetime(end):
-        new_days = rq.get_trading_dates(start_date=fetch_start.replace('-', ''), end_date=end.replace('-', ''))
-        new_days = [d.strftime('%Y-%m-%d') for d in new_days]
-        df_new = pd.DataFrame(new_days, columns=['trading_day'])
-    else:
-        df_new = pd.DataFrame(columns=['trading_day'])
-
-    df_day = pd.concat([df_old[['trading_day']] if df_old is not None else pd.DataFrame(columns=['trading_day']),
-                        df_new], ignore_index=True)
-    df_day = df_day.drop_duplicates().sort_values('trading_day').reset_index(drop=True)
-    write_csv(df_day, path_day)
-
-    # 交易周（根据交易日计算）：当日与下一交易日不相邻（相差 > 1 天）视为周末
-    days = pd.to_datetime(df_day['trading_day']).tolist()
-    weeks = [d for i, d in enumerate(days[:-1]) if (days[i+1] - days[i]).days > 1]
-    df_week = pd.DataFrame(pd.Series(weeks).dt.strftime('%Y-%m-%d'), columns=['trading_week'])
-    path_week = os.path.join(DATA_PATH, 'trading_week.csv')
-    write_csv(df_week, path_week)
-
-
-# =========================
-# 2) 全部股票信息（直接由聚宽导出覆盖，不做增量）
-# =========================
-def update_stock_info_from_jq_export():
-    if not UPDATE_SWITCH.get('stock_info', True):
-        return
-    src_path = os.path.join(DATA_PATH, 'stock_list_jq.csv')
-    if not os.path.exists(src_path):
-        warnings.warn('缺少 data/raw/stock_list_jq.csv，跳过 stock_info 更新')
-        return
-    df_src = pd.read_csv(src_path, index_col=0)
-    df_src = df_src.reset_index().rename(columns={
-        'index': 'code',
-        'display_name': 'name',
-        'start_date': 'ipo_date',
-        'end_date': 'delist_date'
-    })
-    df_src = df_src[['code', 'name', 'ipo_date', 'delist_date']]
-    out_path = os.path.join(DATA_PATH, 'stock_info.csv')
-    write_csv(df_src, out_path, encoding='gbk')
-
-
-# =========================
-# 3) 股票日行情（前复权，MultiIndex 增量）
-# =========================
-def update_stock_price_day(start='2010-01-01', end=TODAY_STR):
-    if not UPDATE_SWITCH.get('stock_price_day', True):
-        return
-    stock_info_path = os.path.join(DATA_PATH, 'stock_info.csv')
-    stock_info = read_csv_safe(stock_info_path, index_col=0, encoding='gbk')
-    if stock_info is None or stock_info.empty:
-        warnings.warn('stock_info.csv 不存在或为空，跳过行情更新')
-        return
-    stock_list = stock_info['code'].dropna().unique().tolist()
-
-    out_path = os.path.join(DATA_PATH, 'stock_price_day.parquet')
-    df_old = read_parquet_safe(out_path)
-
-    # 确保旧数据为 MultiIndex（order_book_id, datetime）
-    if df_old is not None and not df_old.empty:
-        if not isinstance(df_old.index, pd.MultiIndex):
-            idx_cols = [c for c in df_old.columns if c in ['order_book_id', 'datetime']]
-            if set(idx_cols) == {'order_book_id', 'datetime'}:
-                df_old['datetime'] = pd.to_datetime(df_old['datetime'])
-                df_old = df_old.set_index(['order_book_id', 'datetime']).sort_index()
-
-    last_dt = max_datetime_from_multiindex(df_old)
-    # 改为包含 last_dt 当天
-    fetch_start = start if last_dt is None else last_dt.strftime('%Y-%m-%d')
-    if pd.to_datetime(fetch_start) > pd.to_datetime(end):
-        return
-
-    df_new = get_price_safe(
-        stock_list,
-        start_date=fetch_start,
-        end_date=end,
-        frequency=FREQ_DAY,
-        fields=None,
-        adjust_type='pre',
-        skip_suspended=False,
-        market='cn',
-        expect_df=True,
-        time_slice=None,
-        filter_codes=True
-    )
-    # 若无增量数据（当天无数据或全部非法），直接退出
-    if df_new is None:
-        return
-
-    # 统一转 MultiIndex
-    if isinstance(df_new.index, pd.MultiIndex):
-        df_new_mi = df_new.copy()
-    else:
-        if {'order_book_id', 'datetime'}.issubset(df_new.columns):
-            df_new['datetime'] = pd.to_datetime(df_new['datetime'])
-            df_new_mi = df_new.set_index(['order_book_id', 'datetime']).sort_index()
-        else:
-            df_new_mi = df_new.reset_index().set_index(['order_book_id', 'datetime']).sort_index()
-
-    # 合并：列对齐并去重
-    df_all = concat_dedup_multiindex(df_old, df_new_mi, sort_index=True)
-    write_parquet(df_all, out_path)
-
-
-# =========================
-# 4) 停牌信息（宽表，增量）
-# =========================
-def update_suspended(start='2010-01-01', end=TODAY_STR):
-    if not UPDATE_SWITCH.get('suspended', True):
-        return
-    stock_info_path = os.path.join(DATA_PATH, 'stock_info.csv')
-    stock_info = read_csv_safe(stock_info_path, index_col=0, encoding='gbk')
-    if stock_info is None or stock_info.empty:
-        warnings.warn('stock_info.csv 不存在或为空，跳过停牌更新')
-        return
-    stock_list = stock_info['code'].dropna().unique().tolist()
-
-    out_path = os.path.join(DATA_PATH, 'is_suspended.csv')
-    df_old = read_csv_safe(out_path, index_col=0)
-    if df_old is not None and not df_old.empty:
-        try:
-            df_old.index = pd.to_datetime(df_old.index)
-        except Exception:
-            pass
-
-    last_day = max_date_from_index_as_str(df_old)
-    # 改为包含 last_day 当天
-    fetch_start = start if last_day is None else last_day
-    if pd.to_datetime(fetch_start) > pd.to_datetime(end):
-        return
-
-    try:
-        suspended = rq.is_suspended(stock_list, start_date=fetch_start, end_date=end, market='cn')
-    except Exception as e:
-        warnings.warn(f'is_suspended error: {e}')
-        return
-    if suspended is None or (isinstance(suspended, pd.DataFrame) and suspended.empty):
-        return
-
-    suspended.index = pd.to_datetime(suspended.index)
-    df_all = concat_dedup_wide_by_index(df_old, suspended, sort_index=True)
-    df_to_save = df_all.copy()
-    df_to_save.index = df_to_save.index.strftime('%Y-%m-%d')
-    write_csv(df_to_save, out_path)
-
-
-# =========================
-# 5) ST 信息（宽表，增量）
-# =========================
-def update_is_st(start='2010-01-01', end=TODAY_STR):
-    if not UPDATE_SWITCH.get('is_st', True):
-        return
-    stock_info_path = os.path.join(DATA_PATH, 'stock_info.csv')
-    stock_info = read_csv_safe(stock_info_path, index_col=0, encoding='gbk')
-    if stock_info is None or stock_info.empty:
-        warnings.warn('stock_info.csv 不存在或为空，跳过 ST 更新')
-        return
-    stock_list = stock_info['code'].dropna().unique().tolist()
-
-    out_path = os.path.join(DATA_PATH, 'is_st_stock.csv')
-    df_old = read_csv_safe(out_path, index_col=0)
-    if df_old is not None and not df_old.empty:
-        try:
-            df_old.index = pd.to_datetime(df_old.index)
-        except Exception:
-            pass
-
-    last_day = max_date_from_index_as_str(df_old)
-    # 改为包含 last_day 当天
-    fetch_start = start if last_day is None else last_day
-    if pd.to_datetime(fetch_start) > pd.to_datetime(end):
-        return
-
-    try:
-        is_st = rq.is_st_stock(stock_list, start_date=fetch_start, end_date=end)
-    except Exception as e:
-        warnings.warn(f'is_st_stock error: {e}')
-        return
-    if is_st is None or (isinstance(is_st, pd.DataFrame) and is_st.empty):
-        return
-
-    is_st.index = pd.to_datetime(is_st.index)
-    df_all = concat_dedup_wide_by_index(df_old, is_st, sort_index=True)
-    df_to_save = df_all.copy()
-    df_to_save.index = df_to_save.index.strftime('%Y-%m-%d')
-    write_csv(df_to_save, out_path)
-
-
-# =========================
-# 6) 指数成分（当前快照覆盖）
-# =========================
-def update_index_components():
-    if not UPDATE_SWITCH.get('index_components', True):
-        return
-    indices = {
-        '000300.XSHG': 'index_components_000300.csv',
-        '000852.XSHG': 'index_components_000852.csv',
-        '000905.XSHG': 'index_components_000905.csv',
-    }
-    for idx, fname in indices.items():
-        comps = pd.Series(rq.index_components(idx, date=None, market='cn', return_create_tm=False))
-        out_path = os.path.join(DATA_PATH, fname)
-        write_csv(comps, out_path)
-
-
-# =========================
-# 7) 行业与风格（当前快照覆盖 + 映射）
-# =========================
-def update_industry_and_style():
-    if not UPDATE_SWITCH.get('industry_and_style', True):
-        return
-    stock_info_path = os.path.join(DATA_PATH, 'stock_info.csv')
-    stock_info = read_csv_safe(stock_info_path, index_col=0, encoding='gbk')
-    if stock_info is None or stock_info.empty:
-        warnings.warn('stock_info.csv 不存在或为空，跳过行业/风格更新')
-        return
-    stock_list = stock_info['code'].dropna().unique().tolist()
-
-    # 行业（中信2019，Level 0）
-    stock_industry = rq.get_instrument_industry(stock_list, source='citics_2019', level=0)
-    out_ind_path = os.path.join(DATA_PATH, 'stock_industry_citics_2019_level0.csv')
-    write_csv(stock_industry, out_ind_path, encoding='gbk')
-
-    # 风格/板块（citics_sector）
-    stock_sector = rq.get_instrument_industry(stock_list, source='citics_2019', level='citics_sector')
-    out_style_path = os.path.join(DATA_PATH, 'stock_style_citics_2019_sector.csv')
-    write_csv(stock_sector, out_style_path, encoding='gbk')
-
-    # 生成映射（覆盖）
-    pd.read_csv(out_style_path, encoding='gbk')[['order_book_id', 'style_sector_name']] \
-        .rename(columns={'style_sector_name': 'sector'}) \
-        .to_csv(os.path.join(DATA_PATH, 'stock_style_map.csv'), index=False, encoding='gbk')
-
-    pd.read_csv(out_ind_path, encoding='gbk')[['order_book_id', 'first_industry_name']] \
-        .rename(columns={'first_industry_name': 'industry'}) \
-        .to_csv(os.path.join(DATA_PATH, 'stock_industry_map.csv'), index=False, encoding='gbk')
-
-
-# =========================
-# 8) 指数日行情（MultiIndex 增量）
-# =========================
-def update_index_price_day(start='2010-01-01', end=TODAY_STR):
-    if not UPDATE_SWITCH.get('index_price_day', True):
-        return
-    index_list = ['000300.XSHG', '000905.XSHG', '000852.XSHG']
-
-    out_path = os.path.join(DATA_PATH, 'index_price_day.parquet')
-    df_old = read_parquet_safe(out_path)
-
-    # 旧数据 MultiIndex 化
-    if df_old is not None and not df_old.empty:
-        if not isinstance(df_old.index, pd.MultiIndex):
-            idx_cols = [c for c in df_old.columns if c in ['order_book_id', 'datetime']]
-            if set(idx_cols) == {'order_book_id', 'datetime'}:
-                df_old['datetime'] = pd.to_datetime(df_old['datetime'])
-                df_old = df_old.set_index(['order_book_id', 'datetime']).sort_index()
-
-    last_dt = max_datetime_from_multiindex(df_old)
-    # 改为包含 last_dt 当天
-    fetch_start = start if last_dt is None else last_dt.strftime('%Y-%m-%d')
-    if pd.to_datetime(fetch_start) > pd.to_datetime(end):
-        return
-
-    df_new = get_price_safe(
-        index_list,
-        start_date=fetch_start,
-        end_date=end,
-        frequency=FREQ_DAY,
-        fields=None,
-        adjust_type='pre',
-        skip_suspended=False,
-        market='cn',
-        expect_df=True,
-        time_slice=None,
-        filter_codes=False  # 指数代码一般无需过滤
-    )
-    if df_new is None:
-        return
-
-    if isinstance(df_new.index, pd.MultiIndex):
-        df_new_mi = df_new.copy()
-    else:
-        if {'order_book_id', 'datetime'}.issubset(df_new.columns):
-            df_new['datetime'] = pd.to_datetime(df_new['datetime'])
-            df_new_mi = df_new.set_index(['order_book_id', 'datetime']).sort_index()
-        else:
-            df_new_mi = df_new.reset_index().set_index(['order_book_id', 'datetime']).sort_index()
-
-    df_all = concat_dedup_multiindex(df_old, df_new_mi, sort_index=True)
-    write_parquet(df_all, out_path)
-
-
-# =========================
-# 9) 新增：风格日行情（增量聚合到 sector_price_day.parquet）
-# =========================
-def update_sector_price_day(start='2010-01-01', end=TODAY_STR):
-    if not UPDATE_SWITCH.get('sector_price_day', True):
-        return
-
-    # 依赖输入
-    stock_price_path = os.path.join(DATA_PATH, 'stock_price_day.parquet')
-    style_map_path   = os.path.join(DATA_PATH, 'stock_style_map.csv')
-
-    price_df = read_parquet_safe(stock_price_path)
-    if price_df is None or price_df.empty:
-        warnings.warn('缺少或空的 stock_price_day.parquet，跳过 sector_price_day 生成')
-        return
-
-    # MultiIndex(order_book_id, datetime)
-    if not isinstance(price_df.index, pd.MultiIndex):
-        idx_cols = [c for c in price_df.columns if c in ['order_book_id', 'datetime']]
-        if set(idx_cols) == {'order_book_id', 'datetime'}:
-            price_df['datetime'] = pd.to_datetime(price_df['datetime'])
-            price_df = price_df.set_index(['order_book_id', 'datetime']).sort_index()
-        else:
-            warnings.warn('stock_price_day.parquet 非 MultiIndex 结构，跳过 sector 生成')
-            return
-
-    style_map = read_csv_safe(style_map_path, encoding='gbk')
-    if style_map is None or style_map.empty or ('order_book_id' not in style_map.columns) or ('sector' not in style_map.columns):
-        warnings.warn('缺少 stock_style_map.csv 或列不正确，跳过 sector 生成')
-        return
-    style_map['order_book_id'] = style_map['order_book_id'].astype(str).str.strip()
-    style_map['sector'] = style_map['sector'].astype(str).str.strip()
-
-    # 目标风格枚举（固定五类）
-    TARGET_SECTORS = ['周期风格', '成长风格', '消费风格', '稳定风格', '金融风格']
-
-    # 取出我们需要的行情列
-    cols_needed = []
-    for c in ['open', 'close', 'high', 'low', 'volume', 'total_turnover', 'num_trades']:
-        if c in price_df.columns:
-            cols_needed.append(c)
-    if not cols_needed or ('close' not in cols_needed) or ('total_turnover' not in cols_needed):
-        warnings.warn('price_day 缺少必要列（至少需要 close 与 total_turnover），跳过 sector 生成')
-        return
-    price_small = price_df[cols_needed].copy()
-
-    # 把 MultiIndex 拆成列，便于合并风格映射
-    price_small = price_small.reset_index()
-    price_small['order_book_id'] = price_small['order_book_id'].astype(str).str.strip()
-    price_small['date'] = pd.to_datetime(price_small['date'])
-
-    # 合并 sector
-    price_small = price_small.merge(style_map[['order_book_id', 'sector']], on='order_book_id', how='left')
-    price_small['sector'] = price_small['sector'].fillna('')  # 无风格的剔除
-    price_small = price_small[price_small['sector'].isin(TARGET_SECTORS)]
-
-    if price_small.empty:
-        warnings.warn('按风格过滤后为空，跳过 sector 生成')
-        return
-
-    # 读取已有 sector 文件
-    out_path = os.path.join(DATA_PATH, 'sector_price_day.parquet')
-    sector_old = read_parquet_safe(out_path)
-    last_day = None
-    if sector_old is not None and not sector_old.empty:
-        try:
-            last_day = pd.to_datetime(sector_old['date']).max().strftime('%Y-%m-%d') if 'date' in sector_old.columns else pd.to_datetime(sector_old.index).max().strftime('%Y-%m-%d')
-        except Exception:
-            last_day = None
-
-    # 增量区间（包含 last_day 当天以便覆盖）
-    fetch_start = start if last_day is None else last_day
-    price_small = price_small[(price_small['date'] >= pd.to_datetime(fetch_start)) & (price_small['date'] <= pd.to_datetime(end))]
-    if price_small.empty:
-        return
-
-    # 当日每风格聚合：成交额权重聚合 close；成交额/成交量/笔数直接求和；成分数量记有效样本数
-    def _agg_one_day(df_day: pd.DataFrame) -> pd.DataFrame:
-        rows = []
-        for sec in TARGET_SECTORS:
-            sub = df_day[df_day['sector'] == sec]
-            if sub.empty:
-                continue
-            # 有效样本：需要 close 与 total_turnover 有效
-            sub = sub.copy()
-            sub = sub.replace([np.inf, -np.inf], np.nan)
-            sub = sub.dropna(subset=['close', 'total_turnover'])
-            if sub.empty:
-                continue
-
-            tot = float(sub['total_turnover'].sum())
-            if tot <= 0:
-                # 无成交额：close 用简单平均兜底
-                close_val = float(sub['close'].mean())
-            else:
-                w = sub['total_turnover'].values.astype(float) / tot
-                close_val = float(np.sum(sub['close'].values.astype(float) * w))
-
-            volume_sum = float(sub['volume'].sum()) if 'volume' in sub.columns else np.nan
-            turnover_sum = float(sub['total_turnover'].sum())
-            trades_sum = float(sub['num_trades'].sum()) if 'num_trades' in sub.columns else np.nan
-            cnt = int(len(sub))
-
-            rows.append({
-                'sector': sec,
-                'date': df_day['date'].iloc[0],
-                'close': close_val,
-                'total_turnover': turnover_sum,
-                'volume': volume_sum,
-                'num_trades': trades_sum,
-                'constituents_count': cnt
-            })
-        if not rows:
-            return pd.DataFrame(columns=['sector','date','close','total_turnover','volume','num_trades','constituents_count'])
-        return pd.DataFrame(rows)
-
-    # 对每日进行聚合
-    grouped = price_small.groupby('date', sort=True)
-    out_parts = []
-    for dt, df_day in grouped:
-        out_parts.append(_agg_one_day(df_day))
-
-    if not out_parts:
-        return
-    sector_new = pd.concat(out_parts, ignore_index=True)
-    sector_new = sector_new.sort_values(['date','sector'])
-
-    # 合并旧数据并去重（保留新行覆盖）
-    if sector_old is None or sector_old.empty:
-        sector_all = sector_new
-    else:
-        # 统一列顺序
-        base_cols = ['sector','date','close','total_turnover','volume','num_trades','constituents_count']
-        for c in base_cols:
-            if c not in sector_old.columns:
-                sector_old[c] = np.nan
-        sector_old = sector_old[base_cols].copy()
-
-        sector_all = pd.concat([sector_old, sector_new], axis=0, ignore_index=True)
-        sector_all['date'] = pd.to_datetime(sector_all['date'])
-        sector_all = sector_all.drop_duplicates(subset=['sector','date'], keep='last').sort_values(['date','sector'])
-
-    write_parquet(sector_all, out_path)
-    print(f'[DATA] 已更新风格日行情：{out_path}，总行数={len(sector_all)}，新增/覆盖={len(sector_new)}')
-
-
-# =========================
-# 主流程
-# =========================
+        return stock, pd.DataFrame()
+
+def enforce_factor_cols_consistency(stock_feat: Dict[str, pd.DataFrame], existed_cols: Optional[List[str]]) -> List[str]:
+    if existed_cols is not None and len(existed_cols) > 0:
+        return list(existed_cols)
+    if len(stock_feat) == 0:
+        raise RuntimeError("无可用的股票因子用于推断列名。")
+    sample_stock = next(iter(stock_feat.keys()))
+    return stock_feat[sample_stock].columns.tolist()
+
+# ===== 主流程（增量 + 局部片段 + 覆盖最后一日） =====
 def main():
-    # 1) 交易日 & 周
-    print('更新交易日与交易周...')
-    update_trading_calendar(start='2001-01-01', end=TRADING_DAY_END)
+    # 1) 读取最新的日频数据并规范索引
+    day_df = pd.read_parquet(CFG.price_day_file)
+    day_df = ensure_multiindex_price(day_df)
 
-    # 2) 股票信息（JQ 导出覆盖）
-    print('更新股票信息（需先导出 stock_list_jq.csv）...')
-    update_stock_info_from_jq_export()
+    stocks = day_df.index.get_level_values(0).unique().tolist()
 
-    # 3) 股票日行情（前复权，MultiIndex）
-    print('更新股票日行情...')
-    update_stock_price_day(start='2010-01-01', end=TODAY_STR)
+    # 2) 已写入的 H5 元信息
+    h5_path = Path(CFG.feat_file)
+    next_idx, written_dates, existed_cols = read_h5_meta(h5_path)
+    written_dates_idx = pd.DatetimeIndex(sorted(written_dates)) if written_dates else pd.DatetimeIndex([])
+    last_written = written_dates_idx.max() if len(written_dates_idx) > 0 else None
 
-    # 4) 停牌（宽表）
-    print('更新停牌信息...')
-    update_suspended(start='2010-01-01', end=TODAY_STR)
+    # 3) 缺失的周五（加入 last_written 用于覆盖修订）
+    missing_fridays = list_missing_fridays(Path(CFG.trading_day_file), CFG.start_date, CFG.end_date, written_dates)
+    missing_fridays = list(missing_fridays)  # 确保是 list，便于 append
+    if last_written is not None and last_written not in missing_fridays:
+        missing_fridays.append(last_written)
+    # 最终转为 DatetimeIndex，供下游函数（需要 .min()/.max()）使用
+    missing_fridays = pd.DatetimeIndex(sorted(set(missing_fridays)))
+    if len(missing_fridays) == 0:
+        print("没有新增/需覆盖的周五采样日需要写入，增量构建完成。")
+        return
 
-    # 5) ST（宽表）
-    print('更新 ST 信息...')
-    update_is_st(start='2010-01-01', end=TODAY_STR)
+    # 4) 局部历史片段的起点
+    hist_start = get_required_history_start(missing_fridays, max_lookback=CFG.max_lookback)
+    hist_end = pd.Timestamp(CFG.end_date)
+    # 截取行情片段，仅用这一段计算全量因子
+    print(f"局部历史片段: {hist_start.date()} ~ {hist_end.date()}, 读取中...")
+    sliced = day_df[(day_df.index.get_level_values('datetime') >= hist_start) &
+                    (day_df.index.get_level_values('datetime') <= hist_end)]
+    print(f"读取局部行情片段: {sliced.index.get_level_values('datetime').min().date()} ~ {sliced.index.get_level_values('datetime').max().date()}, 股票数={sliced.index.get_level_values(0).nunique()}")
 
-    # 6) 指数成分（快照覆盖）
-    print('更新指数成分...')
-    update_index_components()
+    # 5) 并行计算“局部片段”的全量因子缓存
+    stock_feat: Dict[str, pd.DataFrame] = {}
+    with ThreadPoolExecutor(max_workers=CFG.num_workers) as ex:
+        futures = {ex.submit(_compute_one, s, sliced): s for s in stocks if s in sliced.index.get_level_values(0)}
+        for fut in tqdm(as_completed(futures), total=len(futures), desc="并行计算因子(局部片段)"):
+            s = futures[fut]
+            stk, fct = fut.result()
+            if not fct.empty:
+                stock_feat[stk] = fct
 
-    # 7) 行业与风格（快照覆盖 + 映射）
-    print('更新行业与风格...')
-    update_industry_and_style()
+    if len(stock_feat) == 0:
+        print("局部片段内无可计算的股票因子，增量构建结束。")
+        return
 
-    # 8) 指数日行情（MultiIndex）
-    print('更新指数日行情...')
-    update_index_price_day(start='2010-01-01', end=TODAY_STR)
+    # 6) 因子列名与历史一致
+    factor_cols = enforce_factor_cols_consistency(stock_feat, existed_cols)
 
-    # 9) 新增：风格日行情（增量聚合）
-    print('更新风格日行情（sector_price_day）...')
-    update_sector_price_day(start='2010-01-01', end=TODAY_STR)
+    # 7) 逐个周五写入（只处理缺失/需覆盖的）
+    str_dt = h5py.string_dtype(encoding='utf-8')
+    mode = "a" if h5_path.exists() else "w"
+    written_cnt_total = 0
+    with h5py.File(h5_path, mode) as h5f:
+        # 建立 date -> group_name 映射（用于覆盖删除）
+        existing_groups: Dict[pd.Timestamp, str] = {}
+        for k in h5f.keys():
+            try:
+                gd = h5f[k].attrs.get('date', None)
+                if gd is not None:
+                    existing_groups[pd.Timestamp(gd)] = k
+            except Exception:
+                continue
 
+        if 'factor_cols' not in h5f.attrs:
+            h5f.attrs['factor_cols'] = np.asarray(factor_cols, dtype=str_dt)
 
-if __name__ == '__main__':
+        group_idx = next_idx
+        for d in tqdm(missing_fridays, desc="增量写入特征仓"):
+            # 覆盖：如果已存在该日期组，先删除
+            if d in existing_groups:
+                try:
+                    del h5f[existing_groups[d]]
+                except Exception:
+                    pass  # 删除失败则忽略，继续用追加写入覆盖（会留下重复，建议尽量删除成功）
+
+            feats_all = []
+            stk_list  = []
+            # 对所有股票在该日期切出窗口
+            for stk, fct_full in stock_feat.items():
+                fct_hist = fct_full[fct_full.index <= d]
+                if len(fct_hist) < CFG.daily_window:
+                    continue
+                fct_win = fct_hist.tail(CFG.daily_window)
+                fct_win = fct_win.reindex(columns=factor_cols)
+                vals = fct_win.values
+                if not np.isfinite(vals).any() or np.isnan(vals).all():
+                    continue
+                vals = np.nan_to_num(vals, nan=0.0, posinf=0.0, neginf=0.0)
+                if vals.ndim != 2 or vals.shape[0] != CFG.daily_window:
+                    continue
+                feats_all.append(vals.astype(np.float32))
+                stk_list.append(stk)
+
+            if not feats_all:
+                continue
+
+            feats_arr = np.stack(feats_all, axis=0)  # [N,T,C]
+            feats_arr = mad_clip(feats_arr)
+            feats_arr = np.nan_to_num(feats_arr, nan=0.0, posinf=0.0, neginf=0.0)
+
+            g = h5f.create_group(f"date_{group_idx}")
+            g.attrs['date'] = d.strftime('%Y-%m-%d')
+            g.create_dataset("stocks", data=np.asarray(stk_list, dtype=str_dt))
+
+            N, T, C = feats_arr.shape
+            chunk0 = int(min(256, N))
+            try:
+                g.create_dataset(
+                    "factor",
+                    data=feats_arr,
+                    compression="lzf",
+                    chunks=(chunk0, T, C)
+                )
+            except Exception:
+                g.create_dataset(
+                    "factor",
+                    data=feats_arr,
+                    compression=None,
+                    chunks=(chunk0, T, C)
+                )
+            written_cnt_total += 1
+            group_idx += 1
+
+    print(f"增量构建完成：新增/覆盖周五组数={written_cnt_total}，H5路径={h5_path}")
+
+if __name__ == "__main__":
     main()
