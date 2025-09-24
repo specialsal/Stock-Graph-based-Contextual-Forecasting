@@ -14,8 +14,8 @@ from backtest_rolling_config import BTRollingConfig
 from combine_s_g import main as combine_s_g
 
 def main():
-    # print("STEP 0: 更新数据")
-    # acquire_data()
+    print("STEP 0: 更新数据")
+    acquire_data()
     print("STEP 1: 更新离线特征仓")
     gen_feature()
     print("STEP 2: 更新市场/风格上下文特征")
@@ -24,16 +24,16 @@ def main():
     gen_label()
     print("STEP 4: 滚动训练")
     rolling_train()
-    print("STEP 5: 滚动生成打分")
-    bt_gen()
-    print("STEP 6: 滚动回测")
-    position_gen()
-    print("STEP 7: 回测统计指标")
-    metrics_gen(f"./backtest_rolling/{BTRollingConfig.run_name}/nav_{BTRollingConfig.run_name}.csv")
-    print("STEP 8: 组合黄金etf")
-    combine_s_g()
-    print("STEP 9: 组合回测统计指标")
-    metrics_gen(f"./backtest_rolling/{BTRollingConfig.run_name}/s_g_combo/combo_nav.csv")
+    # print("STEP 5: 滚动生成打分")
+    # bt_gen()
+    # print("STEP 6: 滚动回测")
+    # position_gen()
+    # print("STEP 7: 回测统计指标")
+    # metrics_gen(f"./backtest_rolling/{BTRollingConfig.run_name}/nav_{BTRollingConfig.run_name}.csv")
+    # print("STEP 8: 组合黄金etf")
+    # combine_s_g()
+    # print("STEP 9: 组合回测统计指标")
+    # metrics_gen(f"./backtest_rolling/{BTRollingConfig.run_name}/s_g_combo/combo_nav.csv")
 
 
 if __name__ == "__main__":

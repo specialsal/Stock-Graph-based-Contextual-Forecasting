@@ -1,21 +1,21 @@
 # ====================== train_utils.py ======================
 # coding: utf-8
 """
-训练通用工具：
+训练通用工具（RankNet_margin 损失 + 精简日志）：
 - 环境设置/优化器封装
 - 股票样本过滤（读取与闭包）
 - AMP/相关指标
-- Pairwise Ranking 损失
+- Pairwise Ranking 损失（带常数 margin 的 RankNet）
 - 按组读取（HDF5 -> 内存 -> 分batch）
 - 窗口内拟合 Scaler（仅用训练组）
 """
 import math, torch, numpy as np, pandas as pd, h5py, shutil
 import torch.nn.functional as F
 from pathlib import Path
-from typing import Iterable, Optional, Tuple, List, Dict
+from typing import Iterable, Optional, Tuple, List, Dict, Any
 from config import CFG
 from utils import Scaler, rank_ic
-from typing import Any
+
 # ================= RAM 模式（窗口级一次性加载并常驻） =================
 def load_window_to_ram(
     h5: h5py.File,
@@ -88,15 +88,13 @@ def try_fused_adamw(params, lr, wd):
     """
     创建 AdamW 优化器：
     - 优先尝试 fused 版本（仅在支持的平台和 PyTorch 版本可用）
-    - 使用关键字参数传递 lr 与 weight_decay，避免位置参数被误解析为 betas
+    - 使用关键字参数传递 lr 与 weight_decay
     - 回退到非 fused 版本
     """
     kwargs = dict(lr=lr, weight_decay=wd)
     try:
-        # 一些 PyTorch 版本要求 fused 仅在 CUDA 上可用
         return torch.optim.AdamW(params, fused=HAS_CUDA, **kwargs)
     except TypeError:
-        # 旧版本无 fused 关键字
         return torch.optim.AdamW(params, **kwargs)
 
 def get_amp_dtype():
@@ -218,8 +216,6 @@ def _is_limit_like_row(row: pd.Series, up_th: float = 0.098, near_eps: float = 0
     if any(c not in row or pd.isna(row[c]) for c in req):
         return False, False
     o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
-    # 涨跌幅（以昨收无法直接获得时，近似用 (close/open - 1) 作为替代信号，保守但不严谨）
-    # 若有 pre_close 可替代更好；这里采用 open->close 的日内涨跌幅近似：
     day_ret = (c / o - 1.0) if o > 0 else 0.0
     limit_up_like = (day_ret >= up_th and c >= h * (1 - near_eps)) or (abs(o - h) <= near_eps * max(1.0, h) and abs(c - h) <= near_eps * max(1.0, h))
     limit_dn_like = (day_ret <= -up_th and c <= l * (1 + near_eps)) or (abs(o - l) <= near_eps * max(1.0, l) and abs(c - l) <= near_eps * max(1.0, l))
@@ -240,7 +236,6 @@ def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd
     if not isinstance(daily_df.index, pd.MultiIndex):
         daily_df = daily_df.set_index(["order_book_id","date"]).sort_index()
 
-    # 预先准备：快速 xs 按日期切片
     def get_row_by_code_date(code: str, date: pd.Timestamp):
         try:
             return daily_df.loc[(code, date)]
@@ -248,7 +243,6 @@ def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd
             return None
 
     def filter_fn(date: pd.Timestamp, code: str) -> bool:
-        # 1) 板块开关
         from train_utils import classify_board
         bd = classify_board(code)
         if bd == "STAR"    and not getattr(CFG, "include_star_market", True): return False
@@ -256,7 +250,6 @@ def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd
         if bd == "BSE"     and not getattr(CFG, "include_bse",         True): return False
         if bd == "NEEQ"    and not getattr(CFG, "include_neeq",        True): return False
 
-        # 2) IPO/退市
         if stock_info is not None and code in stock_info.index:
             info = stock_info.loc[code]
             ipo = info["ipo_date"]
@@ -269,15 +262,12 @@ def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd
         else:
             if not CFG.allow_missing_info: return False
 
-        # 3) 停牌
         if getattr(CFG, "suspended_exclude", True) and susp_df is not None:
             if get_flag_at(susp_df, date, code) == 1: return False
 
-        # 4) ST
         if getattr(CFG, "st_exclude", True) and st_df is not None:
             if get_flag_at(st_df, date, code) == 1: return False
 
-        # 5) 成交额
         thr = getattr(CFG, "min_daily_turnover", 0.0) or 0.0
         if thr > 0:
             key = (code, date)
@@ -285,8 +275,6 @@ def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd
             to = daily_df.loc[key, "total_turnover"] if "total_turnover" in daily_df.columns else np.nan
             if pd.isna(to) or float(to) < float(thr): return False
 
-        # 6) 新增：接近涨停/接近跌停 禁买（按当日口径）
-        # 若存在 open/high/low/close，则判定；否则跳过该规则（不报错）
         row = get_row_by_code_date(code, date)
         if row is not None:
             try:
@@ -301,6 +289,7 @@ def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd
 
 # --------------------------- AMP / 指标 --------------------------- #
 def pearsonr(pred, y):
+    # 仅作为诊断时使用（训练/验证日志不再输出）
     if pred.numel() < 2:
         return torch.tensor(float("nan"), device=pred.device, dtype=pred.dtype)
     px = pred - pred.mean()
@@ -312,11 +301,12 @@ def pearsonr(pred, y):
         return torch.tensor(float("nan"), device=pred.device, dtype=pred.dtype)
     return (px * py).mean() / (vx.sqrt() * vy.sqrt())
 
-# --------------------------- 排序损失 --------------------------- #
-def pairwise_ranking_loss(pred: torch.Tensor, y: torch.Tensor, num_pairs: int = 2048) -> torch.Tensor:
+# --------------------------- 排序损失（带常数 margin） --------------------------- #
+def pairwise_ranking_loss_margin(pred: torch.Tensor, y: torch.Tensor, m: float, num_pairs: int = 2048) -> torch.Tensor:
     """
-    BPR/Logistic 风格的 pairwise 排序损失：
-    L = - E_{(i,j)} [ log sigmoid( (y_i - y_j) * (pred_i - pred_j) ) ]
+    RankNet（pairwise logistic）的 margin 版本（成本敏感）：
+    L = E_{(i,j)} [ softplus( m - s_ij * (pred_i - pred_j) ) ]
+    其中 s_ij = sign(y_i - y_j) ∈ {-1, +1}，m 为常数 margin（如 0.0025）。
     - 在 batch 内随机采样若干对，避免 O(B^2)
     """
     B = pred.shape[0]
@@ -334,8 +324,8 @@ def pairwise_ranking_loss(pred: torch.Tensor, y: torch.Tensor, num_pairs: int = 
     if not valid.any():
         return pred.new_tensor(0.0)
     i = i[valid]; j = j[valid]; s_ij = s_ij[valid]
-    diff = (pred[i] - pred[j]) * s_ij
-    return -torch.log(torch.sigmoid(diff).clamp_min(1e-12)).mean()
+    x = m - s_ij * (pred[i] - pred[j])
+    return torch.nn.functional.softplus(x).mean()
 
 # --------------------------- 窗口内拟合 Scaler --------------------------- #
 def fit_scaler_for_groups(h5: h5py.File, group_keys: Iterable[str]) -> Scaler:
@@ -391,7 +381,6 @@ def load_group_to_memory(h5: h5py.File,
     X = np.squeeze(X)                           # -> [N,T,C]
     X = scaler_d.transform(X).astype(np.float32)
 
-    # 过滤：标签存在 + 业务过滤
     keep_idx, y_list = [], []
     for i, s in enumerate(stocks):
         key = (date, s)
@@ -406,10 +395,8 @@ def load_group_to_memory(h5: h5py.File,
     stocks = stocks[keep_idx]
     y = np.asarray(y_list, dtype=np.float32)
 
-    # 行业ID
     ind = np.asarray([ind_map.get(s, pad_ind_id) for s in stocks], dtype=np.int64)
 
-    # 上下文
     if date in ctx_df.index:
         ctx_vec = ctx_df.loc[date].values.astype(np.float32)
     else:
@@ -465,16 +452,12 @@ def classify_board(code: str) -> str:
         parts = s.split(".")
         prefix = parts[0]
         suffix = parts[-1].upper() if len(parts) > 1 else ""
-        # 科创板
         if suffix == "XSHG" and (prefix.startswith("688") or prefix.startswith("689")):
             return "STAR"
-        # 创业板
         if suffix == "XSHE" and (prefix.startswith("300") or prefix.startswith("301")):
             return "CHINEXT"
-        # 北交所
         if suffix in ("XBEI", "XBSE"):
             return "BSE"
-        # 新三板（场外）
         if suffix in ("XNE", "XNEE", "XNEQ", "XNEX", "NEEQ"):
             return "NEEQ"
         return "OTHER"

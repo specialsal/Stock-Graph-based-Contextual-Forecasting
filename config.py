@@ -1,14 +1,13 @@
 # ====================== config.py ======================
 # coding: utf-8
 """
-全局配置 —— 早停版（在原基础上加入早停参数）
+全局配置 —— RankNet_margin(cost=m) + 精简日志版本
 修改点：
-- 去掉测试集与风险调整分数相关参数：不再使用 test_weeks 与 score_alpha；
-- 新增 run_name，并将 model_dir 定义为 models/model_{run_name}；
-- 新增 warm_start 开关：可选从上一个窗口的 best 模型作为本窗口初始化；
-- 训练保存的 best/last 与 TensorBoard 写入策略：模型保存在 models/model_{run_name}，
-  TensorBoard 仍统一写在 models/tblogs；
-- 其它参数与说明保持一致。
+- 去掉 ranking_weight 及所有混合损失逻辑；
+- 新增 pairwise margin 的常数参数 pair_margin_m 与成对采样数 pair_num_pairs；
+- 日志只保留 pairwise_margin_loss 与 ic_rank；
+- 早停仍以验证集 RankIC 为判据；
+- 其它参数保持一致。
 """
 import torch, random, numpy as np
 from dataclasses import dataclass
@@ -18,7 +17,7 @@ from datetime import datetime
 @dataclass
 class Config:
     # -------- 运行命名（影响模型输出路径）--------
-    run_name = "tr1gat1win50"
+    run_name = "tr1gat1win50_margin_only_icrank_es"
 
     # -------- 路径 --------
     data_dir      = Path("./data")
@@ -86,20 +85,19 @@ class Config:
     use_torch_compile = False
     print_step_interval = 10
 
-    # -------- 排序损失权重 --------
-    ranking_weight  = 0.5
+    # -------- Pairwise RankNet (margin) 参数 --------
+    pair_margin_m  = 0.0025   # 常数 margin（约 25 bps，周频）
+    pair_num_pairs = 4096     # 每步随机采样的成对数量
 
-    # -------- 早停参数 --------
+    # -------- 早停参数（以验证集 ic_rank 为唯一判据）--------
     early_stop_min_epochs  = 3
     early_stop_max_epochs  = 15
     early_stop_patience    = 3
     early_stop_min_delta   = 1e-4
 
     # -------- Warm Start 开关 --------
-    # 若为 True，则每个窗口训练前尝试加载“上一个窗口”的 best 作为初始化
     warm_start_enable = False
-    # strict=True 时要求完全匹配 state_dict；False 则允许部分加载（推荐 False，更稳健）
-    warm_start_strict = False
+    warm_start_strict = False  # 推荐 False，允许部分加载
 
     # -------- 板块开关 --------
     include_star_market = False

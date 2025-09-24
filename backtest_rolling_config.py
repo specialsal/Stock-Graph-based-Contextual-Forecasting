@@ -78,7 +78,7 @@ class BTRollingConfig:
     allow_multiple_triggers_per_week: bool = True
 
     # 组合权重与过滤（从代码中上移到配置）
-    weight_mode: str = "equal"  # "equal" 或 "score"
+    weight_mode: str = "equal"  # "equal" 或 "score" 或 "optimize"
     filter_negative_scores_long: bool = False
 
     # 设备

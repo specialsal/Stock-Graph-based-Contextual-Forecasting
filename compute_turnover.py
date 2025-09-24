@@ -31,7 +31,7 @@ def ensure_dir(p: Path):
 
 def load_positions(cfg) -> pd.DataFrame:
     out_dir = cfg.backtest_dir
-    pos_path = out_dir / f"positions_{cfg.run_name_out}.csv"
+    pos_path = out_dir / f"positions_{cfg.run_name_out}_{cfg.weight_mode}.csv"
     if not pos_path.exists():
         alt = out_dir / f"positions_{cfg.run_name}.csv"
         if alt.exists():

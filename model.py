@@ -169,7 +169,7 @@ class GCFNet(nn.Module):
 
         self.gate = nn.Linear(hidden * 2, 1)
 
-        # 新增：ctx 归一化层（仅基于当前样本，无未来信息）
+        # 对上下文做 LayerNorm（仅基于当前样本，无未来信息）
         self.ctx_norm = nn.LayerNorm(ctx_dim)
 
         self.film = FiLM(ctx_dim, hidden)
