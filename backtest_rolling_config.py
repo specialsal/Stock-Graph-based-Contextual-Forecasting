@@ -1,9 +1,6 @@
 # coding: utf-8
 """
 滚动回测专用配置（按窗口 step_weeks 片段拼接）
-- 模型目录按 run_name 组织：./models/model_{run_name}
-- 回测输出目录：./backtest_rolling/{run_name}
-- 其它参数尽量与 backtest_config 保持一致
 """
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,39 +23,38 @@ class BTRollingConfig:
     # 运行名（用于输出文件命名）
     run_name_out  = run_name
 
-    # 基础路径（沿用训练配置目录结构）
+    # 数据路径
     data_dir       = Path("./data")
     processed_dir  = data_dir / "processed"
     raw_dir        = data_dir / "raw"
     feat_file      = processed_dir / "features_daily.h5"
     ctx_file       = processed_dir / "context_features.parquet"
-    label_file     = processed_dir / "weekly_labels.parquet"  # 可选，用于计算收益
+    label_file     = processed_dir / "weekly_labels.parquet"
     industry_map_file = raw_dir / "stock_industry_map.csv"
     trading_day_file  = raw_dir / "trading_day.csv"
-    # 为回测筛选加载原始数据（与训练一致）
     price_day_file     = raw_dir / "stock_price_day.parquet"
     stock_info_file    = raw_dir / "stock_info.csv"
     is_suspended_file  = raw_dir / "is_suspended.csv"
     is_st_file         = raw_dir / "is_st_stock.csv"
 
     # 回测模式
-    # mode = "long"  仅做多
-    # mode = "ls"    多空对冲（多头等权，空头等权，净敞口可通过 long_weight/short_weight 控制）
     mode           = "long"
     long_weight    = 1.0
     short_weight   = 1.0
 
     # 分组与持仓控制
-    top_pct        = 0.05    # 做多比例（0~1）
-    bottom_pct     = 0.05    # 做空比例（0~1），仅在 mode=="ls" 时使用
-    min_n_stocks   = 50     # 每周最少持仓数量（若不足则本周空仓) 50
-    max_n_stocks   = 300    # 每边最多持仓数量（多/空各自限制）300
+    top_pct        = 0.05
+    bottom_pct     = 0.05
+    min_n_stocks   = 50
+    max_n_stocks   = 300
 
-    # 交易相关假设
-    slippage_bps   = 10  # 单边滑点，基点
-    fee_bps        = 3  # 单边手续费，基点
+    # 成本与滑点（非对称）
+    # 注意：bps 为基点（万分之一）。例如 3 表示万三（0.03%）
+    buy_fee_bps    = 3   # 买入手续费：万三
+    sell_fee_bps   = 8   # 卖出手续费：万八
+    slippage_bps   = 10   # 双边对称滑点：万五（买卖两侧都加）
 
-    # 样本过滤（与训练一致）
+    # 过滤与样本要求（与训练一致，可按需启用）
     enable_filters     = True
     ipo_cut_days       = 120
     suspended_exclude  = True
@@ -67,10 +63,23 @@ class BTRollingConfig:
     allow_missing_info = False
 
     # 板块开关（与训练一致）
-    include_star_market = False  # 科创板
-    include_chinext = False      # 创业板
-    include_bse = False          # 北交所
-    include_neeq = False         # 新三板
+    include_star_market = False
+    include_chinext = False
+    include_bse = False
+    include_neeq = False
+
+    # 周内止盈/止损参数
+    enable_intraweek_stops: bool = False
+    tp_price_ratio: float = 0.06
+    sl_price_ratio: float = 0.06
+    tp_sell_ratio: float = 0.50
+    sl_sell_ratio: float = 1.00
+    stop_priority: str = "SL_first"
+    allow_multiple_triggers_per_week: bool = True
+
+    # 组合权重与过滤（从代码中上移到配置）
+    weight_mode: str = "equal"  # "equal" 或 "score"
+    filter_negative_scores_long: bool = False
 
     # 设备
     device         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
