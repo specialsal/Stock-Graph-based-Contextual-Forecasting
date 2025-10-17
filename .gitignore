@@ -9,3 +9,5 @@ diagnose
 diag_chase.py
 stock_test
 single_stock_test.py
+check/
+

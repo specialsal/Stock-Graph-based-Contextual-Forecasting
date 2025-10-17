@@ -17,6 +17,7 @@ import pandas as pd
 
 from backtest_rolling_config import BT_ROLL_CFG
 from utils import load_calendar, weekly_fridays
+from typing import Dict, Tuple
 
 
 def ensure_dir(p: Path):
@@ -162,45 +163,82 @@ def compute_weekly_returns_with_stops(open_pivot: pd.DataFrame,
 
 def build_nav_from_positions(positions: pd.DataFrame,
                              weekly_ret: Dict[pd.Timestamp, pd.Series],
-                             long_weight: float) -> pd.DataFrame:
+                             long_weight: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     输入：
       - positions: 列至少包含 [date, stock, weight]，可有 score（忽略）
       - weekly_ret: dict[周五(date) -> Series(stock->下一周O2C收益，已含单股成本/滑点/止盈止损口径)]
     输出：
       - nav_df: index=date, cols=[ret_long, ret_short, ret_total, nav, n_long]
+      - stock_returns_df: 包含date, stock, weight, ret, contribution(权重*收益)列
     """
     if positions.empty:
-        return pd.DataFrame(columns=["ret_long", "ret_short", "ret_total", "nav", "n_long"])
+        nav_df = pd.DataFrame(columns=["ret_long", "ret_short", "ret_total", "nav", "n_long"])
+        stock_df = pd.DataFrame(columns=["date", "stock", "weight", "ret", "contribution"])
+        return nav_df, stock_df
 
     positions = positions.copy()
     positions["date"] = pd.to_datetime(positions["date"])
     dates = sorted(set(positions["date"]).intersection(weekly_ret.keys()))
 
     recs = []
+    stock_recs = []  # 存储每只股票的收益记录
+    
     for d in dates:
         pos_d = positions[positions["date"] == d].copy()
         pos_d = pos_d.dropna(subset=["stock", "weight"])
+        
         if pos_d.empty:
             recs.append({"date": d, "ret_long": 0.0, "ret_short": 0.0, "ret_total": 0.0, "n_long": 0})
             continue
+            
         ret_s = weekly_ret[d]
         # 对齐到持仓股票
         pos_d = pos_d.merge(ret_s.rename("ret"), left_on="stock", right_index=True, how="inner")
         pos_d = pos_d.dropna(subset=["ret", "weight"])
+        
         if pos_d.empty:
             recs.append({"date": d, "ret_long": 0.0, "ret_short": 0.0, "ret_total": 0.0, "n_long": 0})
             continue
-        long_ret = float((pos_d["ret"].astype(float) * pos_d["weight"].astype(float)).sum())
+            
+        # 计算每只股票的贡献并添加到股票收益记录
+        pos_d["contribution"] = pos_d["ret"].astype(float) * pos_d["weight"].astype(float)
+        for _, row in pos_d.iterrows():
+            stock_recs.append({
+                "date": d,
+                "stock": row["stock"],
+                "weight": row["weight"],
+                "ret": row["ret"],
+                "contribution": row["contribution"]
+            })
+        
+        # 计算组合收益
+        long_ret = float(pos_d["contribution"].sum())
         total = float(long_weight) * long_ret
-        recs.append({"date": d, "ret_long": long_ret, "ret_short": 0.0, "ret_total": total, "n_long": int(pos_d.shape[0])})
+        recs.append({
+            "date": d, 
+            "ret_long": long_ret, 
+            "ret_short": 0.0, 
+            "ret_total": total, 
+            "n_long": int(pos_d.shape[0])
+        })
 
+    # 处理净值数据
     if not recs:
-        return pd.DataFrame(columns=["ret_long", "ret_short", "ret_total", "nav", "n_long"])
-
-    df_ret = pd.DataFrame(recs).set_index("date").sort_index()
-    df_ret["nav"] = (1.0 + df_ret["ret_total"]).cumprod()
-    return df_ret
+        nav_df = pd.DataFrame(columns=["ret_long", "ret_short", "ret_total", "nav", "n_long"])
+    else:
+        nav_df = pd.DataFrame(recs).set_index("date").sort_index()
+        nav_df["nav"] = (1.0 + nav_df["ret_total"]).cumprod()
+    
+    # 处理股票收益明细数据
+    if not stock_recs:
+        stock_df = pd.DataFrame(columns=["date", "stock", "weight", "ret", "contribution"])
+    else:
+        stock_df = pd.DataFrame(stock_recs)
+        stock_df["date"] = pd.to_datetime(stock_df["date"])
+        stock_df = stock_df.sort_values(by=["date", "stock"]).reset_index(drop=True)
+    
+    return nav_df, stock_df
 
 
 def main():
@@ -264,16 +302,19 @@ def main():
                   if (d >= pd.Timestamp(cfg.bt_start_date)) and (d <= pd.Timestamp(cfg.bt_end_date))}
 
     # 从 positions 聚合生成 NAV
-    nav_df = build_nav_from_positions(positions, weekly_ret, long_weight=float(cfg.long_weight))
+    nav_df,stock_df = build_nav_from_positions(positions, weekly_ret, long_weight=float(cfg.long_weight))
     if nav_df.empty:
         print("[BTR-BT] 未能生成回测净值（可能所有周都空仓或无可对齐的收益）。")
         return
 
     out_nav_csv = out_dir / f"nav_{cfg.run_name_out}.csv"
+    out_stock_csv = out_dir / f"stock_returns_{cfg.run_name_out}.csv"
     ensure_dir(out_nav_csv)
     cols = ["ret_long", "ret_short", "ret_total", "nav", "n_long"]
     nav_df[cols].to_csv(out_nav_csv, float_format="%.8f")
+    stock_df.to_csv(out_stock_csv, index=False, float_format="%.8f")
     print(f"[BTR-BT] 已保存净值序列：{out_nav_csv}")
+    print(f"[BTR-BT] 已保存股票收益明细：{out_stock_csv}")
 
 
 if __name__ == "__main__":

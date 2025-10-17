@@ -17,7 +17,7 @@ from datetime import datetime
 @dataclass
 class Config:
     # -------- 运行命名（影响模型输出路径）--------
-    run_name = "tr1gat1win50_margin_only_icrank_es"
+    run_name = "tr1gat1win50"
 
     # -------- 路径 --------
     data_dir      = Path("./data")

@@ -10,7 +10,7 @@ from datetime import datetime
 @dataclass
 class BTRollingConfig:
     # 与训练一致的 run_name（用于定位模型目录）
-    run_name      = "tr1gat1win50"
+    run_name      = "tr1gat1win50_marginic"
 
     # 路径
     model_dir     = Path(f"./models/model_{run_name}")
@@ -45,14 +45,14 @@ class BTRollingConfig:
     # 分组与持仓控制
     top_pct        = 0.05
     bottom_pct     = 0.05
-    min_n_stocks   = 50
-    max_n_stocks   = 300
+    min_n_stocks   = 10
+    max_n_stocks   = 10
 
     # 成本与滑点（非对称）
     # 注意：bps 为基点（万分之一）。例如 3 表示万三（0.03%）
-    buy_fee_bps    = 3   # 买入手续费：万三
-    sell_fee_bps   = 8   # 卖出手续费：万八
-    slippage_bps   = 10   # 双边对称滑点：万五（买卖两侧都加）
+    buy_fee_bps    = 0.85   # 买入手续费：万三
+    sell_fee_bps   = 5.85   # 卖出手续费：万八
+    slippage_bps   = 0   # 双边对称滑点：万五（买卖两侧都加）
 
     # 过滤与样本要求（与训练一致，可按需启用）
     enable_filters     = True
@@ -80,6 +80,13 @@ class BTRollingConfig:
     # 组合权重与过滤（从代码中上移到配置）
     weight_mode: str = "equal"  # "equal" 或 "score" 或 "optimize"
     filter_negative_scores_long: bool = False
+
+    # 行业中性化开关与参数（新增）
+    neutralize_enable: bool = False               # 是否开启行业中性化
+    neutralize_method: str = "ols_resid"          # "ols_resid" 或 "group_demean"（预留）
+    neutralize_add_intercept: bool = True         # OLS 设计矩阵是否包含截距
+    neutralize_min_group_size: int = 1            # 行业内最小样本数（用于健壮性判定）
+    neutralize_clip_pct: float = 0.0              # 对原始分数 winsorize 百分位（0~0.5），0 表示不裁剪
 
     # 设备
     device         = torch.device("cuda" if torch.cuda.is_available() else "cpu")

@@ -4,10 +4,12 @@ optimize_position.py
 统一“权重生成器”的入口：根据 BT_ROLL_CFG.weight_mode 生成持仓文件。
 - weight_mode ∈ {"equal", "score", "optimize"}
 - 输入：predictions_filtered_{run_name}.parquet（池内打分）
-- 输出：positions_{run_name}_{weight_mode}.csv（仅含权重，不含 next_week_ret）
+- 输出：positions_{run_name}_{weight_mode}.csv（包含权重与审计列 score_neutral）
 说明：
 - equal/score：先选后权重（与原 btr_backtest 的等权/按分加权逻辑一致），不需要历史权重与协方差；
 - optimize：L2 风险 + L2 调仓 QP（复用 optim_l2qp.py），需要上一周权重（若无则视为0）与对角协方差。
+- 若开启行业中性化（BT_ROLL_CFG.neutralize_enable=True），将对每周分数进行横截面 OLS 残差中性化，
+  并在输出 positions 中加列 score_neutral 以便审计。
 """
 
 from pathlib import Path
@@ -17,6 +19,9 @@ import pandas as pd
 
 from backtest_rolling_config import BT_ROLL_CFG as CFG_BT
 from optim_l2qp import build_diag_cov, align_and_select, solve_portfolio_l2qp
+
+# 复用行业映射工具
+from utils import load_industry_map
 
 
 def ensure_dir(p: Path):
@@ -41,27 +46,42 @@ def _load_scores(cfg) -> pd.DataFrame:
     return df[["date", "stock", "score"]].copy()
 
 
-def _select_top(df_d: pd.DataFrame, top_pct: float, max_n: int, min_n: int, filter_negative_scores_long: bool, weight_mode: str):
-    # 先选后权重的通用选股与权重分配
-    df_d = df_d.sort_values(["score", "stock"], ascending=[False, True])
+def _select_top(df_d: pd.DataFrame, top_pct: float, max_n: int, min_n: int,
+                filter_negative_scores_long: bool, weight_mode: str, col_use: str,
+                retain_scores: bool = True):
+    # 先选后权重的通用选股与权重分配；col_use 为用于排序/权重的分数字段（可能是中性化后的）
+    df_d = df_d.sort_values([col_use, "stock"], ascending=[False, True])
     n = len(df_d)
     n_target = max(0, min(int(math.floor(n * top_pct)), int(max_n)))
     if n_target == 0 and n >= min_n:
         n_target = min(int(min_n), n)
     df_sel = df_d.head(n_target).copy()
+
     if filter_negative_scores_long:
-        df_sel = df_sel[df_sel["score"] > 0]
+        df_sel = df_sel[df_sel[col_use] > 0]
+
     if len(df_sel) < min_n:
-        return pd.DataFrame(columns=["stock", "weight", "score"])
+        # 返回空框架，包含需要的列
+        base_cols = ["stock", "weight", "score"]
+        if "score_neutral" in df_d.columns:
+            base_cols.append("score_neutral")
+        return pd.DataFrame(columns=base_cols)
+
     if weight_mode == "equal":
         w = np.full(len(df_sel), 1.0 / len(df_sel), dtype=float)
     else:
-        s = df_sel["score"].values.astype(float)
-        s = np.clip(s, 0.0, None)
+        s = df_sel[col_use].values.astype(float)
+        s = np.clip(s, 0.0, None)  # 非负化
         ssum = s.sum()
         w = (np.full(len(df_sel), 1.0 / len(df_sel), dtype=float) if ssum <= 0 else s / ssum)
+
     df_sel = df_sel.assign(weight=w)
-    return df_sel[["stock", "weight", "score"]]
+
+    # 返回时保留原 score 与 score_neutral（若有）
+    cols_out = ["stock", "weight", "score"]
+    if retain_scores and "score_neutral" in df_sel.columns:
+        cols_out.append("score_neutral")
+    return df_sel[cols_out]
 
 
 def _load_prev_weights(pos_path: Path, date: pd.Timestamp) -> pd.Series:
@@ -96,6 +116,77 @@ def _scale_scores_to_returns(z: pd.Series, target_ic: float = 0.05) -> pd.Series
     return target_ic * z_std
 
 
+def _winsorize_series(s: pd.Series, pct: float) -> pd.Series:
+    # 对分数进行对称分位裁剪；pct=0 表示无裁剪
+    pct = float(pct or 0.0)
+    if pct <= 0.0:
+        return s
+    lo = s.quantile(pct)
+    hi = s.quantile(1.0 - pct)
+    return s.clip(lower=lo, upper=hi)
+
+
+def _neutralize_week_scores(sub: pd.DataFrame, ind_map: dict, add_intercept: bool,
+                            clip_pct: float, method: str = "ols_resid") -> pd.DataFrame:
+    """
+    对单周的打分做行业中性化：返回包含新列 score_neutral 的副本。
+    - sub: 包含列 [date, stock, score]
+    - ind_map: {stock -> industry_id}
+    - method: "ols_resid"（默认）或 "group_demean"（降级兜底）
+    """
+    if sub is None or sub.empty:
+        return sub.assign(score_neutral=np.nan)
+
+    df = sub.copy()
+    # 行业ID映射
+    ind_id = df["stock"].map(lambda x: ind_map.get(str(x).strip(), None))
+    # 缺失行业归为未知ID = max_id + 1
+    max_id = max(ind_map.values()) if len(ind_map) > 0 else -1
+    unk_id = max_id + 1
+    ind_id = ind_id.fillna(unk_id).astype(int)
+    df["ind_id"] = ind_id
+
+    # 可选 winsorize
+    sc = pd.to_numeric(df["score"], errors="coerce")
+    sc = _winsorize_series(sc, pct=clip_pct)
+    df["score_w"] = sc
+
+    # 横截面 OLS 残差
+    if method == "ols_resid":
+        # one-hot 哑变量（避免稀疏行业影响；pandas.get_dummies 会自动去除缺失）
+        X = pd.get_dummies(df["ind_id"].astype(int), prefix="ind", drop_first=False)
+        if add_intercept:
+            X = pd.concat([pd.Series(1.0, index=X.index, name="intercept"), X], axis=1)
+
+        y = df["score_w"].astype(float)
+        # 过滤非有限值样本
+        mask = y.replace([np.inf, -np.inf], np.nan).notna()
+        if mask.sum() < 2 or X.shape[1] == 0:
+            # 兜底：分组去均值
+            grp_mean = df.groupby("ind_id")["score_w"].transform("mean")
+            df["score_neutral"] = (df["score_w"] - grp_mean).astype(float)
+            return df.drop(columns=["ind_id", "score_w"])
+
+        Xv = X.values.astype(float)
+        yv = y.values.astype(float)
+        # 最小二乘解
+        try:
+            beta, *_ = np.linalg.lstsq(Xv[mask.values], yv[mask.values], rcond=None)
+            yhat = Xv @ beta
+            resid = yv - yhat
+            df["score_neutral"] = resid.astype(float)
+        except Exception:
+            # 回退：分组去均值
+            grp_mean = df.groupby("ind_id")["score_w"].transform("mean")
+            df["score_neutral"] = (df["score_w"] - grp_mean).astype(float)
+    else:
+        # 直接分组去均值
+        grp_mean = df.groupby("ind_id")["score_w"].transform("mean")
+        df["score_neutral"] = (df["score_w"] - grp_mean).astype(float)
+
+    return df.drop(columns=["ind_id", "score_w"])
+
+
 def main():
     cfg = CFG_BT
     out_dir = cfg.backtest_dir
@@ -113,6 +204,16 @@ def main():
     scores_all = _load_scores(cfg)
     weeks = sorted(scores_all["date"].unique())
 
+    # 若开启行业中性化，准备行业字典
+    do_neutral = bool(getattr(cfg, "neutralize_enable", False))
+    neutral_method = str(getattr(cfg, "neutralize_method", "ols_resid")).lower()
+    add_intercept = bool(getattr(cfg, "neutralize_add_intercept", True))
+    clip_pct = float(getattr(cfg, "neutralize_clip_pct", 0.0))
+
+    ind_map = None
+    if do_neutral:
+        ind_map = load_industry_map(cfg.industry_map_file)  # {stock -> industry_id}
+
     results = []
     # 若 optimize 需要上一周权重，上一周文件路径为当前即将输出的统一文件（允许不存在）
     prev_pos_path = pos_out if pos_out.exists() else out_dir / f"positions_{cfg.run_name_out}_{weight_mode}.csv"
@@ -123,18 +224,53 @@ def main():
         if sub.empty:
             continue
 
+        # 行业中性化（如开启）
+        col_use = "score"
+        if do_neutral:
+            try:
+                sub = _neutralize_week_scores(
+                    sub=sub,
+                    ind_map=ind_map,
+                    add_intercept=add_intercept,
+                    clip_pct=clip_pct,
+                    method=neutral_method
+                )
+                # 若中性化成功，使用 score_neutral；否则仍用 score
+                if "score_neutral" in sub.columns and sub["score_neutral"].notna().any():
+                    col_use = "score_neutral"
+                else:
+                    sub["score_neutral"] = sub["score"]
+            except Exception:
+                # 强健退避：失败时保持原分数，并写一个镜像列
+                sub["score_neutral"] = sub["score"]
+                col_use = "score"
+
+        else:
+            # 未开启中性化，也输出审计列为原分数
+            sub["score_neutral"] = sub["score"]
+
         if weight_mode in ("equal", "score"):
             df_sel = _select_top(
-                sub, top_pct=float(cfg.top_pct), max_n=int(cfg.max_n_stocks), min_n=int(cfg.min_n_stocks),
+                sub.assign(score=sub["score"].astype(float)),  # 保证原列类型
+                top_pct=float(cfg.top_pct), max_n=int(cfg.max_n_stocks), min_n=int(cfg.min_n_stocks),
                 filter_negative_scores_long=bool(cfg.filter_negative_scores_long),
-                weight_mode=weight_mode
+                weight_mode=weight_mode,
+                col_use=col_use,
+                retain_scores=True
             )
             if df_sel.empty:
-                # 记空仓
+                # 当周空仓：也可选择写空记录，此处直接跳过；若需显式空仓可追加一条记录 weight=0（按需要改）
                 pass
             else:
                 for _, r in df_sel.iterrows():
-                    results.append({"date": date, "stock": str(r["stock"]), "weight": float(r["weight"]), "score": float(r["score"])})
+                    results.append({
+                        "date": date,
+                        "stock": str(r["stock"]),
+                        "weight": float(r["weight"]),
+                        "score": float(r["score"]) if pd.notna(r["score"]) else np.nan,
+                        "score_neutral": (float(r["score_neutral"]) if "score_neutral" in r and pd.notna(r["score_neutral"]) else
+                                          (float(r["score"]) if pd.notna(r["score"]) else np.nan))
+                    })
         else:
             # optimize 路径
             # 底池
@@ -144,9 +280,18 @@ def main():
             # 协方差（对角）
             rets = _load_returns_matrix(cfg, end_date=date, lookback_days=120).reindex(columns=universe)
             sigma_diag = build_diag_cov(rets).reindex(universe).fillna(rets.var().mean()).values
-            # 打分 -> 预期收益尺度
-            z_raw = pd.Series(sub["score"].values.astype(float), index=sub["stock"].astype(str).values, name="z")
+            # 打分 -> 使用中性化后的分数作为 z_raw
+            z_raw = pd.Series(
+                (sub[col_use] if col_use in sub.columns else sub["score"]).values.astype(float),
+                index=sub["stock"].astype(str).values,
+                name="z"
+            )
+            # 保存审计列（原分数与中性化分数）
+            z_audit_neu = pd.Series(sub["score_neutral"].values.astype(float), index=sub["stock"].astype(str).values)
+
+            # 归一到“预期收益尺度”
             z = _scale_scores_to_returns(z_raw, target_ic=0.05)
+
             # 单票上限
             ub = pd.Series(0.05, index=universe)
             # 对齐与裁剪（提速）
@@ -164,9 +309,15 @@ def main():
             # 回填到股票层（未入选为0）
             w_opt = pd.Series(0.0, index=universe, dtype=float)
             w_opt.loc[idx] = w_opt_vec
-            # 写入结果
+            # 写入结果（含 score 与 score_neutral 审计列）
             for s, w in w_opt.items():
-                results.append({"date": date, "stock": str(s), "weight": float(w), "score": float(z_raw.get(s, np.nan))})
+                results.append({
+                    "date": date,
+                    "stock": str(s),
+                    "weight": float(w),
+                    "score": float(sub.set_index("stock").loc[s, "score"]) if s in sub.set_index("stock").index else np.nan,
+                    "score_neutral": float(z_audit_neu.get(s, np.nan))
+                })
 
     if not results:
         raise RuntimeError("未能生成任何持仓记录，请检查打分与配置。")
@@ -174,6 +325,10 @@ def main():
     out_df = pd.DataFrame(results)
     out_df = out_df.sort_values(["date", "weight"], ascending=[True, False])
     out_df["date"] = pd.to_datetime(out_df["date"])
+    # 确保包含审计列
+    if "score_neutral" not in out_df.columns:
+        out_df["score_neutral"] = out_df["score"]
+
     out_df.to_csv(pos_out, index=False, float_format="%.8f")
     print(f"[OPT-POS] saved: {pos_out}")
 
