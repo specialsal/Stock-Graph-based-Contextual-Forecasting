@@ -50,9 +50,9 @@ class BTRollingConfig:
 
     # 成本与滑点（非对称）
     # 注意：bps 为基点（万分之一）。例如 3 表示万三（0.03%）
-    buy_fee_bps    = 0.85   # 买入手续费：万三
-    sell_fee_bps   = 5.85   # 卖出手续费：万八
-    slippage_bps   = 0   # 双边对称滑点：万五（买卖两侧都加）
+    buy_fee_bps    = 11   # 买入手续费：万三
+    sell_fee_bps   = 16   # 卖出手续费：万八
+    slippage_bps   = 5   # 双边对称滑点：万五（买卖两侧都加）
 
     # 过滤与样本要求（与训练一致，可按需启用）
     enable_filters     = True
@@ -78,16 +78,18 @@ class BTRollingConfig:
     allow_multiple_triggers_per_week: bool = True
 
     # 组合权重与过滤（从代码中上移到配置）
-    weight_mode: str = "equal"  # "equal" 或 "score" 或 "optimize"
+    weight_mode: str = "score"  # "equal" 或 "score" 或 "optimize"
     filter_negative_scores_long: bool = False
 
     # 行业中性化开关与参数（新增）
-    neutralize_enable: bool = False               # 是否开启行业中性化
+    neutralize_enable: bool = True               # 是否开启行业中性化
     neutralize_method: str = "ols_resid"          # "ols_resid" 或 "group_demean"（预留）
     neutralize_add_intercept: bool = True         # OLS 设计矩阵是否包含截距
     neutralize_min_group_size: int = 1            # 行业内最小样本数（用于健壮性判定）
     neutralize_clip_pct: float = 0.0              # 对原始分数 winsorize 百分位（0~0.5），0 表示不裁剪
 
+    # 调仓频率（新增）：1=每周；2=双周；3=三周
+    rebalance_every_k: int = 3
     # 设备
     device         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 

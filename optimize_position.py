@@ -10,6 +10,10 @@ optimize_position.py
 - optimize：L2 风险 + L2 调仓 QP（复用 optim_l2qp.py），需要上一周权重（若无则视为0）与对角协方差。
 - 若开启行业中性化（BT_ROLL_CFG.neutralize_enable=True），将对每周分数进行横截面 OLS 残差中性化，
   并在输出 positions 中加列 score_neutral 以便审计。
+
+新增：
+- 支持低频调仓：通过 backtest_rolling_config.BT_ROLL_CFG.rebalance_every_k（1/2/3）。
+  仅在“调仓周”重算权重；非调仓周直接沿用上一周权重，不做QP、不变更成分。
 """
 
 from pathlib import Path
@@ -214,11 +218,19 @@ def main():
     if do_neutral:
         ind_map = load_industry_map(cfg.industry_map_file)  # {stock -> industry_id}
 
+    # 调仓频率（1=每周；2=双周；3=三周）
+    k = max(1, int(getattr(cfg, "rebalance_every_k", 1)))
+
     results = []
     # 若 optimize 需要上一周权重，上一周文件路径为当前即将输出的统一文件（允许不存在）
     prev_pos_path = pos_out if pos_out.exists() else out_dir / f"positions_{cfg.run_name_out}_{weight_mode}.csv"
 
-    for date in weeks:
+    # 用于非调仓周直接沿用上一周权重（避免每次都从磁盘加载）
+    last_week_weights = None  # pd.Series(index=stock, dtype=float)
+    last_week_scores = None   # pd.Series(index=stock, dtype=float)
+    last_week_scores_neu = None  # pd.Series(index=stock, dtype=float)
+
+    for idx, date in enumerate(weeks):
         date = pd.Timestamp(date)
         sub = scores_all[scores_all["date"] == date].copy()
         if sub.empty:
@@ -235,88 +247,113 @@ def main():
                     clip_pct=clip_pct,
                     method=neutral_method
                 )
-                # 若中性化成功，使用 score_neutral；否则仍用 score
                 if "score_neutral" in sub.columns and sub["score_neutral"].notna().any():
                     col_use = "score_neutral"
                 else:
                     sub["score_neutral"] = sub["score"]
             except Exception:
-                # 强健退避：失败时保持原分数，并写一个镜像列
                 sub["score_neutral"] = sub["score"]
                 col_use = "score"
-
         else:
-            # 未开启中性化，也输出审计列为原分数
             sub["score_neutral"] = sub["score"]
 
-        if weight_mode in ("equal", "score"):
-            df_sel = _select_top(
-                sub.assign(score=sub["score"].astype(float)),  # 保证原列类型
-                top_pct=float(cfg.top_pct), max_n=int(cfg.max_n_stocks), min_n=int(cfg.min_n_stocks),
-                filter_negative_scores_long=bool(cfg.filter_negative_scores_long),
-                weight_mode=weight_mode,
-                col_use=col_use,
-                retain_scores=True
-            )
-            if df_sel.empty:
-                # 当周空仓：也可选择写空记录，此处直接跳过；若需显式空仓可追加一条记录 weight=0（按需要改）
-                pass
-            else:
-                for _, r in df_sel.iterrows():
+        is_rebalance = ((idx % k) == 0)
+
+        if not is_rebalance:
+            # 非调仓周：沿用上一周权重。如果上一周权重为空，回退为调仓
+            if last_week_weights is None or last_week_weights.empty:
+                is_rebalance = True
+
+        if is_rebalance:
+            # 计算当周权重
+            if weight_mode in ("equal", "score"):
+                df_sel = _select_top(
+                    sub.assign(score=sub["score"].astype(float)),
+                    top_pct=float(cfg.top_pct), max_n=int(cfg.max_n_stocks), min_n=int(cfg.min_n_stocks),
+                    filter_negative_scores_long=bool(cfg.filter_negative_scores_long),
+                    weight_mode=weight_mode,
+                    col_use=col_use,
+                    retain_scores=True
+                )
+                if df_sel.empty:
+                    # 本周空仓：不写入记录
+                    last_week_weights = None
+                    last_week_scores = None
+                    last_week_scores_neu = None
+                    continue
+                # 写入并缓存本周结果
+                w_ser = pd.Series(df_sel["weight"].values.astype(float), index=df_sel["stock"].astype(str).values)
+                last_week_weights = w_ser.copy()
+                last_week_scores = pd.Series(df_sel["score"].values.astype(float), index=df_sel["stock"].astype(str).values)
+                if "score_neutral" in df_sel.columns:
+                    last_week_scores_neu = pd.Series(df_sel["score_neutral"].values.astype(float), index=df_sel["stock"].astype(str).values)
+                else:
+                    last_week_scores_neu = last_week_scores.copy()
+
+                for s, w in w_ser.items():
                     results.append({
                         "date": date,
-                        "stock": str(r["stock"]),
-                        "weight": float(r["weight"]),
-                        "score": float(r["score"]) if pd.notna(r["score"]) else np.nan,
-                        "score_neutral": (float(r["score_neutral"]) if "score_neutral" in r and pd.notna(r["score_neutral"]) else
-                                          (float(r["score"]) if pd.notna(r["score"]) else np.nan))
+                        "stock": str(s),
+                        "weight": float(w),
+                        "score": float(last_week_scores.get(s, np.nan)),
+                        "score_neutral": float(last_week_scores_neu.get(s, np.nan))
                     })
+
+            else:
+                # optimize 路径（调仓周才做QP）
+                universe = sub["stock"].astype(str).tolist()
+                w_prev = _load_prev_weights(prev_pos_path, date)
+                rets = _load_returns_matrix(cfg, end_date=date, lookback_days=120).reindex(columns=universe)
+                sigma_diag = build_diag_cov(rets).reindex(universe).fillna(rets.var().mean()).values
+
+                z_raw = pd.Series(
+                    (sub[col_use] if col_use in sub.columns else sub["score"]).values.astype(float),
+                    index=sub["stock"].astype(str).values,
+                    name="z"
+                )
+                z_audit_neu = pd.Series(sub["score_neutral"].values.astype(float), index=sub["stock"].astype(str).values)
+                z = _scale_scores_to_returns(z_raw, target_ic=0.05)
+
+                ub = pd.Series(0.05, index=universe)
+                idx_keep, z_vec, wprev_vec, ub_vec = align_and_select(universe=universe, z=z, w_prev=w_prev, ub=ub, top_n=300)
+                pos_index = {s: k for k, s in enumerate(universe)}
+                sigma_vec = np.asarray(sigma_diag)[[pos_index[s] for s in idx_keep]]
+
+                w_opt_vec, diag = solve_portfolio_l2qp(
+                    z=z_vec, sigma_diag=sigma_vec, w_prev=wprev_vec, ub=ub_vec,
+                    lambda_risk=5.0, gamma_tc=10.0,
+                    full_invest=False, tau2_budget=None,
+                    solver="OSQP", verbose=False
+                )
+                w_opt = pd.Series(0.0, index=universe, dtype=float)
+                w_opt.loc[idx_keep] = w_opt_vec
+
+                # 缓存当周权重与审计列
+                last_week_weights = w_opt.copy()
+                last_week_scores = z_raw.copy()
+                last_week_scores_neu = z_audit_neu.copy()
+
+                for s, w in w_opt.items():
+                    results.append({
+                        "date": date,
+                        "stock": str(s),
+                        "weight": float(w),
+                        "score": float(z_raw.get(s, np.nan)),
+                        "score_neutral": float(z_audit_neu.get(s, np.nan))
+                    })
+
         else:
-            # optimize 路径
-            # 底池
-            universe = sub["stock"].astype(str).tolist()
-            # 上一周权重
-            w_prev = _load_prev_weights(prev_pos_path, date)
-            # 协方差（对角）
-            rets = _load_returns_matrix(cfg, end_date=date, lookback_days=120).reindex(columns=universe)
-            sigma_diag = build_diag_cov(rets).reindex(universe).fillna(rets.var().mean()).values
-            # 打分 -> 使用中性化后的分数作为 z_raw
-            z_raw = pd.Series(
-                (sub[col_use] if col_use in sub.columns else sub["score"]).values.astype(float),
-                index=sub["stock"].astype(str).values,
-                name="z"
-            )
-            # 保存审计列（原分数与中性化分数）
-            z_audit_neu = pd.Series(sub["score_neutral"].values.astype(float), index=sub["stock"].astype(str).values)
-
-            # 归一到“预期收益尺度”
-            z = _scale_scores_to_returns(z_raw, target_ic=0.05)
-
-            # 单票上限
-            ub = pd.Series(0.05, index=universe)
-            # 对齐与裁剪（提速）
-            idx, z_vec, wprev_vec, ub_vec = align_and_select(universe=universe, z=z, w_prev=w_prev, ub=ub, top_n=300)
-            # 对齐协方差
-            pos_index = {s: k for k, s in enumerate(universe)}
-            sigma_vec = np.asarray(sigma_diag)[[pos_index[s] for s in idx]]
-            # 求解 QP
-            w_opt_vec, diag = solve_portfolio_l2qp(
-                z=z_vec, sigma_diag=sigma_vec, w_prev=wprev_vec, ub=ub_vec,
-                lambda_risk=5.0, gamma_tc=10.0,
-                full_invest=False, tau2_budget=None,
-                solver="OSQP", verbose=False
-            )
-            # 回填到股票层（未入选为0）
-            w_opt = pd.Series(0.0, index=universe, dtype=float)
-            w_opt.loc[idx] = w_opt_vec
-            # 写入结果（含 score 与 score_neutral 审计列）
-            for s, w in w_opt.items():
+            # 非调仓周：沿用上一周权重与审计分数（不做任何重新计算/选股/QP）
+            # last_week_weights 至少非空
+            for s, w in last_week_weights.items():
                 results.append({
                     "date": date,
                     "stock": str(s),
                     "weight": float(w),
-                    "score": float(sub.set_index("stock").loc[s, "score"]) if s in sub.set_index("stock").index else np.nan,
-                    "score_neutral": float(z_audit_neu.get(s, np.nan))
+                    "score": float(last_week_scores.get(s, np.nan)) if last_week_scores is not None else np.nan,
+                    "score_neutral": float(last_week_scores_neu.get(s, np.nan)) if last_week_scores_neu is not None else (
+                        float(last_week_scores.get(s, np.nan)) if last_week_scores is not None else np.nan
+                    )
                 })
 
     if not results:
