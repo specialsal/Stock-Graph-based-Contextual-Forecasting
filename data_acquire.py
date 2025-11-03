@@ -406,12 +406,12 @@ def update_industry_and_style():
     write_csv(stock_sector, out_style_path, encoding='gbk')
 
     # 生成映射（覆盖）
-    pd.read_csv(out_style_path, encoding='gbk')[['order_book_id', 'style_sector_name']] \
-        .rename(columns={'style_sector_name': 'sector'}) \
+    pd.read_csv(out_style_path, encoding='gbk')[['order_book_id', 'style_sector_name','industry_chain_sector_name']] \
+        .rename(columns={'style_sector_name': 'sector','industry_chain_sector_name': 'chain_sector'}) \
         .to_csv(os.path.join(DATA_PATH, 'stock_style_map.csv'), index=False, encoding='gbk')
 
-    pd.read_csv(out_ind_path, encoding='gbk')[['order_book_id', 'first_industry_name']] \
-        .rename(columns={'first_industry_name': 'industry'}) \
+    pd.read_csv(out_ind_path, encoding='gbk')[['order_book_id', 'first_industry_name','second_industry_name']] \
+        .rename(columns={'first_industry_name': 'industry','second_industry_name': 'industry2'}) \
         .to_csv(os.path.join(DATA_PATH, 'stock_industry_map.csv'), index=False, encoding='gbk')
 
 
@@ -668,11 +668,11 @@ def main():
         selected_columns.to_csv('backtest_rolling/others/500_index_nav.csv', index=False)
 
     # 11) 更新黄金ETF
-    print('更新黄金ETF')
-    gold_etf = ak.fund_etf_hist_em(symbol="159934", period="daily", start_date="20100101", end_date=date.today().strftime("%Y%m%d"), adjust="qfq")
-    gold_etf = gold_etf[['日期','开盘','收盘']]
-    gold_etf.columns = ['date','open','close']
-    gold_etf.to_parquet('data/raw/gold_etf_day.parquet')
+    # print('更新黄金ETF')
+    # gold_etf = ak.fund_etf_hist_em(symbol="159934", period="daily", start_date="20100101", end_date=date.today().strftime("%Y%m%d"), adjust="qfq")
+    # gold_etf = gold_etf[['日期','开盘','收盘']]
+    # gold_etf.columns = ['date','open','close']
+    # gold_etf.to_parquet('data/raw/gold_etf_day.parquet')
 
 
 if __name__ == '__main__':

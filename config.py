@@ -2,12 +2,10 @@
 # coding: utf-8
 """
 全局配置 —— RankNet_margin(cost=m) + 精简日志版本
-修改点：
-- 去掉 ranking_weight 及所有混合损失逻辑；
-- 新增 pairwise margin 的常数参数 pair_margin_m 与成对采样数 pair_num_pairs；
-- 日志只保留 pairwise_margin_loss 与 ic_rank；
-- 早停仍以验证集 RankIC 为判据；
-- 其它参数保持一致。
+本版变更：
+- 移除 graph_type 与所有 mean 图相关开关，仅保留 GAT。
+- 新增 style_map_file（chain_sector 嵌入来源）、chain_emb 维度。
+- 行业图固定为 hybrid：industry2 与 industry 两路 GAT 聚合并融合（无开关）。
 """
 import torch, random, numpy as np
 from dataclasses import dataclass
@@ -17,7 +15,7 @@ from datetime import datetime
 @dataclass
 class Config:
     # -------- 运行命名（影响模型输出路径）--------
-    run_name = "tr1gat1win50_margin_m0"
+    run_name = "tr1gat1win50_margin_m0_hybrid2graph"
 
     # -------- 路径 --------
     data_dir      = Path("./data")
@@ -33,7 +31,8 @@ class Config:
     index_day_file     = raw_dir / "index_price_day.parquet"
     style_day_file     = raw_dir / "sector_price_day.parquet"
     trading_day_file   = raw_dir / "trading_day.csv"
-    industry_map_file  = raw_dir / "stock_industry_map.csv"
+    industry_map_file  = raw_dir / "stock_industry_map.csv"   # 含 industry, industry2
+    style_map_file     = raw_dir / "stock_style_map.csv"      # 含 sector, chain_sector
     stock_info_file     = raw_dir / "stock_info.csv"
     is_suspended_file   = raw_dir / "is_suspended.csv"
     is_st_file          = raw_dir / "is_st_stock.csv"
@@ -63,11 +62,11 @@ class Config:
 
     # -------- 模型超参 --------
     hidden        = 64
-    ind_emb       = 16
+    ind_emb       = 16         # 若不区分，可与 chain_emb 相同
+    chain_emb     = 16         # chain_sector 嵌入维度
     ctx_dim       = 21
     tr_layers     = 1
-    gat_layers    = 1
-    graph_type    = "gat"
+    gat_layers    = 1          # 每路 GAT 层数（industry 与 industry2 各用同样层数）
     lr            = 1e-4
     weight_decay  = 1e-2
 
@@ -86,8 +85,8 @@ class Config:
     print_step_interval = 10
 
     # -------- Pairwise RankNet (margin) 参数 --------
-    pair_margin_m  = 0   # 常数 margin（约 25 bps，周频）
-    pair_num_pairs = 4096     # 每步随机采样的成对数量
+    pair_margin_m  = 0       # 常数 margin（可设 0, 0.0025 等）
+    pair_num_pairs = 4096    # 每步随机采样的成对数量
 
     # -------- 早停参数（以验证集 ic_rank 为唯一判据）--------
     early_stop_min_epochs  = 3
