@@ -17,7 +17,7 @@ from datetime import datetime
 @dataclass
 class Config:
     # -------- 运行命名（影响模型输出路径）--------
-    run_name = "tr1gat1win50"
+    run_name = "tr1gat1win50_margin_m0"
 
     # -------- 路径 --------
     data_dir      = Path("./data")
@@ -86,7 +86,7 @@ class Config:
     print_step_interval = 10
 
     # -------- Pairwise RankNet (margin) 参数 --------
-    pair_margin_m  = 0.0025   # 常数 margin（约 25 bps，周频）
+    pair_margin_m  = 0   # 常数 margin（约 25 bps，周频）
     pair_num_pairs = 4096     # 每步随机采样的成对数量
 
     # -------- 早停参数（以验证集 ic_rank 为唯一判据）--------

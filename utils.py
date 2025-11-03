@@ -42,6 +42,14 @@ def load_calendar(csv_file: Path) -> pd.DatetimeIndex:
     dates = pd.read_csv(csv_file, header=None, skiprows=1).iloc[:, 1]
     return pd.DatetimeIndex(sorted(pd.to_datetime(dates, format='%Y-%m-%d').unique()))
 
+def get_next_trading_day(date_str,csv_file: Path):
+    trading_days = load_calendar(csv_file)
+    input_date = pd.to_datetime(date_str)
+
+    current_index = trading_days.get_loc(input_date)
+    
+    return trading_days[current_index + 1].strftime('%Y-%m-%d')
+
 def weekly_fridays(calendar: pd.DatetimeIndex) -> pd.DatetimeIndex:
     df = pd.DataFrame({"d": calendar})
     df['w'] = df['d'].dt.to_period('W')

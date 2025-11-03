@@ -1,25 +1,30 @@
 # coding: utf-8
 """
-btr_backtest.py
-读取 positions_{run_name}_{weight_mode}.csv + 原始日线，构建周度组合净值：
-- 调仓周：按 O2C 口径并在价格层计入单股买卖成本/滑点；
-- 非调仓周：按 C2C 口径且不计任何交易成本（真实“持有不过度交易”）。
-- 写 backtest_rolling/{run_name}/nav_{run_name}.csv（不带 weight_mode 后缀）
+btr_backtest.py（日度版，支持一次性止盈/止损 + 交易记录输出）
+读取日度持仓 positions_{run_name_out}_{weight_mode}.csv + 原始日线，生成“日度净值”与成交记录：
+- 新增：stock_trades_{run_name_out}.csv（列：date,stock,action,entry_price,exec_price）
 
-调仓周识别（基于持仓变化）：
-- 第一个有持仓的周视为调仓周；
-- 后续周：若本周与上周的股票集合或任意权重有显著变化（阈值 eps）则为调仓周，否则为非调仓周。
+成交事件定义：
+- BUY: 当日目标从无到有，按开盘买入，exec_price=O*(1+买入成本)，entry_price=当日开盘裸价O
+- SELL: 当日目标从有到无，未触发止盈/止损，按开盘卖出，exec_price=O*(1-卖出成本)，entry_price=该轮首次入场的开盘裸价
+- TP: 止盈触发清仓，exec_price=entry_price*(1+tp_ratio)*(1-卖出成本)
+- SL: 止损触发清仓，exec_price=entry_price*(1-sl_ratio)*(1-卖出成本)
+
+收益口径保持原先：
+- 新增：O(今, 含买入成本)→C(今)
+- 存续：C(昨)→C(今)
+- 减仓/清仓：C(昨)→O(今, 含卖出成本)
+- 止盈/止损：C(昨)→触发执行价(含卖出成本)
 """
 
-import math
 from pathlib import Path
-from typing import Dict, Tuple, Optional
+from typing import Optional, Dict
 
 import numpy as np
 import pandas as pd
 
 from backtest_rolling_config import BT_ROLL_CFG
-from utils import load_calendar, weekly_fridays
+from utils import load_calendar
 
 
 def ensure_dir(p: Path):
@@ -36,108 +41,16 @@ def _cost_terms_from_cfg():
 
 
 def _build_pivots(price_df: pd.DataFrame):
-    """构造 open/high/low/close 的宽表（index=date, columns=stock）"""
     close_pivot = price_df["close"].unstack(0).sort_index()
     open_pivot  = price_df["open"].unstack(0).sort_index()
     high_pivot  = price_df["high"].unstack(0).sort_index()
     low_pivot   = price_df["low"].unstack(0).sort_index()
-    return open_pivot, high_pivot, low_pivot, close_pivot
+    return open_pivot, close_pivot, high_pivot, low_pivot
 
 
-def _align_last(avail_idx: pd.DatetimeIndex, target: pd.Timestamp) -> Optional[pd.Timestamp]:
-    """对齐至不晚于 target 的最后一个交易日"""
-    ok = avail_idx[avail_idx <= target]
-    return ok[-1] if len(ok) > 0 else None
-
-
-def _week_ret_o2c_with_cost(open_pv: pd.DataFrame, close_pv: pd.DataFrame,
-                            f0: pd.Timestamp, f1: pd.Timestamp,
-                            buy_cost: float, sell_cost: float) -> Optional[pd.Series]:
-    """
-    调仓周：O2C 含成本。返回 Series(index=stock)。
-    """
-    avail = close_pv.index
-    d0 = _align_last(avail, f0)
-    d1 = _align_last(avail, f1)
-    if d0 is None or d1 is None:
-        return None
-
-    # 起点为 d0 的下一交易日
-    pos = avail.get_indexer([d0])[0]
-    if pos < 0 or pos + 1 >= len(avail):
-        return None
-    d_start = avail[pos + 1]
-    if d_start > d1:
-        return None
-
-    try:
-        O0 = open_pv.loc[d_start]
-        C1 = close_pv.loc[d1]
-    except KeyError:
-        return None
-
-    O0_eff = O0 * (1.0 + buy_cost)
-    C1_eff = C1 * (1.0 - sell_cost)
-    ret = (C1_eff / O0_eff - 1.0).replace([np.inf, -np.inf], np.nan)
-    return ret
-
-
-def _week_ret_c2c_nocost(close_pv: pd.DataFrame,
-                         f_prev: pd.Timestamp, f_cur: pd.Timestamp) -> Optional[pd.Series]:
-    """
-    非调仓周：C2C 不计成本。返回 Series(index=stock)。
-    """
-    avail = close_pv.index
-    d0 = _align_last(avail, f_prev)
-    d1 = _align_last(avail, f_cur)
-    if d0 is None or d1 is None or d1 <= d0:
-        return None
-    try:
-        C0 = close_pv.loc[d0]
-        C1 = close_pv.loc[d1]
-    except KeyError:
-        return None
-    ret = (C1 / C0 - 1.0).replace([np.inf, -np.inf], np.nan)
-    return ret
-
-
-def _is_rebalance_week(w_prev: Optional[pd.Series],
-                       w_curr: pd.Series,
-                       eps: float = 1e-9) -> bool:
-    """
-    基于“持仓变化”识别调仓周：
-    - 第一个有持仓周或上周无权重视为调仓周；
-    - 股票集合变化或任意权重变化超过阈值则为调仓周；否则非调仓周。
-    参数：
-      w_prev/w_curr: Series(index=stock, value=weight)，已归一化或原始权重均可
-    """
-    if w_curr is None or w_curr.empty:
-        return False
-    if (w_prev is None) or (w_prev.empty):
-        return True  # 第一周有持仓 => 调仓
-
-    # 集合差异
-    set_prev = set(w_prev.index)
-    set_curr = set(w_curr.index)
-    if set_prev != set_curr:
-        return True
-
-    # 权重差异（对齐比较）
-    w_prev2 = w_prev.reindex(w_curr.index).fillna(0.0).values
-    w_curr2 = w_curr.fillna(0.0).values
-    diff = np.abs(w_curr2 - w_prev2).max() if len(w_curr2) > 0 else 0.0
-    return bool(diff > eps)
-
-
-def _pivot_weights_for_week(positions: pd.DataFrame, date: pd.Timestamp) -> pd.Series:
-    """
-    从明细中抽取当周权重向量 Series(index=stock, value=weight)；剔除非有限值与零权重。
-    """
+def _pivot_weights_for_day(positions: pd.DataFrame, date: pd.Timestamp) -> pd.Series:
     g = positions[positions["date"] == date]
-    if g.empty:
-        return pd.Series(dtype=float)
     s = pd.Series(g["weight"].values.astype(float), index=g["stock"].astype(str).values)
-    s = s.replace([np.inf, -np.inf], np.nan).dropna()
     s = s[s != 0.0]
     return s
 
@@ -147,146 +60,230 @@ def main():
     out_dir = cfg.backtest_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    weight_mode = str(getattr(cfg, "weight_mode", "equal")).lower()
-    # 输入持仓：positions_{run_name}_{weight_mode}.csv
+    weight_mode = str(getattr(cfg, "weight_mode", "score")).lower()
     pos_path = out_dir / f"positions_{cfg.run_name_out}_{weight_mode}.csv"
     if not pos_path.exists():
-        raise FileNotFoundError(f"未找到持仓文件：{pos_path}。请先运行 optimize_position.py 生成持仓。")
+        raise FileNotFoundError(f"未找到持仓文件：{pos_path}")
 
+    # 止盈/止损参数
+    enable_stops = bool(getattr(cfg, "enable_intraweek_stops", False))
+    tp_ratio = float(getattr(cfg, "tp_price_ratio", 0.06))
+    sl_ratio = float(getattr(cfg, "sl_price_ratio", 0.06))
+
+    # 读取日度持仓
     positions = pd.read_csv(pos_path)
-    if positions.empty:
-        raise RuntimeError(f"持仓文件为空：{pos_path}")
-    if not {"date", "stock", "weight"}.issubset(set(positions.columns)):
-        raise RuntimeError("持仓文件缺少必要列：需要包含 date, stock, weight")
-
-    # 规范
     positions["date"] = pd.to_datetime(positions["date"])
     positions = positions.sort_values(["date", "stock"])
-    # 限定回测区间（防御）
     positions = positions[(positions["date"] >= pd.Timestamp(cfg.bt_start_date)) &
                           (positions["date"] <= pd.Timestamp(cfg.bt_end_date))]
 
-    # 价格日线
+    # 读取日线
     price_df = pd.read_parquet(cfg.price_day_file)
     if not isinstance(price_df.index, pd.MultiIndex):
         price_df = price_df.set_index(["order_book_id", "date"]).sort_index()
-    need_cols = ["open", "high", "low", "close"]
-    lack = [c for c in need_cols if c not in price_df.columns]
-    if lack:
-        raise RuntimeError(f"price_day_file 缺少必要列：{lack}")
+    needed_cols = {"open", "close", "high", "low"}
+    if not needed_cols.issubset(price_df.columns):
+        raise RuntimeError("price_day_file 需包含 open/close/high/low 列")
 
-    open_pivot, high_pivot, low_pivot, close_pivot = _build_pivots(price_df)
+    open_pv, close_pv, high_pv, low_pv = _build_pivots(price_df)
 
-    # 周锚
-    cal = load_calendar(cfg.trading_day_file)
-    fridays_all = weekly_fridays(cal)
-
-    # 仅保留持仓出现的周与可用的周五锚点的交集，且在回测区间内
-    weeks = sorted(positions["date"].unique())
-    weeks = [pd.Timestamp(d) for d in weeks if (d in fridays_all)]
-    weeks = [d for d in weeks if (d >= pd.Timestamp(cfg.bt_start_date)) and (d <= pd.Timestamp(cfg.bt_end_date))]
-    if len(weeks) < 1:
-        print("[BTR-BT] 有效周度样本不足，退出。")
+    # 交易日序列
+    days = pd.DatetimeIndex(sorted(positions["date"].unique()))
+    days = days.intersection(open_pv.index).intersection(close_pv.index)
+    if len(days) == 0:
+        print("[BTR-BT] 无有效交易日")
         return
 
     buy_cost, sell_cost = _cost_terms_from_cfg()
 
-    # 遍历周，先判定调仓与否，再据此选择 O2C(含成本) 或 C2C(无成本) 的单股收益
     recs = []
     stock_recs = []
+    trade_recs = []  # 新增：交易事件记录
 
-    prev_weights_vec: Optional[pd.Series] = None  # index=stock, value=weight
-    for i, d_cur in enumerate(weeks):
-        # 当周权重向量
-        w_cur = _pivot_weights_for_week(positions, d_cur)
+    # 每只股票的“本轮入场价（裸价O）”与“是否已触发”
+    entry_state: Dict[str, Dict[str, float]] = {}
 
-        # 判定是否调仓周
-        is_rebal = _is_rebalance_week(prev_weights_vec, w_cur, eps=1e-9)
+    prev_w: Optional[pd.Series] = None  # 昨日权重
 
-        # 找下一周锚点（用于收益窗口右端）
-        if i < len(weeks) - 1:
-            d_next = weeks[i + 1]
-        else:
-            # 最后一周：用 fridays_all 中 d_cur 之后的下一个周五作为右端（若存在）
-            idx = fridays_all.get_indexer([d_cur])[0]
-            d_next = fridays_all[idx + 1] if (idx >= 0 and idx + 1 < len(fridays_all)) else None
+    for i, d in enumerate(days):
+        w_today_target = _pivot_weights_for_day(positions, d)
+        w_yest = prev_w
 
-        if d_next is None:
-            # 无法构造下一周收益，跳过
-            prev_weights_vec = w_cur
-            continue
+        set_today = set(w_today_target.index)
+        set_yest = set() if (w_yest is None or w_yest.empty) else set(w_yest.index)
 
-        # 选择收益口径
-        if is_rebal:
-            # 调仓：O2C 含成本
-            ret_s = _week_ret_o2c_with_cost(open_pivot, close_pivot, d_cur, d_next, buy_cost, sell_cost)
-        else:
-            # 非调仓：C2C 无成本（从上一周末收盘到本周末收盘）
-            ret_s = _week_ret_c2c_nocost(close_pivot, d_cur, d_next)
+        C_t = close_pv.loc[d]
+        O_t = open_pv.loc[d]
+        H_t = high_pv.loc[d]
+        L_t = low_pv.loc[d]
+        d_prev = days[i - 1] if i > 0 else None
+        C_prev = close_pv.loc[d_prev] if d_prev is not None else None
 
-        if ret_s is None or ret_s.empty or w_cur is None or w_cur.empty:
-            # 无有效收益或当周空仓
-            recs.append({"date": d_cur, "ret_long": 0.0, "ret_short": 0.0, "ret_total": 0.0, "n_long": 0})
-            prev_weights_vec = w_cur
-            continue
+        # 新增集合
+        A_add = list(set_today - set_yest)
+        Y_all = list(set_yest)
 
-        # 对齐到持仓股票
-        sub = w_cur.to_frame(name="weight").merge(ret_s.rename("ret"), left_index=True, right_index=True, how="inner")
-        sub = sub.replace([np.inf, -np.inf], np.nan).dropna(subset=["weight", "ret"])
-        if sub.empty:
-            recs.append({"date": d_cur, "ret_long": 0.0, "ret_short": 0.0, "ret_total": 0.0, "n_long": 0})
-            prev_weights_vec = w_cur
-            continue
+        # 1) 当日新入场：记录 entry_price（裸价O），并记录 BUY 交易
+        if A_add:
+            for s in A_add:
+                o_raw = float(O_t.get(s, np.nan))
+                if np.isfinite(o_raw):
+                    entry_state[s] = {"entry_price": o_raw, "triggered": 0.0}
+                    exec_price = o_raw * (1.0 + buy_cost)
+                    trade_recs.append({
+                        "date": d, "stock": s, "action": "BUY",
+                        "entry_price": o_raw, "exec_price": exec_price
+                    })
 
-        # 周收益（多头）：权重 × 单股周收益
-        sub["contribution"] = sub["weight"].astype(float) * sub["ret"].astype(float)
+        # 2) 存量持有先检查止损->止盈
+        stopped_symbols = set()
+        contrib_stops_total = 0.0
+        if enable_stops and Y_all and C_prev is not None:
+            for s in Y_all:
+                state = entry_state.get(s)
+                if state is None:
+                    # 兜底：若状态丢失，用当日开盘作为入场基准
+                    entry_state[s] = {"entry_price": float(O_t.get(s, np.nan)), "triggered": 0.0}
+                    state = entry_state[s]
+                if state["triggered"]:
+                    continue
+                # 仅对昨持有且今仍持有者检查
+                if (s in set_yest) and (s in set_today) and np.isfinite(state["entry_price"]):
+                    entry_price = float(state["entry_price"])
+                    hi = float(H_t.get(s, np.nan))
+                    lo = float(L_t.get(s, np.nan))
+                    if not np.isfinite(hi) or not np.isfinite(lo):
+                        continue
 
-        # 记录股票明细
-        for s, r in sub.iterrows():
-            stock_recs.append({
-                "date": d_cur,
-                "stock": str(s),
-                "weight": float(r["weight"]),
-                "ret": float(r["ret"]),
-                "contribution": float(r["contribution"])
-            })
+                    sl_price = entry_price * (1.0 - sl_ratio)
+                    tp_price = entry_price * (1.0 + tp_ratio)
 
-        long_ret = float(sub["contribution"].sum())
-        total = float(cfg.long_weight) * long_ret  # 仅多头
+                    trig = None
+                    exec_price = None
+                    if lo <= sl_price:
+                        trig = "SL"
+                        exec_price = sl_price * (1.0 - sell_cost)
+                    elif hi >= tp_price:
+                        trig = "TP"
+                        exec_price = tp_price * (1.0 - sell_cost)
+
+                    if trig is not None:
+                        # 用昨日权重全清仓，收益以 C_prev -> exec_price
+                        w_prev = float(w_yest.get(s, 0.0)) if (w_yest is not None) else 0.0
+                        if w_prev > 0 and C_prev is not None and np.isfinite(exec_price):
+                            r = float(exec_price / float(C_prev.get(s, np.nan)) - 1.0)
+                            contrib = w_prev * r
+                            contrib_stops_total += contrib
+                            stock_recs.append({"date": d, "stock": s, "weight": w_prev, "ret": r, "contribution": contrib})
+                            # 记录交易
+                            trade_recs.append({
+                                "date": d, "stock": s, "action": trig,
+                                "entry_price": entry_price, "exec_price": exec_price
+                            })
+                        entry_state[s]["triggered"] = 1.0
+                        stopped_symbols.add(s)
+
+        # 3) 其余路径：新增、存续、减持
+        A_add_effective = [s for s in A_add if s not in stopped_symbols]
+        S_keep = list((set_yest & set_today) - stopped_symbols)
+        R_reduce = list((set_yest - set_today) - stopped_symbols)
+
+        # 收益段
+        ret_add = pd.Series(dtype=float)
+        if A_add_effective:
+            O_eff = (O_t.loc[A_add_effective] * (1.0 + buy_cost)).astype(float)
+            ret_add = (C_t.loc[A_add_effective].astype(float) / O_eff - 1.0)
+
+        ret_keep = pd.Series(dtype=float)
+        if S_keep and C_prev is not None:
+            ret_keep = (C_t.loc[S_keep].astype(float) / C_prev.loc[S_keep].astype(float) - 1.0)
+
+        ret_reduce = pd.Series(dtype=float)
+        if R_reduce and C_prev is not None:
+            O_out = (O_t.loc[R_reduce] * (1.0 - sell_cost)).astype(float)
+            ret_reduce = (O_out / C_prev.loc[R_reduce].astype(float) - 1.0)
+
+        # 贡献
+        contrib_add = (w_today_target.reindex(A_add_effective).fillna(0.0) * ret_add).sum() if len(ret_add) else 0.0
+        contrib_keep = (w_today_target.reindex(S_keep).fillna(0.0) * ret_keep).sum() if len(ret_keep) else 0.0
+        contrib_reduce = 0.0
+        if len(ret_reduce):
+            contrib_reduce = (w_yest.reindex(R_reduce).fillna(0.0) * ret_reduce).sum() if (w_yest is not None) else 0.0
+
+        day_ret = float(contrib_stops_total + contrib_add + contrib_keep + contrib_reduce)
+
+        # n_long：以日末目标剔除被 stop 的近似
+        n_long = int(len(set_today - stopped_symbols))
+
         recs.append({
-            "date": d_cur,
-            "ret_long": long_ret,
+            "date": d,
+            "ret_long": day_ret,
             "ret_short": 0.0,
-            "ret_total": total,
-            "n_long": int(sub.shape[0])
+            "ret_total": day_ret,
+            "n_long": n_long
         })
 
-        prev_weights_vec = w_cur
+        # 明细记录
+        if len(ret_add):
+            for s, r in ret_add.items():
+                w = float(w_today_target.get(s, 0.0))
+                stock_recs.append({"date": d, "stock": s, "weight": w, "ret": float(r), "contribution": float(w * r)})
+        if len(ret_keep):
+            for s, r in ret_keep.items():
+                w = float(w_today_target.get(s, 0.0))
+                stock_recs.append({"date": d, "stock": s, "weight": w, "ret": float(r), "contribution": float(w * r)})
+        if len(ret_reduce) and (w_yest is not None):
+            for s, r in ret_reduce.items():
+                w = float(w_yest.get(s, 0.0))
+                stock_recs.append({"date": d, "stock": s, "weight": w, "ret": float(r), "contribution": float(w * r)})
+                # 记录 SELL 交易（常规清仓或减仓的“卖出事件”）
+                o_out = float(O_t.get(s, np.nan)) * (1.0 - sell_cost) if np.isfinite(float(O_t.get(s, np.nan))) else np.nan
+                entry_price = entry_state.get(s, {}).get("entry_price", np.nan)
+                trade_recs.append({
+                    "date": d, "stock": s, "action": "SELL",
+                    "entry_price": entry_price, "exec_price": o_out
+                })
 
-    # 处理净值数据
-    if not recs:
-        print("[BTR-BT] 未能生成回测净值（可能所有周都空仓或无法对齐收益）。")
-        return
+        # 状态生命周期
+        to_del = []
+        for s in set(set_yest | set_today):
+            tgt_zero = (s not in set_today) or (s in stopped_symbols)
+            if tgt_zero:
+                if s in entry_state:
+                    to_del.append(s)
+        for s in to_del:
+            entry_state.pop(s, None)
+
+        prev_w = w_today_target
+
+    # 输出净值
     nav_df = pd.DataFrame(recs).set_index("date").sort_index()
     nav_df["nav"] = (1.0 + nav_df["ret_total"]).cumprod()
 
-    # 股票收益明细
+    out_nav_csv = out_dir / f"nav_{cfg.run_name_out}.csv"
+    ensure_dir(out_nav_csv)
+    cols = ["ret_long", "ret_short", "ret_total", "nav", "n_long"]
+    nav_df[cols].to_csv(out_nav_csv, float_format="%.8f")
+    print(f"[BTR-BT] 已保存净值序列：{out_nav_csv}")
+
+    # 输出股票收益明细
     stock_df = pd.DataFrame(stock_recs)
     if not stock_df.empty:
         stock_df["date"] = pd.to_datetime(stock_df["date"])
         stock_df = stock_df.sort_values(by=["date", "stock"]).reset_index(drop=True)
-
-    # 输出
-    out_nav_csv = out_dir / f"nav_{cfg.run_name_out}.csv"
-    out_stock_csv = out_dir / f"stock_returns_{cfg.run_name_out}.csv"
-    ensure_dir(out_nav_csv)
-    cols = ["ret_long", "ret_short", "ret_total", "nav", "n_long"]
-    nav_df[cols].to_csv(out_nav_csv, float_format="%.8f")
-    if not stock_df.empty:
+        out_stock_csv = out_dir / f"stock_returns_{cfg.run_name_out}.csv"
         stock_df.to_csv(out_stock_csv, index=False, float_format="%.8f")
-    print(f"[BTR-BT] 已保存净值序列：{out_nav_csv}")
-    if not stock_df.empty:
         print(f"[BTR-BT] 已保存股票收益明细：{out_stock_csv}")
+
+    # 输出交易记录
+    trade_df = pd.DataFrame(trade_recs, columns=["date", "stock", "action", "entry_price", "exec_price"])
+    if not trade_df.empty:
+        trade_df["date"] = pd.to_datetime(trade_df["date"])
+        trade_df = trade_df.sort_values(by=["date", "stock"]).reset_index(drop=True)
+    out_trades_csv = out_dir / f"stock_trades_{cfg.run_name_out}.csv"
+    ensure_dir(out_trades_csv)
+    trade_df.to_csv(out_trades_csv, index=False, float_format="%.8f")
+    print(f"[BTR-BT] 已保存交易记录：{out_trades_csv}")
 
 
 if __name__ == "__main__":

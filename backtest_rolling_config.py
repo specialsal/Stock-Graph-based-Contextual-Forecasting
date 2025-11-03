@@ -45,13 +45,13 @@ class BTRollingConfig:
     # 分组与持仓控制
     top_pct        = 0.05
     bottom_pct     = 0.05
-    min_n_stocks   = 10
-    max_n_stocks   = 10
+    min_n_stocks   = 8
+    max_n_stocks   = 8
 
     # 成本与滑点（非对称）
     # 注意：bps 为基点（万分之一）。例如 3 表示万三（0.03%）
-    buy_fee_bps    = 11   # 买入手续费：万三
-    sell_fee_bps   = 16   # 卖出手续费：万八
+    buy_fee_bps    = 10   # 买入手续费：万零点八五
+    sell_fee_bps   = 15   # 卖出手续费：万五点八五
     slippage_bps   = 5   # 双边对称滑点：万五（买卖两侧都加）
 
     # 过滤与样本要求（与训练一致，可按需启用）
@@ -69,16 +69,12 @@ class BTRollingConfig:
     include_neeq = False
 
     # 周内止盈/止损参数
-    enable_intraweek_stops: bool = False
-    tp_price_ratio: float = 0.06
-    sl_price_ratio: float = 0.06
-    tp_sell_ratio: float = 0.50
-    sl_sell_ratio: float = 1.00
-    stop_priority: str = "SL_first"
-    allow_multiple_triggers_per_week: bool = True
+    enable_intraweek_stops: bool = True
+    tp_price_ratio: float = 99
+    sl_price_ratio: float = 0.05
 
     # 组合权重与过滤（从代码中上移到配置）
-    weight_mode: str = "score"  # "equal" 或 "score" 或 "optimize"
+    weight_mode: str = "equal"  # "equal" 或 "score" 或 "optimize"
     filter_negative_scores_long: bool = False
 
     # 行业中性化开关与参数（新增）
@@ -89,7 +85,8 @@ class BTRollingConfig:
     neutralize_clip_pct: float = 0.0              # 对原始分数 winsorize 百分位（0~0.5），0 表示不裁剪
 
     # 调仓频率（新增）：1=每周；2=双周；3=三周
-    rebalance_every_k: int = 3
+    rebalance_every_k: int = 4
+    
     # 设备
     device         = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
