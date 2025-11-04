@@ -5,9 +5,10 @@ import h5py
 from typing import List, Tuple, Optional, Set, Dict
 
 def load_industry_map(csv_file: Path):
-    # 保留原函数（兼容旧使用场景）：stock -> 单一 industry id
+    # 使用 gbk 编码，兼容列名的潜在空白与大小写
     df = pd.read_csv(csv_file, encoding='gbk')
     cols = {c.strip().lower(): c for c in df.columns}
+    # 兼容可能的列名变体
     key_col = None
     ind_col = None
     for cand in ['order_book_id', 'code', 'stock_code', 'ticker']:
@@ -24,82 +25,17 @@ def load_industry_map(csv_file: Path):
     df = df[[key_col, ind_col]].copy()
     df[key_col] = df[key_col].astype(str).str.strip()
     df[ind_col] = df[ind_col].astype(str).str.strip()
+
+    # 去重，保留首次出现
     df = df.dropna(subset=[key_col, ind_col]).drop_duplicates(subset=[key_col])
 
+    # 将中文行业名映射为稳定整数ID（按名称排序，保证可复现）
     unique_inds = sorted(df[ind_col].unique())
-    ind2id = {name: i for i, name in enumerate(unique_inds)}
+    ind2id = {name: i for i, name in enumerate(unique_inds)}  # 0..K-1
     stock2id = {stk: ind2id[ind_name] for stk, ind_name in zip(df[key_col], df[ind_col])}
+
+    # 返回股票->行业ID 映射；如需行业名->ID也可返回
     return stock2id
-
-def load_industry_twolevel_map(csv_file: Path) -> Tuple[Dict[str, int], Dict[str, int]]:
-    """
-    读取 stock_industry_map.csv -> 两级行业映射：
-    - 返回 (stock_to_ind1_id, stock_to_ind2_id)
-    """
-    df = pd.read_csv(csv_file, encoding='gbk')
-    cols = {c.strip().lower(): c for c in df.columns}
-    key_col = None
-    ind1_col = None
-    ind2_col = None
-    for cand in ['order_book_id', 'code', 'stock_code', 'ticker']:
-        if cand in cols:
-            key_col = cols[cand]; break
-    for cand in ['industry', 'first_industry_name', 'industry_name', 'industry_cn']:
-        if cand in cols:
-            ind1_col = cols[cand]; break
-    for cand in ['industry2', 'second_industry_name', 'industry_name_2', 'industry2_cn']:
-        if cand in cols:
-            ind2_col = cols[cand]; break
-    if key_col is None or ind1_col is None:
-        raise ValueError(f"行业映射缺少列，检测到: {df.columns.tolist()}，至少需 order_book_id + industry；建议包含 industry2")
-    df = df[[key_col, ind1_col] + ([ind2_col] if ind2_col else [])].copy()
-    df[key_col]  = df[key_col].astype(str).str.strip()
-    df[ind1_col] = df[ind1_col].astype(str).str.strip()
-    if ind2_col:
-        df[ind2_col] = df[ind2_col].astype(str).str.strip()
-
-    # 构造 id
-    uniq1 = sorted(df[ind1_col].dropna().unique())
-    id1_map = {v: i for i, v in enumerate(uniq1)}
-    if ind2_col:
-        uniq2 = sorted(df[ind2_col].dropna().unique())
-        id2_map = {v: i for i, v in enumerate(uniq2)}
-    else:
-        id2_map = {}
-
-    stock2ind1 = {r[key_col]: id1_map[r[ind1_col]] for _, r in df.dropna(subset=[ind1_col]).iterrows()}
-    if ind2_col:
-        stock2ind2 = {r[key_col]: id2_map[r[ind2_col]] for _, r in df.dropna(subset=[ind2_col]).iterrows()}
-    else:
-        stock2ind2 = {}
-    return stock2ind1, stock2ind2
-
-def load_chain_sector_map(csv_file: Path) -> Dict[str, int]:
-    """
-    读取 stock_style_map.csv -> chain_sector 映射：stock -> chain_id
-    需要列：order_book_id, chain_sector
-    """
-    df = pd.read_csv(csv_file, encoding='gbk')
-    cols = {c.strip().lower(): c for c in df.columns}
-    key_col = None
-    chain_col = None
-    for cand in ['order_book_id', 'code', 'stock_code', 'ticker']:
-        if cand in cols:
-            key_col = cols[cand]; break
-    for cand in ['chain_sector', 'industry_chain_sector_name', 'chain', 'chain_name']:
-        if cand in cols:
-            chain_col = cols[cand]; break
-    if key_col is None or chain_col is None:
-        raise ValueError(f"风格链映射缺少列，检测到: {df.columns.tolist()}，需要 order_book_id + chain_sector")
-
-    df = df[[key_col, chain_col]].copy()
-    df[key_col]   = df[key_col].astype(str).str.strip()
-    df[chain_col] = df[chain_col].astype(str).str.strip()
-    df = df.dropna(subset=[key_col, chain_col]).drop_duplicates(subset=[key_col])
-
-    uniq = sorted(df[chain_col].unique())
-    c2id = {v: i for i, v in enumerate(uniq)}
-    return {r[key_col]: c2id[r[chain_col]] for _, r in df.iterrows()}
 
 # -------- 交易日历 --------
 def load_calendar(csv_file: Path) -> pd.DatetimeIndex:
@@ -109,7 +45,9 @@ def load_calendar(csv_file: Path) -> pd.DatetimeIndex:
 def get_next_trading_day(date_str,csv_file: Path):
     trading_days = load_calendar(csv_file)
     input_date = pd.to_datetime(date_str)
+
     current_index = trading_days.get_loc(input_date)
+    
     return trading_days[current_index + 1].strftime('%Y-%m-%d')
 
 def weekly_fridays(calendar: pd.DatetimeIndex) -> pd.DatetimeIndex:
@@ -140,11 +78,13 @@ def pkl_load(path: Path):
 # -------- RankIC（torch，无梯度）--------
 @torch.no_grad()
 def rank_ic(pred, tgt):
+    # pred, tgt: 1D tensor
     n = pred.numel()
     if n < 2:
         return 0.0
     pr = pred.argsort().argsort().float()
     tg = tgt.argsort().argsort().float()
+    # z-score 前检查方差
     pr_std = pr.std(unbiased=False)
     tg_std = tg.std(unbiased=False)
     if pr_std <= 1e-12 or tg_std <= 1e-12:
@@ -155,16 +95,27 @@ def rank_ic(pred, tgt):
 
 # ========== 新增：增量特征构建工具 ==========
 def read_h5_meta(h5_path: Path) -> Tuple[int, Set[pd.Timestamp], Optional[List[str]]]:
+    """
+    读取已存在的 H5 特征仓元信息：
+    - 返回 下一 group 序号、已写入的周五日期集合、factor_cols（若存在）
+    """
     if not h5_path.exists():
         return 0, set(), None
     written_dates = set()
     factor_cols = None
     with h5py.File(h5_path, "r") as h5f:
+        # 检查根目录属性中是否存在 'factor_cols'（因子列名元数据）
         if 'factor_cols' in h5f.attrs:
+            # 读取因子列名：
+            # 1. 将 h5f.attrs['factor_cols'] 转为 numpy 数组（H5存储格式）
+            # 2. 遍历数组元素，若为bytes类型则解码为utf-8字符串，否则直接转为字符串
+            # 3. 最终得到字符串列表（确保中文/特殊字符正常显示）
             factor_cols = [s.decode('utf-8') if isinstance(s, bytes) else str(s) for s in np.array(h5f.attrs['factor_cols'])]
+        # 遍历 H5 文件中所有顶层键（组名或数据集名）
         for k in h5f.keys():
             if not k.startswith("date_"):
                 continue
+            # 从当前组的属性中获取 'date' 字段（存储该组对应的实际日期）
             d_str = h5f[k].attrs.get('date', None)
             if d_str is None:
                 continue
@@ -175,6 +126,9 @@ def read_h5_meta(h5_path: Path) -> Tuple[int, Set[pd.Timestamp], Optional[List[s
     return next_idx, written_dates, factor_cols
 
 def list_missing_fridays(calendar_csv: Path, start_date: str, end_date: str, written_dates: Set[pd.Timestamp]) -> pd.DatetimeIndex:
+    """
+    基于交易日历计算[start_date, end_date]内的全部周五，并去掉已写入组，得到缺失周五列表
+    """
     cal = load_calendar(calendar_csv)
     all_fridays = weekly_fridays(cal)
     mask = (all_fridays >= pd.Timestamp(start_date)) & (all_fridays <= pd.Timestamp(end_date))
@@ -183,13 +137,21 @@ def list_missing_fridays(calendar_csv: Path, start_date: str, end_date: str, wri
     return pd.DatetimeIndex(sorted(need))
 
 def get_required_history_start(missing_fridays: pd.DatetimeIndex, max_lookback: int) -> Optional[pd.Timestamp]:
+    """
+    对于需要增量的最早周五，向前回溯 max_lookback-1 个交易日作为计算窗口的起点
+    注意：这里用自然日减法，若你需要精确“交易日回溯”，请在调用前基于交易日序列做 index-based 回退。
+    """
     if missing_fridays is None or len(missing_fridays) == 0:
         return None
     first_target = missing_fridays.min()
+    # 使用自然日减去一定天数，保守取值，多取一点冗余并不影响正确性
     start_date = first_target - pd.Timedelta(days=max_lookback * 2)
     return start_date.normalize()
 
 def ensure_multiindex_price(day_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    确保日线行情为 MultiIndex(order_book_id, datetime) 并按索引排序
+    """
     if not isinstance(day_df.index, pd.MultiIndex):
         raise ValueError("price_day_file 需要为 MultiIndex(order_book_id, datetime) 格式。")
     names = list(day_df.index.names)
@@ -201,16 +163,27 @@ def ensure_multiindex_price(day_df: pd.DataFrame) -> pd.DataFrame:
     return day_df.sort_index()
 
 def merge_multiindex_columns_union(df_old: pd.DataFrame, df_new: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+    """
+    对齐两份列名的并集并返回对齐后的副本与并集列顺序
+    """
     cols = sorted(set(df_old.columns) | set(df_new.columns))
     return df_old.reindex(columns=cols), df_new.reindex(columns=cols), cols
 
 class SlidingWindowCache:
+    """
+    简单的滑窗缓存器：缓存每只股票最近一次切片的（end_date, window_df），
+    若下一次请求的 end_date 相同或更晚且窗口相同，则避免重复切 slice。
+    """
     def __init__(self): 
+        # 初始化缓存字典，键为股票代码（str），值为元组 (end_date, window_df)
+        # end_date 是缓存数据的截止日期（pd.Timestamp），window_df 是该股票的历史数据切片（pd.DataFrame）
         self.cache: Dict[str, Tuple[pd.Timestamp, pd.DataFrame]] = {}
     def get(self, code: str, end_dt: pd.Timestamp, win: int) -> Optional[pd.DataFrame]:
+        # 尝试从缓存中获取股票 code 的数据
         if code not in self.cache: return None
         last_end, last_df = self.cache[code]
         if last_df is None or last_end is None: return None
+        # 窗口检查：若 end_dt 未早于已缓存的 end_dt，直接复用最后 win 行
         if end_dt >= last_end and len(last_df) >= win:
             return last_df.tail(win)
         return None

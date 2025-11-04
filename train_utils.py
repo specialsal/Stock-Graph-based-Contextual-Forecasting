@@ -2,9 +2,12 @@
 # coding: utf-8
 """
 训练通用工具（RankNet_margin 损失 + 精简日志）：
-本版变更：
-- 数据载入与迭代：扩展为三路 id（chain_id、ind1_id、ind2_id）
-- 移除 graph_type 相关逻辑（模型侧仅 GAT）
+- 环境设置/优化器封装
+- 股票样本过滤（读取与闭包）
+- AMP/相关指标
+- Pairwise Ranking 损失（带常数 margin 的 RankNet）
+- 按组读取（HDF5 -> 内存 -> 分batch）
+- 窗口内拟合 Scaler（仅用训练组）
 """
 import math, torch, numpy as np, pandas as pd, h5py, shutil
 import torch.nn.functional as F
@@ -20,33 +23,34 @@ def load_window_to_ram(
     label_df: pd.DataFrame,
     ctx_df: pd.DataFrame,
     scaler_d: Scaler,
-    chain_map: dict,
-    ind1_map: dict,
-    ind2_map: dict,
-    pad_chain_id: int,
-    pad_ind1_id: int,
-    pad_ind2_id: int,
+    ind_map: dict,
+    pad_ind_id: int,
     filter_fn=None
 ) -> Tuple[List[Dict[str, Any]], float]:
+    """
+    将一个窗口的所有 group 一次性加载到内存，返回：
+    - items: 每个元素为 {date, X, ind, ctx, y}
+    - total_gb: 估算总内存占用（GB）
+    """
     items: List[Dict[str, Any]] = []
     total_bytes = 0
     skipped = 0
     for gk in group_keys:
-        out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d,
-                                   chain_map, ind1_map, ind2_map,
-                                   pad_chain_id, pad_ind1_id, pad_ind2_id,
-                                   filter_fn=filter_fn)
+        out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
         if out is None:
             skipped += 1
             continue
-        X, chain, ind1, ind2, ctx, y, date = out
-        items.append({"date": date, "X": X, "chain": chain, "ind1": ind1, "ind2": ind2, "ctx": ctx, "y": y})
-        total_bytes += X.nbytes + chain.nbytes + ind1.nbytes + ind2.nbytes + ctx.nbytes + y.nbytes
+        X, ind, ctx, y, date = out
+        items.append({"date": date, "X": X, "ind": ind, "ctx": ctx, "y": y})
+        total_bytes += X.nbytes + ind.nbytes + ctx.nbytes + y.nbytes
     total_gb = total_bytes / 1e9
     print(f"[RAM预载] 已加载 {len(items)} 个 group 到内存，约 {total_gb:.2f} GB（跳过空组 {skipped}）")
     return items, total_gb
 
 def iterate_ram_minibatches(mem_items: List[Dict[str, Any]], batch_size: int, shuffle: bool = True):
+    """
+    仅使用常驻内存的数据进行训练迭代：先打乱 group，再 group 内打乱切 batch。
+    """
     if not mem_items:
         return
     order = np.arange(len(mem_items))
@@ -54,7 +58,7 @@ def iterate_ram_minibatches(mem_items: List[Dict[str, Any]], batch_size: int, sh
         np.random.shuffle(order)
     for idx in order:
         it = mem_items[idx]
-        X, chain, ind1, ind2, ctx, y = it["X"], it["chain"], it["ind1"], it["ind2"], it["ctx"], it["y"]
+        X, ind, ctx, y = it["X"], it["ind"], it["ctx"], it["y"]
         M = X.shape[0]
         idxs = np.arange(M)
         if shuffle:
@@ -62,12 +66,13 @@ def iterate_ram_minibatches(mem_items: List[Dict[str, Any]], batch_size: int, sh
         for st in range(0, M, batch_size):
             sel = idxs[st: st+batch_size]
             xb = torch.from_numpy(X[sel])
-            cb = torch.from_numpy(chain[sel])
-            i1 = torch.from_numpy(ind1[sel])
-            i2 = torch.from_numpy(ind2[sel])
-            ctxb = torch.from_numpy(ctx[sel])
+            ib = torch.from_numpy(ind[sel])
+            cb = torch.from_numpy(ctx[sel])
             yb = torch.from_numpy(y[sel])
-            yield xb, cb, i1, i2, ctxb, yb
+            if HAS_CUDA:
+                xb = xb.pin_memory(); ib = ib.pin_memory()
+                cb = cb.pin_memory(); yb = yb.pin_memory()
+            yield xb, ib, cb, yb
 
 # --------------------------- 基础环境/优化器 --------------------------- #
 HAS_CUDA = (torch.cuda.is_available() and CFG.device.type == "cuda")
@@ -80,6 +85,12 @@ def setup_env():
         torch.backends.cudnn.benchmark = True
 
 def try_fused_adamw(params, lr, wd):
+    """
+    创建 AdamW 优化器：
+    - 优先尝试 fused 版本（仅在支持的平台和 PyTorch 版本可用）
+    - 使用关键字参数传递 lr 与 weight_decay
+    - 回退到非 fused 版本
+    """
     kwargs = dict(lr=lr, weight_decay=wd)
     try:
         return torch.optim.AdamW(params, fused=HAS_CUDA, **kwargs)
@@ -128,6 +139,10 @@ def parse_date_flexible(s: pd.Series):
         return pd.to_datetime(s, errors="coerce")
 
 def load_stock_info(path: Path):
+    """
+    需要列: [code, ipo_date, delist_date]
+    返回: index=code, 列: ipo_date(TS), delist_date(TS or NaT)
+    """
     df = read_csv_with_encoding(path)
     if df is None:
         return None
@@ -166,6 +181,9 @@ def load_stock_info(path: Path):
     return out.set_index(code_col)
 
 def load_flag_table(path: Path):
+    """
+    停牌/ST 表 -> index=DatetimeIndex(date), 列=股票代码(str)，值 ∈ {0,1}
+    """
     df = read_csv_with_encoding(path)
     if df is None:
         return None
@@ -188,6 +206,12 @@ def get_flag_at(df_flag: pd.DataFrame, date: pd.Timestamp, code: str) -> int:
     return 0
 
 def _is_limit_like_row(row: pd.Series, up_th: float = 0.098, near_eps: float = 0.001) -> Tuple[bool, bool]:
+    """
+    近似判定：接近涨停/接近跌停
+    - up_th: 涨停阈值（约 9.8%）
+    - near_eps: 贴近高/低的相对阈值（0.1%）
+    需要列: open/high/low/close（缺失则返回 False, False）
+    """
     req = ["open","high","low","close"]
     if any(c not in row or pd.isna(row[c]) for c in req):
         return False, False
@@ -198,6 +222,15 @@ def _is_limit_like_row(row: pd.Series, up_th: float = 0.098, near_eps: float = 0
     return bool(limit_up_like), bool(limit_dn_like)
 
 def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd.DataFrame, st_df: pd.DataFrame):
+    """
+    返回闭包 filter_fn(date, code) -> bool
+    规则（若 CFG.enable_filters=True）：
+      - 板块开关：include_star_market / include_chinext / include_bse / include_neeq
+      - IPO/退市日要求
+      - 停牌/ST 剔除
+      - 成交额阈值
+      - 新增：接近涨停/接近跌停 禁买
+    """
     if not getattr(CFG, "enable_filters", False):
         return None
     if not isinstance(daily_df.index, pd.MultiIndex):
@@ -256,6 +289,7 @@ def make_filter_fn(daily_df: pd.DataFrame, stock_info: pd.DataFrame, susp_df: pd
 
 # --------------------------- AMP / 指标 --------------------------- #
 def pearsonr(pred, y):
+    # 仅作为诊断时使用（训练/验证日志不再输出）
     if pred.numel() < 2:
         return torch.tensor(float("nan"), device=pred.device, dtype=pred.dtype)
     px = pred - pred.mean()
@@ -269,6 +303,12 @@ def pearsonr(pred, y):
 
 # --------------------------- 排序损失（带常数 margin） --------------------------- #
 def pairwise_ranking_loss_margin(pred: torch.Tensor, y: torch.Tensor, m: float, num_pairs: int = 2048) -> torch.Tensor:
+    """
+    RankNet（pairwise logistic）的 margin 版本（成本敏感）：
+    L = E_{(i,j)} [ softplus( m - s_ij * (pred_i - pred_j) ) ]
+    其中 s_ij = sign(y_i - y_j) ∈ {-1, +1}，m 为常数 margin（如 0.0025）。
+    - 在 batch 内随机采样若干对，避免 O(B^2)
+    """
     B = pred.shape[0]
     if B < 2:
         return pred.new_tensor(0.0)
@@ -289,6 +329,10 @@ def pairwise_ranking_loss_margin(pred: torch.Tensor, y: torch.Tensor, m: float, 
 
 # --------------------------- 窗口内拟合 Scaler --------------------------- #
 def fit_scaler_for_groups(h5: h5py.File, group_keys: Iterable[str]) -> Scaler:
+    """
+    使用训练组的 factor 数据拟合标准化参数，避免未来信息。
+    返回 Scaler（其 mean/std 形状 [1,1,C]）。
+    """
     scaler = Scaler()
     all_sum = None
     all_sqsum = None
@@ -323,40 +367,35 @@ def load_group_to_memory(h5: h5py.File,
                          label_df: pd.DataFrame,
                          ctx_df: pd.DataFrame,
                          scaler_d: Scaler,
-                         chain_map: dict,
-                         ind1_map: dict,
-                         ind2_map: dict,
-                         pad_chain_id: int,
-                         pad_ind1_id: int,
-                         pad_ind2_id: int,
+                         ind_map: dict,
+                         pad_ind_id: int,
                          filter_fn=None):
+    """
+    读取单个 group（一个周五采样日），返回张量化前的 numpy 批数据。
+    """
     if gk not in h5: return None
     g = h5[gk]
     date = pd.Timestamp(g.attrs["date"])
-    stocks = g["stocks"][:].astype(str)
-    X = np.asarray(g["factor"][:])
-    X = np.squeeze(X)
+    stocks = g["stocks"][:].astype(str)         # [N]
+    X = np.asarray(g["factor"][:])              # [N,T,C] 或 [N,T,1,C]
+    X = np.squeeze(X)                           # -> [N,T,C]
     X = scaler_d.transform(X).astype(np.float32)
 
-    keep_idx, y_list, chain_list, ind1_list, ind2_list = [], [], [], [], []
+    keep_idx, y_list = [], []
     for i, s in enumerate(stocks):
         key = (date, s)
         if key in label_df.index:
             if (filter_fn is None) or filter_fn(date, s):
                 keep_idx.append(i)
                 y_list.append(float(label_df.loc[key, "next_week_return"]))
-                chain_list.append(int(chain_map.get(s, pad_chain_id)))
-                ind1_list.append(int(ind1_map.get(s, pad_ind1_id)))
-                ind2_list.append(int(ind2_map.get(s, pad_ind2_id)))
-
     if not keep_idx:
         return None
 
     X = X[keep_idx]
+    stocks = stocks[keep_idx]
     y = np.asarray(y_list, dtype=np.float32)
-    chain = np.asarray(chain_list, dtype=np.int64)
-    ind1 = np.asarray(ind1_list, dtype=np.int64)
-    ind2 = np.asarray(ind2_list, dtype=np.int64)
+
+    ind = np.asarray([ind_map.get(s, pad_ind_id) for s in stocks], dtype=np.int64)
 
     if date in ctx_df.index:
         ctx_vec = ctx_df.loc[date].values.astype(np.float32)
@@ -364,19 +403,15 @@ def load_group_to_memory(h5: h5py.File,
         ctx_vec = np.zeros(ctx_df.shape[1], dtype=np.float32)
     ctx = np.broadcast_to(ctx_vec, (X.shape[0], ctx_vec.shape[0])).copy()
 
-    return X, chain, ind1, ind2, ctx, y, date
+    return X, ind, ctx, y, date
 
 def iterate_group_minibatches(h5: h5py.File,
                               group_keys: List[str],
                               label_df: pd.DataFrame,
                               ctx_df: pd.DataFrame,
                               scaler_d: Scaler,
-                              chain_map: dict,
-                              ind1_map: dict,
-                              ind2_map: dict,
-                              pad_chain_id: int,
-                              pad_ind1_id: int,
-                              pad_ind2_id: int,
+                              ind_map: dict,
+                              pad_ind_id: int,
                               batch_size: int,
                               shuffle: bool = True,
                               filter_fn=None):
@@ -385,12 +420,9 @@ def iterate_group_minibatches(h5: h5py.File,
         np.random.shuffle(order)
     for idx in order:
         gk = group_keys[idx]
-        out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d,
-                                   chain_map, ind1_map, ind2_map,
-                                   pad_chain_id, pad_ind1_id, pad_ind2_id,
-                                   filter_fn=filter_fn)
+        out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
         if out is None: continue
-        X, chain, ind1, ind2, ctx, y, _ = out
+        X, ind, ctx, y, _ = out
         M = X.shape[0]
         idxs = np.arange(M)
         if shuffle:
@@ -398,14 +430,23 @@ def iterate_group_minibatches(h5: h5py.File,
         for st in range(0, M, batch_size):
             sel = idxs[st:st+batch_size]
             xb = torch.from_numpy(X[sel])
-            cb = torch.from_numpy(chain[sel])
-            i1 = torch.from_numpy(ind1[sel])
-            i2 = torch.from_numpy(ind2[sel])
-            ctxb = torch.from_numpy(ctx[sel])
+            ib = torch.from_numpy(ind[sel])
+            cb = torch.from_numpy(ctx[sel])
             yb = torch.from_numpy(y[sel])
-            yield xb, cb, i1, i2, ctxb, yb
+            if HAS_CUDA:
+                xb = xb.pin_memory(); ib = ib.pin_memory()
+                cb = cb.pin_memory(); yb = yb.pin_memory()
+            yield xb, ib, cb, yb
 
 def classify_board(code: str) -> str:
+    """
+    根据代码推断板块（基于常见编码规则）：
+      - STAR(科创板): 688/689 + .XSHG
+      - CHINEXT(创业板): 300/301 + .XSHE
+      - BSE(北交所): 后缀 .XBEI / .XBSE
+      - NEEQ(新三板): 后缀 .XNE / .XNEE / .XNEQ / .XNEX / NEEQ
+      - 其他返回 "OTHER"
+    """
     try:
         s = str(code)
         parts = s.split(".")

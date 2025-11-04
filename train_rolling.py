@@ -1,11 +1,15 @@
 # ====================== train_rolling.py ======================
 # coding: utf-8
 """
-滚动训练主循环（日频 + 双路行业GAT）— RankNet_margin(cost=m) 版本（精简日志）
-- 仅保留 GAT 图（无 mean 分支）
-- 门控嵌入：chain_sector
-- 图：industry2 + industry 两路聚合并融合（hybrid，固定）
+滚动训练主循环（日频 + 行业图/可关闭）— RankNet_margin(cost=m) 版本（精简日志）
+要点：
+- 训练损失仅使用：pairwise RankNet 的 margin 版本（常数 m）
+- 日志与 TensorBoard 只保留：pairwise_margin_loss 与 ic_rank
+- 早停判据：验证集 avg_ic_rank（越大越好）
+- 支持 Warm Start、RAM 模式
+- 保留中文注释
 """
+
 import math, torch, pandas as pd, numpy as np, h5py
 import torch.nn.functional as F
 from pathlib import Path
@@ -16,7 +20,7 @@ import time
 
 from config import CFG
 from model import GCFNet
-from utils import weekly_fridays, load_calendar, load_industry_twolevel_map, load_chain_sector_map, rank_ic
+from utils import weekly_fridays, load_calendar, load_industry_map, rank_ic
 from train_utils import (
     HAS_CUDA, setup_env, get_amp_dtype, try_fused_adamw, ensure_parent_dir,
     make_filter_fn, load_stock_info, load_flag_table,
@@ -25,6 +29,7 @@ from train_utils import (
     load_window_to_ram, iterate_ram_minibatches
 )
 
+# --------------------------- 辅助：保存模型 --------------------------- #
 def save_checkpoint(model, path: Path, scaler_d=None):
     ensure_parent_dir(path)
     payload = {"state_dict": model.state_dict()}
@@ -50,9 +55,11 @@ def build_date_to_group_map(h5: h5py.File) -> dict:
         d2g[dt] = k
     return d2g
 
+# --------------------------- 主流程 --------------------------- #
 def main():
     setup_env()
 
+    # TensorBoard（统一目录）
     log_root = Path("./models") / "tblogs"
     log_root.mkdir(parents=True, exist_ok=True)
     run_tag = time.strftime("%Y%m%d_%H%M%S")
@@ -73,30 +80,20 @@ def main():
     ctx_file = CFG.processed_dir / "context_features.parquet"
     ctx_df = pd.read_parquet(ctx_file)
 
-    # 3) 三套映射与维度
-    chain_map = load_chain_sector_map(CFG.style_map_file)
-    ind1_map, ind2_map = load_industry_twolevel_map(CFG.industry_map_file)
-
+    # 3) 行业映射与维度
+    ind_map  = load_industry_map(CFG.industry_map_file)
     with h5py.File(daily_h5, "r") as h5d:
         d_in = len(h5d.attrs["factor_cols"])
     ctx_dim = ctx_df.shape[1]
+    n_ind_known = max(ind_map.values()) + 1
+    pad_ind_id = n_ind_known
 
-    n_chain_known = (max(chain_map.values()) + 1) if len(chain_map)>0 else 0
-    n_ind1_known  = (max(ind1_map.values()) + 1) if len(ind1_map)>0 else 0
-    n_ind2_known  = (max(ind2_map.values()) + 1) if len(ind2_map)>0 else 0
-
-    pad_chain_id = n_chain_known
-    pad_ind1_id  = n_ind1_known
-    pad_ind2_id  = n_ind2_known
-
-    # 4) 模型、优化器、AMP
+    # 4) 构建模型、优化器、AMP
     amp_dtype = get_amp_dtype()
     model = GCFNet(
-        d_in=d_in,
-        n_chain=n_chain_known, n_ind1=n_ind1_known, n_ind2=n_ind2_known,
-        ctx_dim=ctx_dim,
-        hidden=CFG.hidden, chain_emb_dim=CFG.chain_emb,
-        tr_layers=CFG.tr_layers, gat_layers=getattr(CFG, "gat_layers", 1)
+        d_in=d_in, n_ind=n_ind_known, ctx_dim=ctx_dim,
+        hidden=CFG.hidden, ind_emb_dim=CFG.ind_emb,
+        graph_type=CFG.graph_type, tr_layers=CFG.tr_layers, gat_layers=getattr(CFG, "gat_layers", 1)
     ).to(CFG.device)
 
     if getattr(CFG, "use_torch_compile", False) and hasattr(torch, "compile"):
@@ -135,6 +132,7 @@ def main():
             raise RuntimeError(f"H5 中没有任何以 date_* 命名的组：{daily_h5}")
 
         for i in range(train_weeks, len(fridays) - val_weeks, step_weeks):
+            # 时间切片
             train_dates = fridays[i - train_weeks : i]
             val_dates   = fridays[i : i + val_weeks]
             pred_date   = fridays[i + val_weeks]
@@ -142,9 +140,10 @@ def main():
             train_gk = [date2gk_all[d] for d in train_dates if d in date2gk_all]
             val_gk   = [date2gk_all[d] for d in val_dates   if d in date2gk_all]
 
+            # 仅用训练组拟合标准化
             scaler_d = fit_scaler_for_groups(h5, train_gk)
 
-            # Warm Start（可选）
+            # -------- Warm Start：尝试载入上一个窗口的 best --------
             if getattr(CFG, "warm_start_enable", False):
                 if (i - step_weeks) >= train_weeks:
                     pred_date_prev = fridays[i - step_weeks + val_weeks]
@@ -156,10 +155,11 @@ def main():
                             model.load_state_dict(state_dict, strict=bool(getattr(CFG, "warm_start_strict", False)))
                             print(f"[WarmStart] 已从上一窗口 best 加载初始化：{prev_best_path.name}")
                         except Exception as e:
-                            print(f"[WarmStart][警告] 加载上一窗口 best 失败：{e}")
+                            print(f"[WarmStart][警告] 加载上一窗口 best 失败，使用随机初始化。原因：{e}")
                     else:
-                        print(f"[WarmStart] 未找到上一窗口 best：{prev_best_path.name}（忽略）")
+                        print(f"[WarmStart][提示] 未找到上一窗口 best：{prev_best_path.name}，使用随机初始化。")
 
+            # 样本计数打印
             def _count_samples(keys):
                 n = 0
                 for k in keys:
@@ -183,21 +183,15 @@ def main():
             mem_items_val = None
             if use_ram:
                 mem_items_train, gb_train = load_window_to_ram(
-                    h5, train_gk, label_df, ctx_df, scaler_d,
-                    chain_map, ind1_map, ind2_map,
-                    pad_chain_id, pad_ind1_id, pad_ind2_id,
-                    filter_fn=filter_fn
+                    h5, train_gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn
                 )
                 mem_items_val, gb_val = load_window_to_ram(
-                    h5, val_gk, label_df, ctx_df, scaler_d,
-                    chain_map, ind1_map, ind2_map,
-                    pad_chain_id, pad_ind1_id, pad_ind2_id,
-                    filter_fn=filter_fn
+                    h5, val_gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn
                 )
                 total_gb = gb_train + gb_val
                 cap_gb = float(getattr(CFG, "ram_accel_mem_cap_gb", 48))
                 if total_gb > cap_gb:
-                    print(f"[RAM预载] 估算内存 {total_gb:.2f} GB 超过上限 {cap_gb:.2f} GB，回退逐组加载")
+                    print(f"[RAM预载] 估算内存 {total_gb:.2f} GB 超过上限 {cap_gb:.2f} GB，回退为逐组加载模式")
                     use_ram = False
                     mem_items_train = None
                     mem_items_val = None
@@ -218,8 +212,8 @@ def main():
                 epoch_id += 1
                 # ---------------- 训练 1 个 epoch ---------------- #
                 model.train()
-                prl_sum = 0.0
-                icr_sum = 0.0
+                prl_sum = 0.0  # pairwise_margin_loss 累计
+                icr_sum = 0.0  # ic_rank 累计
                 n_sum = 0
                 opt.zero_grad(set_to_none=True)
                 step = 0
@@ -230,9 +224,7 @@ def main():
                 else:
                     pbar = tqdm(
                         iterate_group_minibatches(
-                            h5, train_gk, label_df, ctx_df, scaler_d,
-                            chain_map, ind1_map, ind2_map,
-                            pad_chain_id, pad_ind1_id, pad_ind2_id,
+                            h5, train_gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id,
                             batch_size=CFG.batch_size, shuffle=True, filter_fn=filter_fn
                         ),
                         total=None, leave=False, desc="train-fast"
@@ -242,16 +234,15 @@ def main():
                 autocast_ctx = torch.amp.autocast("cuda", dtype=amp_dtype, enabled=amp_enabled) \
                                if amp_enabled else nullcontext()
 
-                for fd, chain, ind1, ind2, ctx, y in pbar:
+                for fd, ind, ctx, y in pbar:
                     fd = fd.to(CFG.device, non_blocking=HAS_CUDA)
-                    chain = chain.to(CFG.device, non_blocking=HAS_CUDA)
-                    ind1 = ind1.to(CFG.device, non_blocking=HAS_CUDA)
-                    ind2 = ind2.to(CFG.device, non_blocking=HAS_CUDA)
+                    ind = ind.to(CFG.device, non_blocking=HAS_CUDA)
                     ctx = ctx.to(CFG.device, non_blocking=HAS_CUDA)
                     y  = y.to(CFG.device, non_blocking=HAS_CUDA)
 
                     with autocast_ctx:
-                        pred = model(fd, chain, ind1, ind2, ctx)
+                        pred = model(fd, ind, ctx)
+                        # 仅用 margin 排序损失（常数 m）
                         rank_val = pairwise_ranking_loss_margin(pred, y, m=CFG.pair_margin_m, num_pairs=CFG.pair_num_pairs)
                         loss = rank_val
 
@@ -269,6 +260,7 @@ def main():
                             opt.step()
                         opt.zero_grad(set_to_none=True)
 
+                    # 仅记录两项日志
                     with torch.no_grad():
                         bs = y.shape[0]
                         n_sum += bs
@@ -301,22 +293,20 @@ def main():
                 writer.add_scalar("global/train_epoch/pairwise_margin_loss", prl_sum/max(1,n_sum), global_step_epoch)
                 writer.add_scalar("global/train_epoch/ic_rank", icr_sum/max(1,n_sum), global_step_epoch)
 
-                # ---------------- 验证 ---------------- #
+                # ---------------- 验证评估（用于早停与 best） ---------------- #
                 model.eval()
 
                 def eval_split_ram(mem_items):
                     per_date = []
                     for it in mem_items:
                         X = torch.from_numpy(it["X"]).to(CFG.device, non_blocking=HAS_CUDA)
-                        ch_t = torch.from_numpy(it["chain"]).to(CFG.device, non_blocking=HAS_CUDA)
-                        i1_t = torch.from_numpy(it["ind1"]).to(CFG.device, non_blocking=HAS_CUDA)
-                        i2_t = torch.from_numpy(it["ind2"]).to(CFG.device, non_blocking=HAS_CUDA)
+                        ind_t = torch.from_numpy(it["ind"]).to(CFG.device, non_blocking=HAS_CUDA)
                         ctx_t = torch.from_numpy(it["ctx"]).to(CFG.device, non_blocking=HAS_CUDA)
                         y_t  = torch.from_numpy(it["y"]).to(CFG.device, non_blocking=HAS_CUDA)
                         preds = []
                         bs = CFG.batch_size
                         for st in range(0, X.shape[0], bs):
-                            p = model(X[st:st+bs], ch_t[st:st+bs], i1_t[st:st+bs], i2_t[st:st+bs], ctx_t[st:st+bs])
+                            p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
                             preds.append(p.detach().float().cpu())
                         pred_cpu = torch.cat(preds, 0)
                         y_cpu = y_t.detach().float().cpu()
@@ -328,23 +318,18 @@ def main():
                 def eval_split_stream(keys):
                     per_date = []
                     for gk in keys:
-                        out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d,
-                                                   chain_map, ind1_map, ind2_map,
-                                                   pad_chain_id, pad_ind1_id, pad_ind2_id,
-                                                   filter_fn=filter_fn)
+                        out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
                         if out is None:
                             continue
-                        X, ch_t, i1_t, i2_t, ctx_t, y_t, _ = out
-                        X = torch.from_numpy(X).to(CFG.device, non_blocking=HAS_CUDA)
-                        ch_t = torch.from_numpy(ch_t).to(CFG.device, non_blocking=HAS_CUDA)
-                        i1_t = torch.from_numpy(i1_t).to(CFG.device, non_blocking=HAS_CUDA)
-                        i2_t = torch.from_numpy(i2_t).to(CFG.device, non_blocking=HAS_CUDA)
-                        ctx_t = torch.from_numpy(ctx_t).to(CFG.device, non_blocking=HAS_CUDA)
-                        y_t  = torch.from_numpy(y_t).to(CFG.device, non_blocking=HAS_CUDA)
+                        X, ind_t, ctx_t, y_t = [torch.from_numpy(o) for o in out[:4]]
+                        X = X.to(CFG.device, non_blocking=HAS_CUDA)
+                        ind_t = ind_t.to(CFG.device, non_blocking=HAS_CUDA)
+                        ctx_t = ctx_t.to(CFG.device, non_blocking=HAS_CUDA)
+                        y_t  = y_t.to(CFG.device, non_blocking=HAS_CUDA)
                         preds = []
                         bs = CFG.batch_size
                         for st in range(0, X.shape[0], bs):
-                            p = model(X[st:st+bs], ch_t[st:st+bs], i1_t[st:st+bs], i2_t[st:st+bs], ctx_t[st:st+bs])
+                            p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
                             preds.append(p.detach().float().cpu())
                         pred_cpu = torch.cat(preds, 0)
                         y_cpu = y_t.detach().float().cpu()
@@ -374,6 +359,7 @@ def main():
                 writer.add_scalar("global/val/pairwise_margin_loss", val_avg_prl, global_step_epoch)
                 writer.add_scalar("global/val/ic_rank", val_avg_icr, global_step_epoch)
 
+                # -------- 保存 best + 早停判断（基于 ic_rank） --------
                 prev_best = best_val_score
                 if math.isfinite(val_target) and val_target > best_val_score:
                     best_val_score = val_target
@@ -424,22 +410,17 @@ def main():
             def eval_split_stream(keys):
                 per_date = []
                 for gk in keys:
-                    out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d,
-                                               chain_map, ind1_map, ind2_map,
-                                               pad_chain_id, pad_ind1_id, pad_ind2_id,
-                                               filter_fn=filter_fn)
+                    out = load_group_to_memory(h5, gk, label_df, ctx_df, scaler_d, ind_map, pad_ind_id, filter_fn=filter_fn)
                     if out is None: continue
-                    X, ch_t, i1_t, i2_t, ctx_t, y_t, _ = out
-                    X = torch.from_numpy(X).to(CFG.device, non_blocking=HAS_CUDA)
-                    ch_t = torch.from_numpy(ch_t).to(CFG.device, non_blocking=HAS_CUDA)
-                    i1_t = torch.from_numpy(i1_t).to(CFG.device, non_blocking=HAS_CUDA)
-                    i2_t = torch.from_numpy(i2_t).to(CFG.device, non_blocking=HAS_CUDA)
-                    ctx_t = torch.from_numpy(ctx_t).to(CFG.device, non_blocking=HAS_CUDA)
-                    y_t  = torch.from_numpy(y_t).to(CFG.device, non_blocking=HAS_CUDA)
+                    X, ind_t, ctx_t, y_t = [torch.from_numpy(o) for o in out[:4]]
+                    X = X.to(CFG.device, non_blocking=HAS_CUDA)
+                    ind_t = ind_t.to(CFG.device, non_blocking=HAS_CUDA)
+                    ctx_t = ctx_t.to(CFG.device, non_blocking=HAS_CUDA)
+                    y_t  = y_t.to(CFG.device, non_blocking=HAS_CUDA)
                     preds = []
                     bs = CFG.batch_size
                     for st in range(0, X.shape[0], bs):
-                        p = model(X[st:st+bs], ch_t[st:st+bs], i1_t[st:st+bs], i2_t[st:st+bs], ctx_t[st:st+bs])
+                        p = model(X[st:st+bs], ind_t[st:st+bs], ctx_t[st:st+bs])
                         preds.append(p.detach().float().cpu())
                     pred_cpu = torch.cat(preds, 0)
                     y_cpu = y_t.detach().float().cpu()
