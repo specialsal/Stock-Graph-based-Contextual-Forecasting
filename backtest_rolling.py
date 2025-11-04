@@ -20,11 +20,13 @@ from tqdm import tqdm
 from backtest_rolling_config import BT_ROLL_CFG
 from config import CFG  # 读取训练参数中的 step_weeks 等
 from model import GCFNet
-from utils import load_calendar, weekly_fridays, load_industry_map
+from utils import load_calendar, weekly_fridays, load_industry_twolevel_map, load_chain_sector_map
 from train_utils import make_filter_fn, load_stock_info, load_flag_table  # 复用筛选逻辑
+
 
 def ensure_dir(p: Path):
     p.parent.mkdir(parents=True, exist_ok=True)
+
 
 def list_h5_groups(h5: h5py.File) -> pd.DataFrame:
     rows = []
@@ -42,9 +44,11 @@ def list_h5_groups(h5: h5py.File) -> pd.DataFrame:
     df = pd.DataFrame(rows).sort_values("date").reset_index(drop=True)
     return df
 
+
 def date_to_group(h5: h5py.File) -> Dict[pd.Timestamp, str]:
     df = list_h5_groups(h5)
     return {row["date"]: row["group"] for _, row in df.iterrows()}
+
 
 def infer_factor_dim(h5: h5py.File) -> int:
     if "factor_cols" in h5.attrs:
@@ -55,6 +59,7 @@ def infer_factor_dim(h5: h5py.File) -> int:
             arr = np.squeeze(arr)
             return int(arr.shape[-1])
     raise RuntimeError("无法推断因子维度")
+
 
 class ScalerPayload:
     """
@@ -89,6 +94,7 @@ class ScalerPayload:
             return X.astype(np.float32)
         return ((X - self.mean) / (self.std + 1e-6)).astype(np.float32)
 
+
 def main():
     cfg = BT_ROLL_CFG
     out_dir = cfg.backtest_dir
@@ -110,18 +116,30 @@ def main():
     if len(fridays_bt) < 1:
         raise RuntimeError("回测周五数量不足。请调整回测区间。")
 
-    # 2) 行业映射与模型结构
-    ind_map = load_industry_map(cfg.industry_map_file)
-    n_ind_known = max(ind_map.values()) + 1
-    pad_ind_id = n_ind_known
+    # 2) 风格/行业映射与模型结构（与训练对齐）
+    # - chain_sector: 门控嵌入
+    # - 两级行业：industry, industry2
+    chain_map = load_chain_sector_map(Path("./data/raw/stock_style_map.csv"))
+    ind1_map, ind2_map = load_industry_twolevel_map(cfg.industry_map_file)
+
+    n_chain_known = (max(chain_map.values()) + 1) if len(chain_map) > 0 else 0
+    n_ind1_known  = (max(ind1_map.values()) + 1) if len(ind1_map) > 0 else 0
+    n_ind2_known  = (max(ind2_map.values()) + 1) if len(ind2_map) > 0 else 0
+    pad_chain_id = n_chain_known
+    pad_ind1_id  = n_ind1_known
+    pad_ind2_id  = n_ind2_known
+
     ctx_dim = ctx_df.shape[1] if ctx_df.shape[0] > 0 else int(CFG.ctx_dim)
 
+    # 占位模板（仅用于确认结构，不参与推理）
     model_template = GCFNet(
-        d_in=d_in, n_ind=n_ind_known, ctx_dim=ctx_dim,
-        hidden=CFG.hidden, ind_emb_dim=CFG.ind_emb,
-        graph_type=CFG.graph_type, tr_layers=CFG.tr_layers, gat_layers=getattr(CFG, "gat_layers", 1)
+        d_in=d_in,
+        n_chain=n_chain_known, n_ind1=n_ind1_known, n_ind2=n_ind2_known,
+        ctx_dim=ctx_dim,
+        hidden=CFG.hidden, chain_emb_dim=CFG.chain_emb,
+        tr_layers=CFG.tr_layers, gat_layers=getattr(CFG, "gat_layers", 1)
     ).to(cfg.device)
-    model_template.eval()  # 仅作结构占位
+    model_template.eval()
 
     # 3) 读取日行情与筛选所需表（用于过滤）
     price_day_file = cfg.price_day_file
@@ -198,10 +216,9 @@ def main():
             row = price_df.loc[(code, date)]
         except Exception:
             return False
-        for c in ["open","high","low","close"]:
+        for c in ["open", "high", "low", "close"]:
             if c not in price_df.columns:
                 return False
-        # 与 train_utils 的逻辑保持一致
         o = float(row["open"]); h = float(row["high"]); l = float(row["low"]); c = float(row["close"])
         day_ret = (c / o - 1.0) if o > 0 else 0.0
         up_th = 0.098
@@ -232,9 +249,11 @@ def main():
         # 加载该窗口的 best 模型与 scaler
         state = torch.load(model_path, map_location=cfg.device, weights_only=False)
         model = GCFNet(
-            d_in=d_in, n_ind=n_ind_known, ctx_dim=ctx_dim,
-            hidden=CFG.hidden, ind_emb_dim=CFG.ind_emb,
-            graph_type=CFG.graph_type, tr_layers=CFG.tr_layers, gat_layers=getattr(CFG, "gat_layers", 1)
+            d_in=d_in,
+            n_chain=n_chain_known, n_ind1=n_ind1_known, n_ind2=n_ind2_known,
+            ctx_dim=ctx_dim,
+            hidden=CFG.hidden, chain_emb_dim=CFG.chain_emb,
+            tr_layers=CFG.tr_layers, gat_layers=getattr(CFG, "gat_layers", 1)
         ).to(cfg.device)
         if isinstance(state, dict) and "state_dict" in state:
             model.load_state_dict(state["state_dict"], strict=False)
@@ -369,8 +388,10 @@ def main():
                 X = X_all[idx]
                 pool_arr = np.array(pool, dtype=str)
 
-                # 行业ID
-                ind = np.asarray([ind_map.get(s, pad_ind_id) for s in pool_arr], dtype=np.int64)
+                # 三路 ID：chain_sector, industry(一级), industry2(二级)
+                chain_id = np.asarray([chain_map.get(s, pad_chain_id) for s in pool_arr], dtype=np.int64)
+                ind1_id  = np.asarray([ind1_map.get(s, pad_ind1_id)  for s in pool_arr], dtype=np.int64)
+                ind2_id  = np.asarray([ind2_map.get(s, pad_ind2_id)  for s in pool_arr], dtype=np.int64)
 
                 # 上下文
                 if d in ctx_df.index:
@@ -384,10 +405,17 @@ def main():
                 preds = []
                 with torch.no_grad():
                     xb = torch.from_numpy(X).to(cfg.device)
-                    ib = torch.from_numpy(ind).to(cfg.device)
+                    chb = torch.from_numpy(chain_id).to(cfg.device)
+                    i1b = torch.from_numpy(ind1_id).to(cfg.device)
+                    i2b = torch.from_numpy(ind2_id).to(cfg.device)
                     cb = torch.from_numpy(ctx).to(cfg.device)
                     for st in range(0, xb.shape[0], bs):
-                        pe = model(xb[st:st+bs], ib[st:st+bs], cb[st:st+bs])
+                        pe = GCFNet.forward(model,
+                                            xb[st:st+bs],
+                                            chb[st:st+bs],
+                                            i1b[st:st+bs],
+                                            i2b[st:st+bs],
+                                            cb[st:st+bs])
                         preds.append(pe.detach().float().cpu().numpy())
                 score = np.concatenate(preds, 0)
 
@@ -405,6 +433,7 @@ def main():
     ensure_dir(out_pred_filtered)
     pred_df_filtered.to_parquet(out_pred_filtered)
     print(f"[BTRoll-Min] 已保存池内预测：{out_pred_filtered}")
+
 
 if __name__ == "__main__":
     main()

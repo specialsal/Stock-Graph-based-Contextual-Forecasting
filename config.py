@@ -90,8 +90,8 @@ class Config:
 
     # -------- 早停参数（以验证集 ic_rank 为唯一判据）--------
     early_stop_min_epochs  = 3
-    early_stop_max_epochs  = 15
-    early_stop_patience    = 3
+    early_stop_max_epochs  = 50
+    early_stop_patience    = 5
     early_stop_min_delta   = 1e-4
 
     # -------- Warm Start 开关 --------
