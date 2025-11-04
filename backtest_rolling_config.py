@@ -10,7 +10,7 @@ from datetime import datetime
 @dataclass
 class BTRollingConfig:
     # 与训练一致的 run_name（用于定位模型目录）
-    run_name      = "tr1gat1win50_margin_m0_hybrid2graph"
+    run_name      = "tr1gat1win50_marginic"
 
     # 路径
     model_dir     = Path(f"./models/model_{run_name}")
