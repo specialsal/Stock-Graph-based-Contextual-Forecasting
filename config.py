@@ -17,7 +17,8 @@ from datetime import datetime
 @dataclass
 class Config:
     # -------- 运行命名（影响模型输出路径）--------
-    run_name = "tr1gat1win50_margin_m0"
+    # run_name = "tr1gat1win50_margin_m0"
+    run_name = "baseline_lstm"
 
     # -------- 路径 --------
     data_dir      = Path("./data")
@@ -72,7 +73,7 @@ class Config:
     weight_decay  = 1e-2
 
     # -------- 训练细节 --------
-    batch_size        = 8196
+    batch_size        = 4098
     grad_accum_steps  = 1
     device            = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     num_workers       = 8
