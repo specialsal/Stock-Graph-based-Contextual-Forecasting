@@ -1,16 +1,18 @@
 # coding: utf-8
 """
-baseline_lstm_fast.py with tqdm, AMP and speedups (merged and accelerated)
-- 仅用最近 TRAIN_RECENT_WEEKS 周样本 + MAX_TRAIN_SAMPLES 上限
-- 构造样本时清洗与裁剪，固定长度 FIX_T，去除溢出告警与重复裁齐
-- 训练/预测前一次性标准化，减少 CPU 开销
-- DataLoader + pin_memory + 多进程加载，大批量训练
-- AMP 使用 torch.amp.GradScaler 接口
+baseline_lstm_fast.py with tqdm, AMP and speedups (方案A：保留5年训练 + 跨窗口缓存)
+- 保留每窗完整5年训练集不变
+- 新增跨窗口 LRU 缓存：缓存组级样本(X,y,tickers)，滚动窗口间复用
+- 构造样本时一次性清洗与裁剪（非有限值置零、阈值裁剪），固定长度 FIX_T，避免溢出告警
+- 训练前一次性标准化整批训练数据；预测对该组一次性标准化
+- 使用 DataLoader（pin_memory + 多进程）与 AMP GradScaler(新接口)
+- 其余超参（HIDDEN=64、BATCH=8192、EPOCHS等）保持与原设置一致（从 CFG 读取）
 """
 
 import os, h5py, numpy as np, pandas as pd, torch, torch.nn as nn
 from pathlib import Path
 from typing import Dict, Optional, Tuple, List
+from collections import OrderedDict
 from tqdm import tqdm, trange
 
 from config import CFG
@@ -18,27 +20,28 @@ from backtest_rolling_config import BT_ROLL_CFG
 from utils import load_calendar, weekly_fridays
 from train_utils import make_filter_fn, load_stock_info, load_flag_table
 
-# ----------------- 设备与超参 -----------------
+# ----------------- 设备与超参（保持你的默认） -----------------
 device = torch.device(CFG.device)
 USE_AMP = device.type == "cuda"  # 仅在 GPU 使用 AMP
 
 SEQ_TRUNC = int(getattr(CFG, "seq_trunc", 60))
-FIX_T = int(getattr(CFG, "fix_seq_len", min(SEQ_TRUNC, 60)))  # 统一裁齐长度，默认 60
-BATCH = int(getattr(CFG, "batch_size", 8192))                 # 建议尽量大，受显存限制
-EPOCHS = int(getattr(CFG, "epochs", 4))
+FIX_T = int(getattr(CFG, "fix_seq_len", min(SEQ_TRUNC, 60)))  # 固定裁齐长度，默认 60
+BATCH = int(getattr(CFG, "batch_size", 8192))                 # 保持 8192
+EPOCHS = int(getattr(CFG, "epochs", 4))                       # 保持 4
 LR = float(getattr(CFG, "lr", 1e-4))
-HIDDEN = int(getattr(CFG, "hidden", 64))                      # 可设 32 进一步提速
+HIDDEN = int(getattr(CFG, "hidden", 64))                      # 保持 64
 LAYERS = int(getattr(CFG, "layers", 1))
 DROPOUT = float(getattr(CFG, "dropout", 0.1))
 CLIP_NORM = float(getattr(CFG, "clip_norm", 1.0))
 
-# 数据清洗裁剪
+# 数据清洗裁剪（避免溢出/NaN）
 CLIP_ABS = float(getattr(CFG, "feat_clip_abs", 1e6))
 
-# 训练样本控制
-TRAIN_RECENT_WEEKS = int(getattr(CFG, "train_recent_weeks", 26))  # 每窗仅用最近 K 周
-MAX_TRAIN_SAMPLES = int(getattr(CFG, "max_train_samples", 200000))  # 每窗样本上限，0 表示不限
-PATIENCE = int(getattr(CFG, "patience", 1))  # 早停耐心
+# 跨窗口缓存大小（LRU），可在 CFG.lstm_cache_size 调整
+CACHE_SIZE = int(getattr(CFG, "lstm_cache_size", 600))
+
+# DataLoader 并行
+NUM_WORKERS = int(getattr(CFG, "num_workers", max(1, (os.cpu_count() or 8) // 4)))
 
 # ----------------- 配置 -----------------
 RUN = BT_ROLL_CFG
@@ -53,8 +56,8 @@ PRICE_DAY_FILE = RUN.price_day_file
 START = pd.Timestamp(CFG.start_date)
 END   = pd.Timestamp(RUN.bt_end_date)
 
-TRAIN_YEARS = int(CFG.train_years)
-STEP_WEEKS  = int(CFG.step_weeks)
+TRAIN_YEARS = int(CFG.train_years)  # 5
+STEP_WEEKS  = int(CFG.step_weeks)   # 一般 52
 
 # ----------------- 工具 -----------------
 def date_to_group(h5: h5py.File) -> Dict[pd.Timestamp, str]:
@@ -74,6 +77,13 @@ def date_to_group(h5: h5py.File) -> Dict[pd.Timestamp, str]:
 def map_to_h5_group_date(target_date: pd.Timestamp, h5_idx: pd.DatetimeIndex) -> Optional[pd.Timestamp]:
     ok = h5_idx[h5_idx <= target_date]
     return ok[-1] if len(ok) > 0 else None
+
+def clean_and_clip(X: np.ndarray) -> np.ndarray:
+    # 非有限值置零 + 裁剪，避免 nanmean/nanstd 溢出
+    X = np.where(np.isfinite(X), X, 0.0)
+    if CLIP_ABS is not None and CLIP_ABS > 0:
+        X = np.clip(X, -CLIP_ABS, CLIP_ABS)
+    return X
 
 def build_group_samples(h5: h5py.File, gk: str, label_df: pd.DataFrame, filter_fn):
     """
@@ -119,10 +129,7 @@ def build_group_samples(h5: h5py.File, gk: str, label_df: pd.DataFrame, filter_f
         return np.zeros((0, T, X_all.shape[-1]), dtype=np.float32), np.zeros((0,), dtype=np.float32), []
 
     X_kept = X_all[keep_mask].astype(np.float32, copy=False)
-    # 清洗 + 裁剪，避免溢出
-    X_kept = np.where(np.isfinite(X_kept), X_kept, 0.0)
-    if CLIP_ABS is not None and CLIP_ABS > 0:
-        X_kept = np.clip(X_kept, -CLIP_ABS, CLIP_ABS)
+    X_kept = clean_and_clip(X_kept)
 
     tickers = list(stocks[keep_mask])
     y = sub.loc[keep_mask, "next_week_return"].to_numpy(dtype=np.float32)
@@ -199,6 +206,30 @@ def predict_group(model, X_arr_t: torch.Tensor, batch_size: int):
             preds.append(p.detach().float().cpu().numpy())
     return np.concatenate(preds, axis=0)
 
+# ----------------- LRU 缓存 -----------------
+class GroupCacheLRU:
+    """
+    缓存键：group key (gk)
+    值：(X_arr: [M,T,C] float32 (cleaned/clipped), y: [M] float32, tickers: list[str], date: pd.Timestamp)
+    限制：最多保存 max_size 个组；超出时弹出最久未用的条目
+    """
+    def __init__(self, max_size: int = 600):
+        self.max_size = max_size
+        self.od = OrderedDict()
+    def get(self, key):
+        v = self.od.get(key)
+        if v is not None:
+            # LRU 更新
+            self.od.move_to_end(key)
+        return v
+    def put(self, key, value):
+        self.od[key] = value
+        self.od.move_to_end(key)
+        if len(self.od) > self.max_size:
+            self.od.popitem(last=False)  # 弹出最久未用
+    def __len__(self):
+        return len(self.od)
+
 # ----------------- 主流程 -----------------
 def main():
     cal = load_calendar(TRADING_DAY_FILE)
@@ -236,27 +267,30 @@ def main():
         h5_dates = pd.DatetimeIndex(sorted(d2g.keys()))
         preds_all = []
 
+        # 跨窗口缓存
+        cache = GroupCacheLRU(max_size=CACHE_SIZE)
+
         train_weeks = TRAIN_YEARS * 52
         step_weeks  = STEP_WEEKS
 
         pbar_windows = trange(train_weeks, len(fridays_bt), step_weeks, desc="[LSTM] fast rolling", leave=True)
         for i in pbar_windows:
-            train_dates_full = fridays_bt[i - train_weeks : i]
-            # 仅使用最近 TRAIN_RECENT_WEEKS 周
-            if TRAIN_RECENT_WEEKS > 0 and len(train_dates_full) > TRAIN_RECENT_WEEKS:
-                train_dates = train_dates_full[-TRAIN_RECENT_WEEKS:]
-            else:
-                train_dates = train_dates_full
+            train_dates = fridays_bt[i - train_weeks : i]  # 保留完整5年
             pred_dates  = fridays_bt[i : min(i + step_weeks, len(fridays_bt))]
 
-            # 构造训练集
+            # 构造训练集（从缓存取或构建）
             X_tr_list, y_tr_list = [], []
             for d in tqdm(train_dates, desc="  build train (fridays)", leave=False):
                 g_date = d if d in d2g else map_to_h5_group_date(d, h5_dates)
                 if g_date is None: 
                     continue
                 gk = d2g[g_date]
-                X_arr, ys, _ = build_group_samples(h5, gk, label_df, filter_fn)
+                val = cache.get(gk)
+                if val is not None:
+                    X_arr, ys, _tickers, _dt = val
+                else:
+                    X_arr, ys, tickers = build_group_samples(h5, gk, label_df, filter_fn)
+                    cache.put(gk, (X_arr, ys, tickers, g_date))
                 if X_arr.shape[0] == 0: 
                     continue
                 X_tr_list.append(X_arr)
@@ -268,11 +302,6 @@ def main():
 
             X_train = np.concatenate(X_tr_list, axis=0)  # [N, T, C]
             y_train = np.concatenate(y_tr_list, axis=0)  # [N]
-
-            # 样本上限：保留最近（拼接顺序最后的为最近）
-            if MAX_TRAIN_SAMPLES > 0 and X_train.shape[0] > MAX_TRAIN_SAMPLES:
-                X_train = X_train[-MAX_TRAIN_SAMPLES:]
-                y_train = y_train[-MAX_TRAIN_SAMPLES:]
 
             pbar_windows.write(f"[LSTM] window@{i} train_samples={X_train.shape[0]} T={X_train.shape[1]} C={X_train.shape[2]}")
 
@@ -288,28 +317,23 @@ def main():
                 torch.utils.data.TensorDataset(X_train_t, y_train_t),
                 batch_size=BATCH,
                 shuffle=True,
-                num_workers=max(1, os.cpu_count() // 8),
+                num_workers=NUM_WORKERS,
                 pin_memory=True,
                 drop_last=False
             )
 
-            # 模型与优化器
+            # 模型与优化器（保持你的默认超参）
             model = LSTMReg(in_dim=X_train.shape[-1], hidden=HIDDEN, layers=LAYERS, dropout=DROPOUT).to(device)
             opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=1e-4)
             crit = nn.MSELoss()
             scaler_amp = torch.amp.GradScaler("cuda", enabled=USE_AMP)
 
-            # 训练 + 简单早停
-            best_loss = float("inf"); no_improve = 0
+            # 训练
+            best_loss = float("inf")
             for ep, loss in train_epochs(model, opt, scaler_amp, crit, train_loader, EPOCHS):
                 pbar_windows.write(f"[LSTM] window@{i} epoch {ep}/{EPOCHS} loss={loss:.6f}")
                 if loss + 1e-6 < best_loss:
-                    best_loss = loss; no_improve = 0
-                else:
-                    no_improve += 1
-                if no_improve >= PATIENCE:
-                    pbar_windows.write(f"[LSTM] early stop at epoch {ep}, best={best_loss:.6f}")
-                    break
+                    best_loss = loss
 
             # 预测
             for d in tqdm(pred_dates, desc="  predict (fridays)", leave=False):
@@ -317,7 +341,12 @@ def main():
                 if g_date is None: 
                     continue
                 gk = d2g[g_date]
-                Xg, ys, tickers = build_group_samples(h5, gk, label_df, filter_fn)
+                val = cache.get(gk)
+                if val is not None:
+                    Xg, yg, tickers, _ = val
+                else:
+                    Xg, yg, tickers = build_group_samples(h5, gk, label_df, filter_fn)
+                    cache.put(gk, (Xg, yg, tickers, g_date))
                 if Xg.shape[0] == 0: 
                     continue
                 # 标准化
