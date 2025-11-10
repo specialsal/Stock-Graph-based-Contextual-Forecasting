@@ -665,14 +665,14 @@ def main():
         df['nav'] = (1 + df['ret']).cumprod()
 
         selected_columns = df[['date', 'ret', 'nav']].rename(columns={'ret': 'ret_total'})
-        selected_columns.to_csv('backtest_rolling/others/500_index_nav.csv', index=False)
+        selected_columns.to_csv(f'backtest_rolling/others/{id[3:-5]}_index_nav.csv', index=False)
 
-    # 11) 更新黄金ETF
-    print('更新黄金ETF')
-    gold_etf = ak.fund_etf_hist_em(symbol="159934", period="daily", start_date="20100101", end_date=date.today().strftime("%Y%m%d"), adjust="qfq")
-    gold_etf = gold_etf[['日期','开盘','收盘']]
-    gold_etf.columns = ['date','open','close']
-    gold_etf.to_parquet('data/raw/gold_etf_day.parquet')
+    # # 11) 更新黄金ETF
+    # print('更新黄金ETF')
+    # gold_etf = ak.fund_etf_hist_em(symbol="159934", period="daily", start_date="20100101", end_date=date.today().strftime("%Y%m%d"), adjust="qfq")
+    # gold_etf = gold_etf[['日期','开盘','收盘']]
+    # gold_etf.columns = ['date','open','close']
+    # gold_etf.to_parquet('data/raw/gold_etf_day.parquet')
 
 
 if __name__ == '__main__':
