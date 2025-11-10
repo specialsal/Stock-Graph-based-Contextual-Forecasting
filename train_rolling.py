@@ -93,7 +93,8 @@ def main():
     model = GCFNet(
         d_in=d_in, n_ind=n_ind_known, ctx_dim=ctx_dim,
         hidden=CFG.hidden, ind_emb_dim=CFG.ind_emb,
-        graph_type=CFG.graph_type, tr_layers=CFG.tr_layers, gat_layers=getattr(CFG, "gat_layers", 1)
+        graph_type=CFG.graph_type, tr_layers=CFG.tr_layers, gat_layers=getattr(CFG, "gat_layers", 1),
+        use_film=CFG.use_film, use_transformer=CFG.use_transformer
     ).to(CFG.device)
 
     if getattr(CFG, "use_torch_compile", False) and hasattr(torch, "compile"):

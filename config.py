@@ -1,13 +1,22 @@
 # ====================== config.py ======================
 # coding: utf-8
 """
-全局配置 —— RankNet_margin(cost=m) + 精简日志版本
+全局配置 —— RankNet_margin(cost=m) + 精简日志 + 消融开关版本
+
 修改点：
-- 去掉 ranking_weight 及所有混合损失逻辑；
-- 新增 pairwise margin 的常数参数 pair_margin_m 与成对采样数 pair_num_pairs；
-- 日志只保留 pairwise_margin_loss 与 ic_rank；
-- 早停仍以验证集 RankIC 为判据；
-- 其它参数保持一致。
+- 保留你原有的训练/数据/超参配置；
+- 新增三类“消融开关”，用于控制模型中的三个模块是否启用：
+  1) graph_type 支持 "none"（移除 GNN/行业图）
+  2) use_film: False 时移除 FiLM（上下文调制）
+  3) use_transformer: False 时移除 Transformer（改为 GLUConv + AttnPooling）
+
+使用建议（为避免不同实验互相覆盖，建议为每次实验设置独立 run_name）：
+- 基线：run_name = "TGF-model"                （graph_type="gat"/"mean"，use_film=True，use_transformer=True）
+- No-GNN：run_name = "TGF-abl_noGNN"          （graph_type="none"）
+- No-FiLM：run_name = "TGF-abl_noFiLM"        （use_film=False）
+- No-TR：run_name = "TGF-abl_noTR"            （use_transformer=False）
+
+注意：当更改 run_name 时，会自动将模型与回测输出保存到独立目录，互不干扰。
 """
 import torch, random, numpy as np
 from dataclasses import dataclass
@@ -16,9 +25,13 @@ from datetime import datetime
 
 @dataclass
 class Config:
-    # -------- 运行命名（影响模型输出路径）--------
-    # run_name = "tr1gat1win50_margin_m0"
-    run_name = "baseline_lstm"
+    # -------- 运行命名（影响模型输出路径与回测路径）--------
+    # 建议每次实验改一个 run_name，避免覆盖
+    # run_name = "TGF-model"          # 基线
+    # run_name = "TGF-abl_noGNN"      # 移除 GNN（graph_type="none"）
+    # run_name = "TGF-abl_noFiLM"     # 移除 FiLM（use_film=False）
+    # run_name = "TGF-abl_noTR"       # 移除 Transformer（use_transformer=False）
+    run_name = "TGF-model"
 
     # -------- 路径 --------
     data_dir      = Path("./data")
@@ -62,13 +75,24 @@ class Config:
     start_date  = "2011-01-01"
     end_date    = datetime.today().strftime("%Y-%m-%d")
 
-    # -------- 模型超参 --------
+    # -------- 模型超参（与消融相关的开关在此处） --------
     hidden        = 64
     ind_emb       = 16
     ctx_dim       = 21
     tr_layers     = 1
     gat_layers    = 1
+
+    # 行业图类型：
+    #   "gat"  -> 动态注意力行业图（慢）
+    #   "none" -> 移除 GNN（用于消融：仅 Transformer + FiLM）
     graph_type    = "gat"
+
+    # 消融开关：
+    # - use_film=False     -> 移除 FiLM（上下文调制），等价 h_ctx=h_price
+    # - use_transformer=False -> 移除 Transformer，日频编码为 GLUConv + AttnPooling
+    use_film         = True
+    use_transformer  = True
+
     lr            = 1e-4
     weight_decay  = 1e-2
 
@@ -87,8 +111,8 @@ class Config:
     print_step_interval = 10
 
     # -------- Pairwise RankNet (margin) 参数 --------
-    pair_margin_m  = 0   # 常数 margin（约 25 bps，周频）
-    pair_num_pairs = 4096     # 每步随机采样的成对数量
+    pair_margin_m  = 0           # 常数 margin（如 0.0025 表示约 25 bps；你目前为 0）
+    pair_num_pairs = 4096        # 每步随机采样的成对数量
 
     # -------- 早停参数（以验证集 ic_rank 为唯一判据）--------
     early_stop_min_epochs  = 3
@@ -110,10 +134,12 @@ class Config:
     seed = 42
 
     def __post_init__(self):
+        # 目录就绪与随机种子
         self.processed_dir.mkdir(parents=True, exist_ok=True)
         self.model_dir.mkdir(parents=True, exist_ok=True)
         (Path("./models") / "tblogs").mkdir(parents=True, exist_ok=True)  # 统一 TensorBoard 目录
-        random.seed(self.seed)
+        import random as _random
+        _random.seed(self.seed)
         np.random.seed(self.seed)
         torch.manual_seed(self.seed)
         if self.device.type == "cuda":
