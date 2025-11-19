@@ -31,7 +31,8 @@ class Config:
     # run_name = "TGF-abl_noGNN"      # 移除 GNN（graph_type="none"）
     # run_name = "TGF-abl_noFiLM"     # 移除 FiLM（use_film=False）
     # run_name = "TGF-abl_noTR"       # 移除 Transformer（use_transformer=False）
-    run_name = "TGF-model"
+    # run_name = "TGF-model_5_26_26"
+    run_name = "TGF-fundamental"
 
     # -------- 路径 --------
     data_dir      = Path("./data")
@@ -44,6 +45,7 @@ class Config:
 
     # -------- 原始数据文件 --------
     price_day_file     = raw_dir / "stock_price_day.parquet"
+    price_fundamental_file     = raw_dir / "stock_fundamental_day.parquet"
     index_day_file     = raw_dir / "index_price_day.parquet"
     style_day_file     = raw_dir / "sector_price_day.parquet"
     trading_day_file   = raw_dir / "trading_day.csv"
