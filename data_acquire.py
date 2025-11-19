@@ -23,21 +23,22 @@ TRADING_DAY_END = '2030-12-31'
 
 # 是否更新的开关（可按需修改）
 UPDATE_SWITCH = {
-    'trading_calendar': True,      # 交易日 & 交易周
-    'stock_info': True,            # 股票信息（聚宽导出覆盖）
+    'trading_calendar': False,      # 交易日 & 交易周
+    'stock_info': False,            # 股票信息（聚宽导出覆盖）
     'stock_price_day': True,       # 股票日行情（parquet, MultiIndex）
-    'suspended': True,             # 停牌（CSV 宽表）
-    'is_st': True,                 # ST（CSV 宽表）
-    'index_components': True,      # 指数成分（快照覆盖）
-    'industry_and_style': True,    # 行业与风格（快照覆盖 + 映射）
-    'index_price_day': True,       # 指数日行情（parquet, MultiIndex）
-    'sector_price_day': True,      # 新增：风格日行情（增量聚合）
+    'stock_fundamental_day': False, # 股票基本面日行情（parquet, MultiIndex）
+    'suspended': False,             # 停牌（CSV 宽表）
+    'is_st': False,                 # ST（CSV 宽表）
+    'index_components': False,      # 指数成分（快照覆盖）
+    'industry_and_style': False,    # 行业与风格（快照覆盖 + 映射）
+    'index_price_day': False,       # 指数日行情（parquet, MultiIndex）
+    'sector_price_day': False,      # 新增：风格日行情（增量聚合）
 }
 
 # 可选：在获取行情时过滤无效代码，减少 invalid order_book_id 警告
 FILTER_INVALID_CODES = True
-
-
+FACTOR_LIST = ['pe_ratio_ttm','book_to_market_ratio_ttm','ps_ratio_ttm','market_cap_2','dividend_yield_ttm','cash_flow_per_share_ttm','inc_revenue_ttm','net_profit_growth_ratio_ttm'] # 基本面因子列表
+# 市盈率、市净率、市销率、流通股总市值、股息率、每股经营现金流、营业收入同比增长率、净利润同比增长率
 # =========================
 # 通用工具
 # =========================
@@ -156,7 +157,29 @@ def get_price_safe(codes, start_date, end_date, frequency='1d', fields=None,
     except Exception as e:
         warnings.warn(f'get_price_safe error: {e}')
         return None
-
+    
+def get_factor_safe(codes, factor, start_date, end_date, universe=None, market='cn',
+                   expect_df=True, filter_codes=True):
+    code_list = list(codes)
+    if filter_codes and FILTER_INVALID_CODES:
+        if len(code_list) == 0:
+            return None
+    try:
+        df = rq.get_factor(code_list, 
+                           factor, 
+                           start_date=start_date, 
+                           end_date=end_date, 
+                           universe=universe,
+                           expect_df=expect_df, 
+                           market=market)
+        if df is None:
+            return None
+        if isinstance(df, pd.DataFrame) and df.empty:
+            return None
+        return df
+    except Exception as e:
+        warnings.warn(f'get_factor_safe error: {e}')
+        return None
 
 # =========================
 # 1) 交易日与交易周（增量）
@@ -280,7 +303,63 @@ def update_stock_price_day(start='2010-01-01', end=TODAY_STR):
     df_all = concat_dedup_multiindex(df_old, df_new_mi, sort_index=True)
     write_parquet(df_all, out_path)
 
+# =========================
+# 3.5) 股票基本面行情（前复权，MultiIndex 增量）
+# =========================
+def update_stock_fundamental_day(start='2010-01-01', end=TODAY_STR,factor_list=FACTOR_LIST):
+    if not UPDATE_SWITCH.get('stock_fundamental_day', True):
+        return
+    stock_info_path = os.path.join(DATA_PATH, 'stock_info.csv')
+    stock_info = read_csv_safe(stock_info_path, index_col=0, encoding='gbk')
+    if stock_info is None or stock_info.empty:
+        warnings.warn('stock_info.csv 不存在或为空，跳过行情更新')
+        return
+    stock_list = stock_info['code'].dropna().unique().tolist()
 
+    out_path = os.path.join(DATA_PATH, 'stock_fundamental_day.parquet')
+    df_old = read_parquet_safe(out_path)
+
+    # 确保旧数据为 MultiIndex（order_book_id, datetime）
+    if df_old is not None and not df_old.empty:
+        if not isinstance(df_old.index, pd.MultiIndex):
+            idx_cols = [c for c in df_old.columns if c in ['order_book_id', 'date']]
+            if set(idx_cols) == {'order_book_id', 'date'}:
+                df_old['date'] = pd.to_datetime(df_old['date'])
+                df_old = df_old.set_index(['order_book_id', 'date']).sort_index()
+
+    last_dt = max_datetime_from_multiindex(df_old)
+    # 改为包含 last_dt 当天
+    fetch_start = start if last_dt is None else last_dt.strftime('%Y-%m-%d')
+    if pd.to_datetime(fetch_start) > pd.to_datetime(end):
+        return
+
+    df_new = get_factor_safe(
+        stock_list,
+        factor = factor_list,
+        start_date=fetch_start,
+        end_date=end,
+        universe=None,
+        market='cn',
+        expect_df=True,
+        filter_codes=True
+)
+    # 若无增量数据（当天无数据或全部非法），直接退出
+    if df_new is None:
+        return
+
+    # 统一转 MultiIndex
+    if isinstance(df_new.index, pd.MultiIndex):
+        df_new_mi = df_new.copy()
+    else:
+        if {'order_book_id', 'date'}.issubset(df_new.columns):
+            df_new['date'] = pd.to_datetime(df_new['date'])
+            df_new_mi = df_new.set_index(['order_book_id', 'date']).sort_index()
+        else:
+            df_new_mi = df_new.reset_index().set_index(['order_book_id', 'date']).sort_index()
+
+    # 合并：列对齐并去重
+    df_all = concat_dedup_multiindex(df_old, df_new_mi, sort_index=True)
+    write_parquet(df_all, out_path)
 # =========================
 # 4) 停牌信息（宽表，增量）
 # =========================
@@ -630,6 +709,10 @@ def main():
     # 3) 股票日行情（前复权，MultiIndex）
     print('更新股票日行情...')
     update_stock_price_day(start='2010-01-01', end=TODAY_STR)
+
+    # 3.5) 股票基本面日行情（前复权，MultiIndex）
+    print('更新股票基本面日行情...')
+    update_stock_fundamental_day(start='2010-01-01', end=TODAY_STR, factor_list = FACTOR_LIST)
 
     # 4) 停牌（宽表）
     print('更新停牌信息...')
