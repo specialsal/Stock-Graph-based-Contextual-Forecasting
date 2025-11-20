@@ -32,7 +32,7 @@ class Config:
     # run_name = "TGF-abl_noFiLM"     # 移除 FiLM（use_film=False）
     # run_name = "TGF-abl_noTR"       # 移除 Transformer（use_transformer=False）
     # run_name = "TGF-model_5_26_26"
-    run_name = "TGF-context"
+    run_name = "TGF-rank_cs"
 
     # -------- 路径 --------
     data_dir      = Path("./data")
@@ -115,6 +115,14 @@ class Config:
     # -------- Pairwise RankNet (margin) 参数 --------
     pair_margin_m  = 0           # 常数 margin（如 0.0025 表示约 25 bps；你目前为 0）
     pair_num_pairs = 4096        # 每步随机采样的成对数量
+
+    # ===== 新增：收益差权重（cost-sensitive ranking）相关参数 =====
+    # 是否启用“收益差权重”版本的 ranking loss
+    cs_rank_enable       = True
+    # 收益差缩放尺度 alpha：约等于“典型周收益差”的量级（如 2% -> 0.02）
+    cs_rank_alpha        = 0.02
+    # 单个 pair 的权重上限，防止极端暴涨/暴跌样本权重过大
+    cs_rank_w_max        = 3.0
 
     # -------- 早停参数（以验证集 ic_rank 为唯一判据）--------
     early_stop_min_epochs  = 3

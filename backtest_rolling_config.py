@@ -24,7 +24,7 @@ from datetime import datetime
 @dataclass
 class BTRollingConfig:
     # 与训练一致的 run_name（用于定位模型目录）
-    run_name      = "TGF-context"
+    run_name      = "TGF-rank_cs"
     # run_name      = "TGF-abl_noGNN"
     # run_name      = "TGF-abl_noFiLM"
     # run_name      = "TGF-abl_noTR"
@@ -114,7 +114,7 @@ class BTRollingConfig:
     # 是否对分数做“市值中性化”（按 log(市值) 分箱，箱内去均值）
     mkt_neutral_enable: bool = False
     # log(市值) 的分箱数量：例如 5 表示按分位数切成 5 档
-    mkt_neutral_n_bins: int = 10
+    mkt_neutral_n_bins: int = 3
     # 对 log(市值) 做 winsorize 的百分位，0 表示不裁剪；例如 0.01 表示 1% / 99% 裁剪
     mkt_neutral_clip_pct: float = 0
 
