@@ -10,7 +10,11 @@ from datetime import datetime
 @dataclass
 class BTRollingConfig:
     # 与训练一致的 run_name（用于定位模型目录）
-    run_name      = "baseline_lstm"
+    run_name      = "TGF-context"
+    # run_name      = "TGF-abl_noGNN"
+    # run_name      = "TGF-abl_noFiLM"
+    # run_name      = "TGF-abl_noTR"
+    # run_name      = "TGF-abl_noGNN_noFiLM"
 
     # 路径
     model_dir     = Path(f"./models/model_{run_name}")
@@ -18,8 +22,10 @@ class BTRollingConfig:
 
     # 回测区间（周五采样日）
     bt_start_date = "2017-02-10"
-    # bt_end_date   = datetime.today().strftime("%Y-%m-%d")
-    bt_end_date   = "2025-10-31"
+    bt_end_date   = datetime.today().strftime("%Y-%m-%d")
+    # bt_end_date   = "2025-10-31"
+    # bt_start_date = "2015-01-01"
+    # bt_end_date   = "2015-12-31"
 
     # 运行名（用于输出文件命名）
     run_name_out  = run_name
@@ -46,13 +52,13 @@ class BTRollingConfig:
     # 分组与持仓控制
     top_pct        = 0.05
     bottom_pct     = 0.05
-    min_n_stocks   = 100
-    max_n_stocks   = 200
+    min_n_stocks   = 8 # 50
+    max_n_stocks   = 8 #300
 
     # 成本与滑点（非对称）
     # 注意：bps 为基点（万分之一）。例如 3 表示万三（0.03%）
-    buy_fee_bps    = 0.95   # 买入手续费：万零点八五
-    sell_fee_bps   = 5.95   # 卖出手续费：万五点八五
+    buy_fee_bps    = 5   # 买入手续费：万零点95
+    sell_fee_bps   = 10   # 卖出手续费：万5点95
     slippage_bps   = 5   # 双边对称滑点：万五（买卖两侧都加）
 
     # 过滤与样本要求（与训练一致，可按需启用）
@@ -72,7 +78,7 @@ class BTRollingConfig:
     # 周内止盈/止损参数
     enable_intraweek_stops: bool = False
     tp_price_ratio: float = 99
-    sl_price_ratio: float = 0.05
+    sl_price_ratio: float = 99
 
     # 组合权重与过滤（从代码中上移到配置）
     weight_mode: str = "equal"  # "equal" 或 "score"

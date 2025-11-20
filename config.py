@@ -32,7 +32,7 @@ class Config:
     # run_name = "TGF-abl_noFiLM"     # 移除 FiLM（use_film=False）
     # run_name = "TGF-abl_noTR"       # 移除 Transformer（use_transformer=False）
     # run_name = "TGF-model_5_26_26"
-    run_name = "TGF-fundamental"
+    run_name = "TGF-context"
 
     # -------- 路径 --------
     data_dir      = Path("./data")
