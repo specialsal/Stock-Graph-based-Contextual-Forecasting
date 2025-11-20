@@ -133,7 +133,8 @@ class Config:
     # -------- 模型选择/早停综合指标权重 --------
     # 使用 score = val_rankic_mean - model_select_lambda * val_loss 作为模型选择与早停目标
     # 例如：0.0 表示仅看 RankIC；0.1~1e-3 之间可以自行尝试
-    model_select_lambda = 0.0
+    model_select_alpha = 0.0 # 1为只看RankIC
+    model_select_beta = 1.0
 
     # -------- Warm Start 开关 --------
     warm_start_enable = False

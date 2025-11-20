@@ -390,8 +390,9 @@ def main():
                     val_avg_icr = sum(d["ic_rank"] * wi for d, wi in zip(per_date_val, wv))
                     val_avg_prl = sum(d["pairwise_margin_loss"] * wi for d, wi in zip(per_date_val, wv))
                     # 使用综合 score = RankIC - λ * loss
-                    lam = float(getattr(CFG, "model_select_lambda", 0.0))
-                    val_target = float(val_avg_icr - lam * val_avg_prl)
+                    alpha = float(getattr(CFG, "model_select_alpha", 1.0))
+                    beta = float(getattr(CFG, "model_select_beta", 0.0))
+                    val_target = float(alpha*val_avg_icr + beta * val_avg_prl)
 
                 print(f"  Val:  pairwise_margin_loss={val_avg_prl:.4f} ic_r={val_avg_icr:.4f} "
                       f"score={val_target:.4f}")
@@ -488,8 +489,9 @@ def main():
             per_date_val = eval_split_stream(val_gk)
             final_val = summarize(per_date_val)
 
-            lam = float(getattr(CFG, "model_select_lambda", 0.0))
-            final_score = float(final_val["avg_ic_rank"] - lam * final_val["avg_pairwise_margin_loss"])
+            alpha = float(getattr(CFG, "model_select_alpha", 1.0))
+            beta = float(getattr(CFG, "model_select_beta", 0.0))
+            final_score = float(alpha* final_val["avg_ic_rank"] + beta * final_val["avg_pairwise_margin_loss"])
             row = {
                 "pred_date": pred_date.strftime("%Y-%m-%d"),
                 "best_epoch": best_epoch,
