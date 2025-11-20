@@ -14,96 +14,7 @@ from utils import load_calendar, weekly_fridays
 EPS = 1e-12
 
 SECTORS = ['周期风格', '成长风格', '消费风格', '稳定风格', '金融风格']
-SECTOR_NAME_MAP = {
-    '周期风格': 'cyclical',
-    '成长风格': 'growth',
-    '消费风格': 'consumption',
-    '稳定风格': 'stable',
-    '金融风格': 'financial',
-}
 INDEXS  = ['000300.XSHG', '000905.XSHG', '000852.XSHG']
-
-def load_sector_breadth():
-    """从 sector_price_day.parquet 读取每日风格 breadth 并转成宽表"""
-    path = CFG.raw_dir / "sector_price_day.parquet"
-    if not path.exists():
-        raise FileNotFoundError(f"缺少 {path}，无法计算风格 breadth")
-    df = pd.read_parquet(path)
-    if 'date' not in df.columns or 'sector' not in df.columns or 'breadth' not in df.columns:
-        raise ValueError("sector_price_day 需要包含 ['date','sector','breadth'] 列")
-    df['date'] = pd.to_datetime(df['date'])
-    df = df[df['sector'].isin(SECTORS)].copy()
-    br_pivot = df.pivot(index='date', columns='sector', values='breadth')
-    # 统一列顺序
-    br_pivot = br_pivot.reindex(columns=SECTORS)
-    return br_pivot
-
-def load_index_breadth() -> pd.DataFrame:
-    """
-    使用当前指数成分 + stock_price_day 计算指数成分 breadth
-    返回：index=date, columns=INDEXS
-    """
-    # 个股日行情
-    stock_price_path = CFG.price_day_file  # 你在 CFG 里对应的路径名，请用实际字段
-    stock_df = pd.read_parquet(stock_price_path)
-    if not isinstance(stock_df.index, pd.MultiIndex):
-        idx_cols = [c for c in stock_df.columns if c in ['order_book_id', 'datetime']]
-        if set(idx_cols) == {'order_book_id', 'datetime'}:
-            stock_df['datetime'] = pd.to_datetime(stock_df['datetime'])
-            stock_df = stock_df.set_index(['order_book_id', 'datetime']).sort_index()
-        else:
-            raise ValueError("stock_price_day 必须是 MultiIndex(order_book_id, datetime)")
-    stock_df = stock_df[['open', 'close']].copy()
-    stock_df = stock_df.reset_index().rename(columns={'datetime': 'date'})
-    stock_df['date'] = pd.to_datetime(stock_df['date'])
-
-    # 读取指数成分快照
-    comp_dir = CFG.raw_dir
-    comp_map = {
-        '000300.XSHG': comp_dir / 'index_components_000300.csv',
-        '000905.XSHG': comp_dir / 'index_components_000905.csv',
-        '000852.XSHG': comp_dir / 'index_components_000852.csv',
-    }
-    index_breadth_rows = []
-
-    for idx_code, path in comp_map.items():
-        if not path.exists():
-            raise FileNotFoundError(f"缺少指数成分文件: {path}")
-        comps = pd.read_csv(path, index_col=0, header=None).iloc[:,0].astype(str).str.strip().tolist()
-        if len(comps) == 0:
-            continue
-
-        # 过滤出成分股行情
-        sub = stock_df[stock_df['order_book_id'].isin(comps)].copy()
-        if sub.empty:
-            continue
-
-        def _agg_index_one_day(df_day: pd.DataFrame):
-            # 使用 close/open 近似当日收益
-            df_day = df_day.dropna(subset=['open','close'])
-            if df_day.empty:
-                return np.nan
-            ret = df_day['close'] / df_day['open'] - 1.0
-            up = (ret > 0).sum()
-            down = (ret < 0).sum()
-            total = len(ret)
-            if total == 0:
-                return np.nan
-            return float((up - down) / total)
-
-        br = sub.groupby('date')[['open', 'close']].apply(_agg_index_one_day)
-        br.name = idx_code
-        index_breadth_rows.append(br)
-
-    if not index_breadth_rows:
-        return pd.DataFrame(index=pd.DatetimeIndex([], name='date'), columns=INDEXS)
-
-    br_df = pd.concat(index_breadth_rows, axis=1)
-    br_df.index = pd.to_datetime(br_df.index)
-    br_df = br_df.sort_index()
-    # 统一列顺序
-    br_df = br_df.reindex(columns=INDEXS)
-    return br_df
 
 def _ret(s: pd.Series): return s.pct_change()
 def _mean(s: pd.Series, n: int): return s.rolling(n, min_periods=1).mean()
@@ -170,17 +81,17 @@ def _prepare_sector(sector_df: pd.DataFrame):
 
 def build_context_for_dates(index_df: pd.DataFrame,
                             sector_df: pd.DataFrame,
-                            sector_breadth: pd.DataFrame,
-                            index_breadth: pd.DataFrame,
                             target_fridays: pd.DatetimeIndex) -> pd.DataFrame:
-    """仅对给定的 target_fridays 计算上下文特征
-       sector_breadth: index=date, columns=SECTORS, 值为成分股聚合的 breadth
-    """
+    """仅对给定的 target_fridays 计算上下文特征"""
     idx_close, idx_turn = _prepare_index(index_df)
     sec_close, sec_turn = _prepare_sector(sector_df)
 
     idx_ret = idx_close.pct_change()
     sec_ret = sec_close.pct_change()
+
+    sec_up = (sec_ret > 0).sum(axis=1)
+    sec_dn = (sec_ret < 0).sum(axis=1)
+    bread  = (sec_up - sec_dn) / sec_ret.shape[1]
 
     rows = []
     dates = []
@@ -189,13 +100,13 @@ def build_context_for_dates(index_df: pd.DataFrame,
         idx_dates = idx_close.index[idx_close.index <= d]
         sec_dates = sec_close.index[sec_close.index <= d]
         if len(idx_dates) == 0 or len(sec_dates) == 0:
+            # 没有可用数据，直接跳过该周五（保持严格，但允许数据边界导致的缺失）
             continue
         dt_idx = idx_dates[-1]
         dt_sec = sec_dates[-1]
 
         feat = {}
-
-        # 1) 指数特征（原逻辑不变）
+        # 指数特征
         for code in INDEXS:
             r = idx_ret[code]; t = idx_turn[code]
             if dt_idx not in r.index or dt_idx not in t.index:
@@ -210,22 +121,12 @@ def build_context_for_dates(index_df: pd.DataFrame,
                 feat[f'{code}_ret_std_{n}']  = r_std.loc[dt_idx]
                 feat[f'{code}_to_mean_ratio_{n}'] = (t_mean / (t + EPS)).loc[dt_idx]
                 feat[f'{code}_to_std_ratio_{n}']  = (t_std / (t.abs() + EPS)).loc[dt_idx]
-        # 1.5) 宽基指数 breadth（基于成分股）
-        if index_breadth is not None and dt_idx in index_breadth.index:
-            for code in INDEXS:
-                if code in index_breadth.columns:
-                    feat[f'breadth_{code[3:-5]}'] = index_breadth.at[dt_idx, code]
-        # 2) 风格 breadth：用 sector_breadth（5 个因子）
-        if sector_breadth is not None and dt_sec in sector_breadth.index:
-            for s in SECTORS:
-                val = sector_breadth.at[dt_sec, s]
-                eng = SECTOR_NAME_MAP.get(s, s)  # 找不到就退回原名
-                feat[f'breadth_{eng}'] = val
-            # 若仍需要一个总的风格 breadth，可用简单平均
-            vals = sector_breadth.loc[dt_sec, SECTORS]
-            feat['bread_style'] = vals.mean()
 
-        # 3) 风格收益与成交额特征（原逻辑不变）
+        # 风格 breadth
+        if dt_sec in bread.index:
+            feat['bread_style'] = bread.loc[dt_sec]
+
+        # 风格特征
         for s in SECTORS:
             r = sec_ret[s]; t = sec_turn[s]
             if dt_sec not in r.index or dt_sec not in t.index:
@@ -240,8 +141,6 @@ def build_context_for_dates(index_df: pd.DataFrame,
                 feat[f'{s}_ret_std_{n}']  = r_std.loc[dt_sec]
                 feat[f'{s}_to_mean_ratio_{n}'] = (t_mean / (t + EPS)).loc[dt_sec]
                 feat[f'{s}_to_std_ratio_{n}']  = (t_std / (t.abs() + EPS)).loc[dt_sec]
-
-        # 宽基指数 breadth 会在下一个小节添加
 
         if len(feat) == 0:
             continue
@@ -292,11 +191,9 @@ def main():
     # 载入原始数据
     index_df  = pd.read_parquet(CFG.index_day_file)
     sector_df = pd.read_parquet(CFG.style_day_file)
-    sector_breadth = load_sector_breadth()
-    index_breadth = load_index_breadth()
 
     # 仅对目标周五计算
-    ctx_new = build_context_for_dates(index_df, sector_df, sector_breadth, index_breadth, missing)
+    ctx_new = build_context_for_dates(index_df, sector_df, missing)
 
     if ctx_old is None or ctx_old.empty:
         ctx_all = ctx_new
