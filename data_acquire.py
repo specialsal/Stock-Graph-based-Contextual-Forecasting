@@ -25,14 +25,14 @@ TRADING_DAY_END = '2030-12-31'
 UPDATE_SWITCH = {
     'trading_calendar': False,      # 交易日 & 交易周
     'stock_info': False,            # 股票信息（聚宽导出覆盖）
-    'stock_price_day': True,       # 股票日行情（parquet, MultiIndex）
+    'stock_price_day': False,       # 股票日行情（parquet, MultiIndex）
     'stock_fundamental_day': False, # 股票基本面日行情（parquet, MultiIndex）
     'suspended': False,             # 停牌（CSV 宽表）
     'is_st': False,                 # ST（CSV 宽表）
     'index_components': False,      # 指数成分（快照覆盖）
     'industry_and_style': False,    # 行业与风格（快照覆盖 + 映射）
     'index_price_day': False,       # 指数日行情（parquet, MultiIndex）
-    'sector_price_day': False,      # 新增：风格日行情（增量聚合）
+    'sector_price_day': True,      # 新增：风格日行情（增量聚合）
 }
 
 # 可选：在获取行情时过滤无效代码，减少 invalid order_book_id 警告
@@ -584,7 +584,7 @@ def update_sector_price_day(start='2010-01-01', end=TODAY_STR):
     # 目标风格枚举（固定五类）
     TARGET_SECTORS = ['周期风格', '成长风格', '消费风格', '稳定风格', '金融风格']
 
-    # 取出我们需要的行情列
+    # 取出我们需要的行情列（这里最好保证有 open, close, total_turnover）
     cols_needed = []
     for c in ['open', 'close', 'high', 'low', 'volume', 'total_turnover', 'num_trades']:
         if c in price_df.columns:
@@ -597,6 +597,8 @@ def update_sector_price_day(start='2010-01-01', end=TODAY_STR):
     # 把 MultiIndex 拆成列，便于合并风格映射
     price_small = price_small.reset_index()
     price_small['order_book_id'] = price_small['order_book_id'].astype(str).str.strip()
+    # 这里 MultiIndex 第二层叫 'datetime'，要改成 'date'
+    price_small = price_small.rename(columns={'datetime': 'date'})
     price_small['date'] = pd.to_datetime(price_small['date'])
 
     # 合并 sector
@@ -624,7 +626,7 @@ def update_sector_price_day(start='2010-01-01', end=TODAY_STR):
     if price_small.empty:
         return
 
-    # 当日每风格聚合：成交额权重聚合 close；成交额/成交量/笔数直接求和；成分数量记有效样本数
+    # 当日每风格聚合：新增 breadth_style 列
     def _agg_one_day(df_day: pd.DataFrame) -> pd.DataFrame:
         rows = []
         for sec in TARGET_SECTORS:
@@ -637,6 +639,24 @@ def update_sector_price_day(start='2010-01-01', end=TODAY_STR):
             sub = sub.dropna(subset=['close', 'total_turnover'])
             if sub.empty:
                 continue
+
+            # 计算 breadth（这里用 close 与 open 近似当日收益，你可以改成使用 prev_close）
+            # 只对 open 和 close 都非空的记录计算涨跌
+            if 'open' in sub.columns:
+                sub_ret = sub.dropna(subset=['open', 'close']).copy()
+                if len(sub_ret) > 0:
+                    ret = sub_ret['close'] / sub_ret['open'] - 1.0
+                    up_count = (ret > 0).sum()
+                    down_count = (ret < 0).sum()
+                    total = len(ret)
+                    if total > 0:
+                        breadth_val = float((up_count - down_count) / total)
+                    else:
+                        breadth_val = np.nan
+                else:
+                    breadth_val = np.nan
+            else:
+                breadth_val = np.nan
 
             tot = float(sub['total_turnover'].sum())
             if tot <= 0:
@@ -658,10 +678,11 @@ def update_sector_price_day(start='2010-01-01', end=TODAY_STR):
                 'total_turnover': turnover_sum,
                 'volume': volume_sum,
                 'num_trades': trades_sum,
-                'constituents_count': cnt
+                'constituents_count': cnt,
+                'breadth': breadth_val,          # 新增：风格 breadth
             })
         if not rows:
-            return pd.DataFrame(columns=['sector','date','close','total_turnover','volume','num_trades','constituents_count'])
+            return pd.DataFrame(columns=['sector','date','close','total_turnover','volume','num_trades','constituents_count','breadth'])
         return pd.DataFrame(rows)
 
     # 对每日进行聚合
@@ -679,8 +700,8 @@ def update_sector_price_day(start='2010-01-01', end=TODAY_STR):
     if sector_old is None or sector_old.empty:
         sector_all = sector_new
     else:
-        # 统一列顺序
-        base_cols = ['sector','date','close','total_turnover','volume','num_trades','constituents_count']
+        # 统一列顺序（加上 breadth）
+        base_cols = ['sector','date','close','total_turnover','volume','num_trades','constituents_count','breadth']
         for c in base_cols:
             if c not in sector_old.columns:
                 sector_old[c] = np.nan
