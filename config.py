@@ -130,6 +130,11 @@ class Config:
     early_stop_patience    = 3
     early_stop_min_delta   = 1e-4
 
+    # -------- 模型选择/早停综合指标权重 --------
+    # 使用 score = val_rankic_mean - model_select_lambda * val_loss 作为模型选择与早停目标
+    # 例如：0.0 表示仅看 RankIC；0.1~1e-3 之间可以自行尝试
+    model_select_lambda = 0.0
+
     # -------- Warm Start 开关 --------
     warm_start_enable = False
     warm_start_strict = False  # 推荐 False，允许部分加载

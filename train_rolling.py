@@ -389,9 +389,12 @@ def main():
                     wv = [d["n"] / n_total for d in per_date_val]
                     val_avg_icr = sum(d["ic_rank"] * wi for d, wi in zip(per_date_val, wv))
                     val_avg_prl = sum(d["pairwise_margin_loss"] * wi for d, wi in zip(per_date_val, wv))
-                    val_target = float(val_avg_icr)
+                    # 使用综合 score = RankIC - λ * loss
+                    lam = float(getattr(CFG, "model_select_lambda", 0.0))
+                    val_target = float(val_avg_icr - lam * val_avg_prl)
 
-                print(f"  Val:  pairwise_margin_loss={val_avg_prl:.4f} ic_r={val_avg_icr:.4f}")
+                print(f"  Val:  pairwise_margin_loss={val_avg_prl:.4f} ic_r={val_avg_icr:.4f} "
+                      f"score={val_target:.4f}")
 
                 ep = epoch_id - 1
                 writer.add_scalar(f"{tb_prefix}/val/pairwise_margin_loss", val_avg_prl, ep)
@@ -485,11 +488,14 @@ def main():
             per_date_val = eval_split_stream(val_gk)
             final_val = summarize(per_date_val)
 
+            lam = float(getattr(CFG, "model_select_lambda", 0.0))
+            final_score = float(final_val["avg_ic_rank"] - lam * final_val["avg_pairwise_margin_loss"])
             row = {
                 "pred_date": pred_date.strftime("%Y-%m-%d"),
                 "best_epoch": best_epoch,
                 "val_avg_rankic": final_val["avg_ic_rank"],
                 "val_avg_pairwise_margin_loss": final_val["avg_pairwise_margin_loss"],
+                "val_score": final_score,
                 "epoch_count": epoch_id,
             }
             df_new = pd.DataFrame([row])
