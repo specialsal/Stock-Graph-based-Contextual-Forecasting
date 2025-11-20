@@ -15,10 +15,7 @@
 注意：
 - 需要 utils.read_h5_meta / list_missing_fridays / get_required_history_start / ensure_multiindex_price 等工具函数。
 - 最长回溯窗口为 120（与当前因子定义一致）；若后续新增更长窗口，请同步更新 CFG.max_lookback。
-- 本版本在原有技术因子的基础上，额外接入日度基本面因子（来自 stock_fundamental_day.parquet），
-  并将 market_cap_2 以对数形式（log_mktcap2）作为因子使用。
 """
-
 import numpy as np
 import pandas as pd
 import h5py
@@ -75,13 +72,8 @@ def _zscore(s: pd.Series, win: int) -> pd.Series:
     m = _mean_rolling(s, win); sd = _std_rolling(s, win)
     return (s - m) / (sd + EPS)
 
-# ===== 因子计算（与原版一致，仅技术因子） =====
+# ===== 因子计算（与原版一致） =====
 def calc_factors_one_stock_full(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    输入 df 需至少包含行情列：open, high, low, close, volume, num_trades, total_turnover
-    该函数只用这些行情列计算技术因子；不会直接使用基本面列。
-    基本面将由外层在时间轴上 join 进来。
-    """
     out = pd.DataFrame(index=df.index)
     O, H, L, C = df['open'], df['high'], df['low'], df['close']
     V, NT, TT = df['volume'], df['num_trades'], df['total_turnover']
@@ -194,45 +186,15 @@ def calc_factors_one_stock_full(df: pd.DataFrame) -> pd.DataFrame:
     out = out.replace([np.inf, -np.inf], np.nan)
     return out
 
-# ===== 并行包装（技术因子 + 基本面因子拼接） =====
-def _compute_one(stock: str,
-                 price_all: pd.DataFrame,
-                 fund_all: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
-    """
-    对单只股票，在给定的局部行情片段 price_all 和基本面片段 fund_all 上：
-    - 先用 price_all 计算技术因子（calc_factors_one_stock_full）
-    - 再将对齐到日期的基本面列 join 进来
-    返回 index=日期 的因子 DataFrame（技术 + 基本面）
-    """
+# ===== 并行包装 =====
+def _compute_one(stock: str, df_all: pd.DataFrame) -> Tuple[str, pd.DataFrame]:
     try:
-        # 行情历史
-        hist_price = price_all.loc[stock]
-        if isinstance(hist_price, pd.Series):
-            hist_price = hist_price.to_frame().T
-        hist_price = hist_price.sort_index()
-
-        # 对应股票的基本面历史（可能缺失）
-        if stock in fund_all.index.get_level_values(0):
-            hist_fund = fund_all.loc[stock]
-            if isinstance(hist_fund, pd.Series):
-                hist_fund = hist_fund.to_frame().T
-            hist_fund = hist_fund.sort_index()
-            # 按日期对齐，左连接使得所有行情日期保留，基本面缺失为 NaN
-            hist_merged = hist_price.join(hist_fund, how="left")
-        else:
-            hist_merged = hist_price.copy()
-
-        # 只用行情部分计算技术因子
-        fct_tech = calc_factors_one_stock_full(hist_merged)
-
-        # 将基本面列 join 进因子表（按日期对齐）
-        fund_cols_here = [c for c in fund_all.columns if c in hist_merged.columns]
-        if fund_cols_here:
-            fct_all = fct_tech.join(hist_merged[fund_cols_here], how="left")
-        else:
-            fct_all = fct_tech
-
-        return stock, fct_all
+        hist = df_all.loc[stock]
+        if isinstance(hist, pd.Series):
+            hist = hist.to_frame().T
+        hist = hist.sort_index()
+        fct = calc_factors_one_stock_full(hist)
+        return stock, fct
     except Exception:
         return stock, pd.DataFrame()
 
@@ -246,51 +208,11 @@ def enforce_factor_cols_consistency(stock_feat: Dict[str, pd.DataFrame], existed
 
 # ===== 主流程（增量 + 局部片段 + 覆盖最后一日） =====
 def main():
-    # 1) 读取最新的日频行情数据并规范索引
+    # 1) 读取最新的日频数据并规范索引
     day_df = pd.read_parquet(CFG.price_day_file)
     day_df = ensure_multiindex_price(day_df)
 
     stocks = day_df.index.get_level_values(0).unique().tolist()
-
-    # 1.1) 读取基本面日频数据，并与行情索引对齐
-    fund_df = pd.read_parquet(CFG.price_fundamental_file)
-
-    if not isinstance(fund_df.index, pd.MultiIndex) or fund_df.index.nlevels != 2:
-        # 假设有显式列 order_book_id, date
-        fund_df = fund_df.set_index(["order_book_id", "date"]).sort_index()
-
-    # 将 MultiIndex 第二级名称统一为 'datetime'，与 day_df 一致
-    names = list(fund_df.index.names)
-    if names != ["order_book_id", "datetime"]:
-        try:
-            fund_df.index = fund_df.index.set_names(["order_book_id", "datetime"])
-        except Exception:
-            pass
-    fund_df = fund_df.sort_index()
-
-    # 对 market_cap_2 做 log 变换，得到对数流通市值因子
-    if "market_cap_2" in fund_df.columns:
-        mc = fund_df["market_cap_2"].astype(float)
-        # clip 以避免 log(0) 或 log(非常小的负数/噪声)
-        fund_df["log_mktcap2"] = np.log(np.clip(mc, 1e4, None))
-    else:
-        raise ValueError("stock_fundamental_day.parquet 缺少列 'market_cap_2'")
-
-    # 只保留我们需要的 8 个基本面因子（其中市值使用 log 变换后的 log_mktcap2）
-    fund_cols = [
-        "pe_ratio_ttm",
-        "book_to_market_ratio_ttm",
-        "ps_ratio_ttm",
-        "log_mktcap2",                   # 对数流通市值
-        "dividend_yield_ttm",
-        "cash_flow_per_share_ttm",
-        "inc_revenue_ttm",
-        "net_profit_growth_ratio_ttm",
-    ]
-    missing_fund = [c for c in fund_cols if c not in fund_df.columns]
-    if missing_fund:
-        raise ValueError(f"fundamental 数据缺少必要列: {missing_fund}")
-    fund_df = fund_df[fund_cols].copy()
 
     # 2) 已写入的 H5 元信息
     h5_path = Path(CFG.feat_file)
@@ -316,21 +238,12 @@ def main():
     print(f"局部历史片段: {hist_start.date()} ~ {hist_end.date()}, 读取中...")
     sliced = day_df[(day_df.index.get_level_values('datetime') >= hist_start) &
                     (day_df.index.get_level_values('datetime') <= hist_end)]
-    print(f"读取局部行情片段: {sliced.index.get_level_values('datetime').min().date()} ~ {sliced.index.get_level_values('datetime').max().date()}, "
-          f"股票数={sliced.index.get_level_values(0).nunique()}")
+    print(f"读取局部行情片段: {sliced.index.get_level_values('datetime').min().date()} ~ {sliced.index.get_level_values('datetime').max().date()}, 股票数={sliced.index.get_level_values(0).nunique()}")
 
-    # 对基本面也截取同一区间
-    fund_sliced = fund_df[(fund_df.index.get_level_values('datetime') >= hist_start) &
-                          (fund_df.index.get_level_values('datetime') <= hist_end)]
-
-    # 5) 并行计算“局部片段”的全量因子缓存（技术 + 基本面）
+    # 5) 并行计算“局部片段”的全量因子缓存
     stock_feat: Dict[str, pd.DataFrame] = {}
-    valid_stocks_price = set(sliced.index.get_level_values(0).unique())
     with ThreadPoolExecutor(max_workers=CFG.num_workers) as ex:
-        futures = {
-            ex.submit(_compute_one, s, sliced, fund_sliced): s
-            for s in stocks if s in valid_stocks_price
-        }
+        futures = {ex.submit(_compute_one, s, sliced): s for s in stocks if s in sliced.index.get_level_values(0)}
         for fut in tqdm(as_completed(futures), total=len(futures), desc="并行计算因子(局部片段)"):
             s = futures[fut]
             stk, fct = fut.result()
@@ -341,7 +254,7 @@ def main():
         print("局部片段内无可计算的股票因子，增量构建结束。")
         return
 
-    # 6) 因子列名与历史一致（首次构建时会自动包含技术 + 基本面所有列）
+    # 6) 因子列名与历史一致
     factor_cols = enforce_factor_cols_consistency(stock_feat, existed_cols)
 
     # 7) 逐个周五写入（只处理缺失/需覆盖的）
@@ -369,8 +282,7 @@ def main():
                 try:
                     del h5f[existing_groups[d]]
                 except Exception:
-                    # 删除失败则忽略，后面追加会多一组；但 read_h5_meta 会以 attrs['date'] 来识别
-                    pass
+                    pass  # 删除失败则忽略，继续用追加写入覆盖（会留下重复，建议尽量删除成功）
 
             feats_all = []
             stk_list  = []
@@ -380,7 +292,6 @@ def main():
                 if len(fct_hist) < CFG.daily_window:
                     continue
                 fct_win = fct_hist.tail(CFG.daily_window)
-                # 对齐列顺序（技术 + 基本面）
                 fct_win = fct_win.reindex(columns=factor_cols)
                 vals = fct_win.values
                 if not np.isfinite(vals).any() or np.isnan(vals).all():
@@ -395,7 +306,6 @@ def main():
                 continue
 
             feats_arr = np.stack(feats_all, axis=0)  # [N,T,C]
-            # 对所有因子统一做 MAD 裁剪和 NaN→0（包括基本面）
             feats_arr = mad_clip(feats_arr)
             feats_arr = np.nan_to_num(feats_arr, nan=0.0, posinf=0.0, neginf=0.0)
 
