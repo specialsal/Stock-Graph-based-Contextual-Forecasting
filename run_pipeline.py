@@ -33,6 +33,8 @@ def main():
     bt_gen()
     print("STEP 7: 回测统计指标")
     metrics_gen(f"./backtest_rolling/{BTRollingConfig.run_name}/nav_{BTRollingConfig.run_name}.csv")
+    # metrics_gen(f"./backtest_rolling/{BTRollingConfig.run_name}/nav_with_timing_rolling_{BTRollingConfig.run_name}.csv")
+    # metrics_gen(f"./backtest_rolling/{BTRollingConfig.run_name}/nav_with_timing_rule_mdd_{BTRollingConfig.run_name}.csv")
     # print("STEP 8: 组合黄金etf")
     # combine_s_g()
     # print("STEP 9: 组合回测统计指标")

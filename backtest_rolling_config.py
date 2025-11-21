@@ -24,7 +24,7 @@ from datetime import datetime
 @dataclass
 class BTRollingConfig:
     # 与训练一致的 run_name（用于定位模型目录）
-    run_name      = "TGF-rank_cs"
+    run_name      = "TGF-model"
     # run_name      = "TGF-abl_noGNN"
     # run_name      = "TGF-abl_noFiLM"
     # run_name      = "TGF-abl_noTR"
@@ -49,7 +49,7 @@ class BTRollingConfig:
     processed_dir  = data_dir / "processed"
     raw_dir        = data_dir / "raw"
     feat_file      = processed_dir / "features_daily.h5"
-    ctx_file       = processed_dir / "context_features.parquet"
+    ctx_file       = processed_dir / "context_features_bread.parquet"
     label_file     = processed_dir / "weekly_labels.parquet"
     industry_map_file = raw_dir / "stock_industry_map.csv"
     trading_day_file  = raw_dir / "trading_day.csv"
@@ -92,9 +92,10 @@ class BTRollingConfig:
     include_neeq        = False
 
     # 周内止盈/止损参数
-    enable_intraweek_stops: bool = False
-    tp_price_ratio: float = 99
-    sl_price_ratio: float = 99
+    enable_intraweek_stops: bool = True
+    tp_price_ratio: float = 0.15
+    sl_price_ratio: float = 0.01
+    cooldown_days: float = 1
 
     # 组合权重与过滤（从代码中上移到配置）
     weight_mode: str = "equal"  # "equal" 或 "score"

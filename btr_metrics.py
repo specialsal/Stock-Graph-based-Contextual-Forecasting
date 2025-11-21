@@ -35,11 +35,13 @@ MAIN_NAV_PATH = f"./backtest_rolling/{cfg.run_name}/nav_{cfg.run_name}.csv"
 
 COMPARISON_NAV_PATHS = [
     r"./backtest_rolling/others/300_index_nav.csv",
+    # r"./backtest_rolling/TGF-model/nav_TGF-model.csv",
     # r"./backtest_rolling/others/500_index_nav.csv",
     # r"./backtest_rolling/others/1000_index_nav.csv",
 ]
 
 BENCHMARK_NAV_PATH = r"./backtest_rolling/others/300_index_nav.csv"  # 可设为 None
+# BENCHMARK_NAV_PATH = r"./backtest_rolling/TGF-model/nav_TGF-model.csv"
 
 ANNUAL_FREQ = 252  # 日度
 RISK_FREE_ANNUAL = 0.0

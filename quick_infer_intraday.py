@@ -20,7 +20,7 @@ import h5py
 from tqdm import tqdm
 
 # ======== 顶部可修改变量 ========
-ASOF_DATE = "2025-11-06"          # 例: "2025-11-06"；None 表示使用“价格数据”中的最新可用交易日
+ASOF_DATE = None         # 例: "2025-11-06"；None 表示使用“价格数据”中的最新可用交易日
 MODEL_TAG = None          # 例: "20251107"；None 表示自动选“最近一个不晚于 D 的 model_best_YYYYMMDD.pth”
 FORCE_NO_FILTERS = False  # True 跳过停牌/ST/IPO/成交额等过滤；False 使用回测同样过滤
 OVERRIDE_WEIGHT_MODE = None  # "equal" 或 "score"；None 则使用 BT_ROLL_CFG.weight_mode

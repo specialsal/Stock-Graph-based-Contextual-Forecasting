@@ -27,12 +27,11 @@ from datetime import datetime
 class Config:
     # -------- 运行命名（影响模型输出路径与回测路径）--------
     # 建议每次实验改一个 run_name，避免覆盖
-    # run_name = "TGF-model"          # 基线
+    run_name = "TGF-model"          # 基线
     # run_name = "TGF-abl_noGNN"      # 移除 GNN（graph_type="none"）
     # run_name = "TGF-abl_noFiLM"     # 移除 FiLM（use_film=False）
     # run_name = "TGF-abl_noTR"       # 移除 Transformer（use_transformer=False）
     # run_name = "TGF-model_5_26_26"
-    run_name = "TGF-rank_cs"
 
     # -------- 路径 --------
     data_dir      = Path("./data")

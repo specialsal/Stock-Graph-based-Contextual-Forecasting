@@ -23,15 +23,15 @@ TRADING_DAY_END = '2030-12-31'
 
 # 是否更新的开关（可按需修改）
 UPDATE_SWITCH = {
-    'trading_calendar': False,      # 交易日 & 交易周
-    'stock_info': False,            # 股票信息（聚宽导出覆盖）
-    'stock_price_day': False,       # 股票日行情（parquet, MultiIndex）
-    'stock_fundamental_day': False, # 股票基本面日行情（parquet, MultiIndex）
-    'suspended': False,             # 停牌（CSV 宽表）
-    'is_st': False,                 # ST（CSV 宽表）
-    'index_components': False,      # 指数成分（快照覆盖）
-    'industry_and_style': False,    # 行业与风格（快照覆盖 + 映射）
-    'index_price_day': False,       # 指数日行情（parquet, MultiIndex）
+    'trading_calendar': True,      # 交易日 & 交易周
+    'stock_info': True,            # 股票信息（聚宽导出覆盖）
+    'stock_price_day': True,       # 股票日行情（parquet, MultiIndex）
+    'stock_fundamental_day': True, # 股票基本面日行情（parquet, MultiIndex）
+    'suspended': True,             # 停牌（CSV 宽表）
+    'is_st': True,                 # ST（CSV 宽表）
+    'index_components': True,      # 指数成分（快照覆盖）
+    'industry_and_style': True,    # 行业与风格（快照覆盖 + 映射）
+    'index_price_day': True,       # 指数日行情（parquet, MultiIndex）
     'sector_price_day': True,      # 新增：风格日行情（增量聚合）
 }
 
