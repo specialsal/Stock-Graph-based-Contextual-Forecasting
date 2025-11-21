@@ -49,7 +49,7 @@ class BTRollingConfig:
     processed_dir  = data_dir / "processed"
     raw_dir        = data_dir / "raw"
     feat_file      = processed_dir / "features_daily.h5"
-    ctx_file       = processed_dir / "context_features.parquet"
+    ctx_file       = processed_dir / "context_features_bread.parquet"
     label_file     = processed_dir / "weekly_labels.parquet"
     industry_map_file = raw_dir / "stock_industry_map.csv"
     trading_day_file  = raw_dir / "trading_day.csv"
