@@ -101,7 +101,7 @@ def main():
     sl_ratio = float(getattr(cfg, "sl_price_ratio", 0.06))
 
     # 冷静期天数（自然日）
-    cooldown_days = float(getattr(cfg, "cooldown_days", 5))
+    cooldown_days = float(getattr(cfg, "cooldown_days", 1))
 
     # 读取日度持仓（要求包含 signal_date 列；若没有则用当日 date 代替）
     positions = pd.read_csv(pos_path)
@@ -182,8 +182,10 @@ def main():
 
         # ===== 1) 当日目标权重与集合划分（先不考虑冷静期） =====
         w_today_target = _pivot_weights_for_day(positions, d)
+        # 更新昨日权重前，先把 0 权重的彻底移除 index（不参与 set_yest）
+        if prev_w is not None:
+            prev_w = prev_w[prev_w != 0.0]
         w_yest = prev_w
-
         # 昨日/今日股票集合（初始版本）
         set_today = set(w_today_target.index)
         set_yest = set() if (w_yest is None or w_yest.empty) else set(w_yest.index)

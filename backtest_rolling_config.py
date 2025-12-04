@@ -49,7 +49,7 @@ class BTRollingConfig:
     processed_dir  = data_dir / "processed"
     raw_dir        = data_dir / "raw"
     feat_file      = processed_dir / "features_daily.h5"
-    ctx_file       = processed_dir / "context_features_bread.parquet"
+    ctx_file       = processed_dir / "context_features.parquet"
     label_file     = processed_dir / "weekly_labels.parquet"
     industry_map_file = raw_dir / "stock_industry_map.csv"
     trading_day_file  = raw_dir / "trading_day.csv"
@@ -94,7 +94,7 @@ class BTRollingConfig:
     # 周内止盈/止损参数
     enable_intraweek_stops: bool = True
     tp_price_ratio: float = 0.15
-    sl_price_ratio: float = 0.01
+    sl_price_ratio: float = 99
     cooldown_days: float = 1
 
     # 组合权重与过滤（从代码中上移到配置）
