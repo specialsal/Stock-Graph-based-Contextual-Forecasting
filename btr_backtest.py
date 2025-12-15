@@ -45,13 +45,13 @@ btr_backtest.py（日度版，支持一次性止盈/止损 + 冷静期 + 交易�
 """
 
 from pathlib import Path
-from typing import Optional, Dict, Set
+from typing import Optional, Dict, Set, List
 
 import numpy as np
 import pandas as pd
 
 from backtest_rolling_config import BT_ROLL_CFG
-from utils import load_calendar
+from stop_rules import run_stop_rules
 
 
 def ensure_dir(p: Path):
@@ -90,34 +90,37 @@ def main():
     out_dir = cfg.backtest_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    weight_mode = str(getattr(cfg, "weight_mode", "score")).lower()
+    weight_mode = str(cfg.weight_mode).lower()
     pos_path = out_dir / f"positions_{cfg.run_name_out}_{weight_mode}.csv"
     if not pos_path.exists():
         raise FileNotFoundError(f"未找到持仓文件：{pos_path}")
 
-    # 止盈/止损参数
-    enable_stops = bool(getattr(cfg, "enable_intraweek_stops", False))
-    tp_ratio = float(getattr(cfg, "tp_price_ratio", 0.06))
-    sl_ratio = float(getattr(cfg, "sl_price_ratio", 0.06))
+    # 止盈/止损参数（不再使用 getattr）
+    enable_stops = bool(cfg.enable_intraweek_stops)
+    tp_ratio = float(cfg.tp_price_ratio)
+    sl_ratio = float(cfg.sl_price_ratio)
+    cooldown_days = float(cfg.cooldown_days)
 
-    # 冷静期天数（自然日）
-    cooldown_days = float(getattr(cfg, "cooldown_days", 1))
+    # 多规则配置
+    stop_rules_cfg = cfg.stop_rules
+    if isinstance(stop_rules_cfg, str):
+        stop_rules_cfg = [stop_rules_cfg]
+    trailing_sl_start_ratio = float(cfg.trailing_sl_start_ratio)
+    trailing_sl_drawdown = float(cfg.trailing_sl_drawdown)
 
-    # 读取日度持仓（要求包含 signal_date 列；若没有则用当日 date 代替）
+    # 读取日度持仓
     positions = pd.read_csv(pos_path)
     positions["date"] = pd.to_datetime(positions["date"])
     if "signal_date" in positions.columns:
         positions["signal_date"] = pd.to_datetime(positions["signal_date"])
     else:
-        # 兜底：若没有 signal_date 列，就直接用当日 date 作为 signal_date（相当于每日信号）
         positions["signal_date"] = positions["date"]
 
     positions = positions.sort_values(["date", "stock"])
     positions = positions[(positions["date"] >= pd.Timestamp(cfg.bt_start_date)) &
                           (positions["date"] <= pd.Timestamp(cfg.bt_end_date))]
 
-    # 为每个交易日构造一个唯一的 signal_date（同一天所有股票应一致）
-    # 若某天存在多个 signal_date（理论上不应该），取最早的一个
+    # 每个交易日的 signal_date（若一天内多次，则取最早）
     day_signal_map = (
         positions.groupby("date")["signal_date"]
         .min()
@@ -144,12 +147,14 @@ def main():
 
     buy_cost, sell_cost = _cost_terms_from_cfg()
 
-    recs = []         # 每日组合收益
-    stock_recs = []   # 每日单票收益
-    trade_recs = []   # 交易事件记录
+    recs: List[Dict] = []        # 每日组合收益
+    stock_recs: List[Dict] = []  # 每日单票收益
+    trade_recs: List[Dict] = []  # 交易事件记录
 
     # 每只股票的“本轮入场价（裸价O）”与“是否在本轮已触发 TP/SL”
     entry_state: Dict[str, Dict[str, float]] = {}
+    # 跟踪止损的最高价等状态
+    trailing_state: Dict[str, Dict[str, float]] = {}
 
     prev_w: Optional[pd.Series] = None  # 昨日目标权重（为计算减仓收益使用）
 
@@ -168,7 +173,6 @@ def main():
         if stock not in last_stop_date:
             return False
         delta = (today - last_stop_date[stock]).days
-        # 0 表示触发当天，随后 1~cooldown_days 为冷静期
         return 0 <= delta <= cooldown_days
 
     for i, d in enumerate(days):
@@ -176,17 +180,15 @@ def main():
         sig_date_today = day_signal_map.get(d)
 
         if (current_cycle_signal_date is None) or (sig_date_today != current_cycle_signal_date):
-            # 进入新的信号周期：清空“本周期已 stop 的股票集合”
             current_cycle_signal_date = sig_date_today
             stopped_in_cycle.clear()
 
         # ===== 1) 当日目标权重与集合划分（先不考虑冷静期） =====
         w_today_target = _pivot_weights_for_day(positions, d)
-        # 更新昨日权重前，先把 0 权重的彻底移除 index（不参与 set_yest）
         if prev_w is not None:
             prev_w = prev_w[prev_w != 0.0]
         w_yest = prev_w
-        # 昨日/今日股票集合（初始版本）
+
         set_today = set(w_today_target.index)
         set_yest = set() if (w_yest is None or w_yest.empty) else set(w_yest.index)
 
@@ -202,23 +204,18 @@ def main():
         Y_all = list(set_yest)
 
         # ===== 1.5) 冷静期在权重维度上强制砍仓 =====
-        # 冷静期强于信号：无论 positions 给多大权重，只要在冷静期内，就视为目标权重=0 且不在 set_today 中
         for s in list(set_today):
             if _in_cooldown(s, d):
                 w_today_target.loc[s] = 0.0
                 set_today.remove(s)
 
-        # 冷静期作用后，重新计算“今日目标有、昨日没有”的新增集合
+        # 再算新增集合（冷静期后）
         A_add_raw = list(set_today - set_yest)
 
         # ===== 2) 新增股票集合：再按“本周期已经 stop”过滤 =====
-        # 当前信号周期里，只要一只股票被 TP/SL 过，本周期剩余时间不再允许 BUY
         A_add_cycle_filtered = [s for s in A_add_raw if s not in stopped_in_cycle]
-
-        # 在这里可以不再额外按 _in_cooldown 过滤，因为冷静期已经在 set_today 中砍掉了
         A_add = A_add_cycle_filtered
 
-        # 将“今日仍持有”的集合视为 Y_all 与 set_today 的交集（止损逻辑会进一步剔除）
         Y_all = list(set_yest)
 
         # ===== 3) 当日新入场：记录 entry_price（裸价O），并记录 BUY 交易 =====
@@ -230,6 +227,9 @@ def main():
 
                 # 记录本轮入场价与状态
                 entry_state[s] = {"entry_price": o_raw, "triggered": 0.0}
+                # 跟踪止损状态初始化
+                trailing_state[s] = {"highest_price": o_raw, "tracking_started": 0.0}
+
                 exec_price = o_raw * (1.0 + buy_cost)
 
                 trade_recs.append({
@@ -240,126 +240,49 @@ def main():
                     "exec_price": exec_price
                 })
 
-                # 新一轮持仓开始，重置 stop_closed 状态
                 stop_closed[s] = False
 
-        # ===== 4) 存量持有先检查止损->止盈（只在 enable_stops 条件下） =====
-        contrib_stops_total = 0.0
-
+        # ===== 4) 存量持有先检查各类止盈/止损（多规则叠加） =====
         if enable_stops and Y_all and C_prev is not None:
-            # 注意：这里对“昨日持有 & 今日目标仍持有”的股票检查止损/止盈
-            for s in list(Y_all):  # 用 list(...)，方便在循环中安全地 remove
-                # 若该股票今天已经在冷静期内，被从 set_today 砍掉，则不参与止损检查
-                if s not in set_yest or s not in set_today:
-                    continue
+            contrib_stops_total, set_today, set_yest, Y_all = run_stop_rules(
+                rules=stop_rules_cfg,
+                d=d,
+                enable_stops=enable_stops,
+                tp_ratio=tp_ratio,
+                sl_ratio=sl_ratio,
+                trailing_sl_start_ratio=trailing_sl_start_ratio,
+                trailing_sl_drawdown=trailing_sl_drawdown,
+                cooldown_days=cooldown_days,
+                set_today=set_today,
+                set_yest=set_yest,
+                Y_all=Y_all,
+                w_yest=w_yest,
+                O_t=O_t,
+                H_t=H_t,
+                L_t=L_t,
+                C_prev=C_prev,
+                buy_cost=buy_cost,
+                sell_cost=sell_cost,
+                entry_state=entry_state,
+                trailing_state=trailing_state,
+                stopped_in_cycle=stopped_in_cycle,
+                stop_closed=stop_closed,
+                last_stop_date=last_stop_date,
+                stock_recs=stock_recs,
+                trade_recs=trade_recs,
+            )
 
-                # 若这只股票在冷静期内，本轮已经 TP/SL 过了，理论上不该再进来
-                if _in_cooldown(s, d):
-                    # 冷静期内不再检查 TP/SL，且本日目标也被砍掉了
-                    continue
-
-                # === 显式取当日开盘裸价（关键修正点） ===
-                o_raw = float(O_t.get(s, np.nan))
-                if not np.isfinite(o_raw):
-                    continue
-
-                # entry_state 若不存在，兜底用当日开盘作为入场价
-                state = entry_state.get(s)
-                if state is None:
-                    entry_state[s] = {"entry_price": o_raw, "triggered": 0.0}
-                    state = entry_state[s]
-
-                if state["triggered"]:
-                    # 这一轮已经触发过 TP/SL，不再重复触发
-                    continue
-
-                entry_price = float(state["entry_price"])
-                hi = float(H_t.get(s, np.nan))
-                lo = float(L_t.get(s, np.nan))
-                if not np.isfinite(hi) or not np.isfinite(lo) or not np.isfinite(entry_price):
-                    continue
-
-                sl_price = entry_price * (1.0 - sl_ratio)
-                tp_price = entry_price * (1.0 + tp_ratio)
-
-                trig = None
-                exec_price = None
-
-                # 先检查止损，再检查止盈（优先级可以根据需要调整）
-                # 1) 止损逻辑
-                if lo <= sl_price:
-                    trig = "SL"
-                    # 如果开盘就已经低于止损位，认为只能按开盘价成交（更悲观）
-                    if o_raw <= sl_price:
-                        exec_raw = o_raw
-                    else:
-                        # 否则视为盘中触发，按理想止损价成交
-                        exec_raw = sl_price
-                    exec_price = exec_raw * (1.0 - sell_cost)
-
-                # 2) 止盈逻辑（只有在没有先触发止损的情况下才检查）
-                elif hi >= tp_price:
-                    trig = "TP"
-                    # 如果开盘就已经高于止盈位，认为一开盘就能平掉，按开盘价
-                    if o_raw >= tp_price:
-                        exec_raw = o_raw
-                    else:
-                        # 否则视为盘中触发，按理想止盈价成交
-                        exec_raw = tp_price
-                    exec_price = exec_raw * (1.0 - sell_cost)
-
-                if trig is not None:
-                    # === 4.1) 用昨日权重全清仓，收益以 C_prev -> exec_price ===
-                    w_prev = float(w_yest.get(s, 0.0)) if (w_yest is not None) else 0.0
-                    if w_prev > 0 and np.isfinite(exec_price):
-                        base = float(C_prev.get(s, np.nan))
-                        if np.isfinite(base) and base > 0:
-                            r = float(exec_price / base - 1.0)
-                            contrib = w_prev * r
-                            contrib_stops_total += contrib
-
-                            stock_recs.append({
-                                "date": d,
-                                "stock": s,
-                                "weight": w_prev,
-                                "ret": r,
-                                "contribution": contrib
-                            })
-
-                            # 记录 TP/SL 交易
-                            trade_recs.append({
-                                "date": d,
-                                "stock": s,
-                                "action": trig,
-                                "entry_price": entry_price,
-                                "exec_price": exec_price
-                            })
-
-                    # === 4.2) 状态标记 ===
-                    entry_state[s]["triggered"] = 1.0
-                    stopped_in_cycle.add(s)
-                    stop_closed[s] = True
-                    last_stop_date[s] = d
-
-                    # === 4.3) 关键：当天从“持仓集合”和目标权重中彻底移除这只股票 ===
-                    if s in set_today:
-                        set_today.remove(s)
-                    if s in set_yest:
-                        set_yest.remove(s)
-                    if s in Y_all:
-                        Y_all.remove(s)
-                    if s in w_today_target.index:
-                        w_today_target.loc[s] = 0.0
-
-                    # 同时从 entry_state 中删掉，以结束本轮；冷静期 & stopped_in_cycle 会防止立刻买回
-                    if s in entry_state:
-                        entry_state.pop(s, None)
+            # 规则内部只更新集合，这里把不在 set_today 的股票权重清零
+            for s in list(w_today_target.index):
+                if s not in set_today:
+                    w_today_target.loc[s] = 0.0
+        else:
+            contrib_stops_total = 0.0
 
         # ===== 5) 其余路径：新增、存续、减持（止损股票已被剔除） =====
-        # 重新计算集合：此时 set_today / set_yest 已经剔除了当日触发 TP/SL 的股票
-        A_add_effective = list(set_today - set_yest)  # 当日仍被视为新增
-        S_keep = list(set_yest & set_today)           # 昨日持有且今日仍持有
-        R_reduce = list(set_yest - set_today)         # 昨日持有但今日不再持有
+        A_add_effective = list(set_today - set_yest)
+        S_keep = list(set_yest & set_today)
+        R_reduce = list(set_yest - set_today)
 
         # 新增收益：O(今, 含买入成本) -> C(今)
         ret_add = pd.Series(dtype=float)
@@ -393,7 +316,6 @@ def main():
 
         day_ret = float(contrib_stops_total + contrib_add + contrib_keep + contrib_reduce)
 
-        # n_long：以日末目标剔除被 stop 的近似（set_today 已不含当日触发 stop 的股票）
         n_long = int(len(set_today))
 
         recs.append({
@@ -436,11 +358,10 @@ def main():
                     "contribution": float(w * r)
                 })
 
-                # 方案 A：若本轮曾经通过 stop 平仓，则不再记录 SELL（只记 TP/SL）
+                # 若本轮曾经通过 stop 平仓，则不再记录 SELL（只记 TP/SL/TRAIL_SL）
                 if stop_closed.get(s, False):
                     continue
 
-                # 记录常规 SELL 交易
                 o_out_raw = float(O_t.get(s, np.nan))
                 o_out = o_out_raw * (1.0 - sell_cost) if np.isfinite(o_out_raw) else np.nan
                 entry_price = entry_state.get(s, {}).get("entry_price", np.nan)
@@ -453,24 +374,24 @@ def main():
                     "exec_price": o_out
                 })
 
-                # 本轮结束，可以删除状态（也可以留到下一轮重置）
                 if s in entry_state:
                     entry_state.pop(s, None)
-                stop_closed[s] = False  # 卖出后本轮自然结束
+                if s in trailing_state:
+                    trailing_state.pop(s, None)
+                stop_closed[s] = False  # 卖出后本轮结束
 
         # ===== 8) 状态生命周期清理 =====
-        # 对于今日既不在 set_today 也不在 set_yest 的股票，可以清理 entry_state
-        to_del = []
         alive_stocks = set_today | set_yest
+        to_del = []
         for s in list(entry_state.keys()):
             if s not in alive_stocks:
                 to_del.append(s)
         for s in to_del:
             entry_state.pop(s, None)
-            # last_stop_date 保留，用于未来冷静期判断
-            # stop_closed 在无仓位时可以保留或删除，这里保留，下一次 BUY 会重置为 False
+            if s in trailing_state:
+                trailing_state.pop(s, None)
+            # last_stop_date 保留
 
-        # 更新昨日权重
         prev_w = w_today_target
 
     # ===== 9) 输出净值序列 =====

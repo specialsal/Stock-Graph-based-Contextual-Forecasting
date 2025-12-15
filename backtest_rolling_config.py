@@ -68,14 +68,18 @@ class BTRollingConfig:
     # 分组与持仓控制
     top_pct        = 0.05
     bottom_pct     = 0.05
-    min_n_stocks   = 8   # 最少持仓数
-    max_n_stocks   = 8   # 最大持仓数
+    min_n_stocks   = 7   # 最少持仓数
+    max_n_stocks   = 7   # 最大持仓数
+
+    # 组合权重与过滤（从代码中上移到配置）
+    weight_mode: str = "equal"  # "equal" 或 "score"
+    filter_negative_scores_long: bool = False
 
     # 成本与滑点（非对称）
     # 注意：bps 为基点（万分之一）。例如 3 表示万三（0.03%）
     buy_fee_bps    = 5    # 买入手续费：万零点5
     sell_fee_bps   = 10   # 卖出手续费：万1
-    slippage_bps   = 5    # 双边对称滑点：万5（买卖两侧都加）
+    slippage_bps   = 10    # 双边对称滑点：万5（买卖两侧都加）
 
     # 过滤与样本要求（与训练一致，可按需启用）
     enable_filters     = True
@@ -97,9 +101,17 @@ class BTRollingConfig:
     sl_price_ratio: float = 99
     cooldown_days: float = 1
 
-    # 组合权重与过滤（从代码中上移到配置）
-    weight_mode: str = "equal"  # "equal" 或 "score"
-    filter_negative_scores_long: bool = False
+    # === 止盈/止损规则列表（可叠加） ===
+    # 支持的规则名称：
+    #   "fixed_tp_sl"   固定止盈止损
+    #   "trailing_sl"   跟踪止损
+    stop_rules = ["fixed_tp_sl"]
+
+    # === 跟踪止损相关参数 ===
+    # 只有当价格相对入场价上涨至少 trailing_sl_start_ratio 之后，才开始跟踪最高价
+    trailing_sl_start_ratio: float = 0.15   # 例如 +5% 之后才启动跟踪
+    # 最高价较入场价的回撤比例超过该值时触发跟踪止损
+    trailing_sl_drawdown: float = 0.05      # 例如 从最高点回撤 5% 止损
 
     # 行业中性化开关与参数（已有）
     neutralize_enable: bool = False               # 是否开启行业中性化

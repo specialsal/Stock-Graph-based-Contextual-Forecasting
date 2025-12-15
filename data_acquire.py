@@ -26,7 +26,7 @@ UPDATE_SWITCH = {
     'trading_calendar': True,      # 交易日 & 交易周
     'stock_info': True,            # 股票信息（聚宽导出覆盖）
     'stock_price_day': True,       # 股票日行情（parquet, MultiIndex）
-    'stock_fundamental_day': True, # 股票基本面日行情（parquet, MultiIndex）
+    'stock_fundamental_day': False, # 股票基本面日行情（parquet, MultiIndex）
     'suspended': True,             # 停牌（CSV 宽表）
     'is_st': True,                 # ST（CSV 宽表）
     'index_components': True,      # 指数成分（快照覆盖）
