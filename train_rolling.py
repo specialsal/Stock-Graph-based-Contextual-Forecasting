@@ -25,7 +25,7 @@ from train_utils import (
     HAS_CUDA, setup_env, get_amp_dtype, try_fused_adamw, ensure_parent_dir,
     make_filter_fn, load_stock_info, load_flag_table,
     fit_scaler_for_groups, iterate_group_minibatches, load_group_to_memory,
-    pairwise_ranking_loss_margin, pearsonr,
+    pairwise_ranking_loss_margin, pairwise_ranking_loss_margin_cs, pearsonr,
     load_window_to_ram, iterate_ram_minibatches
 )
 
@@ -93,7 +93,8 @@ def main():
     model = GCFNet(
         d_in=d_in, n_ind=n_ind_known, ctx_dim=ctx_dim,
         hidden=CFG.hidden, ind_emb_dim=CFG.ind_emb,
-        graph_type=CFG.graph_type, tr_layers=CFG.tr_layers, gat_layers=getattr(CFG, "gat_layers", 1)
+        graph_type=CFG.graph_type, tr_layers=CFG.tr_layers, gat_layers=getattr(CFG, "gat_layers", 1),
+        use_film=CFG.use_film, use_transformer=CFG.use_transformer
     ).to(CFG.device)
 
     if getattr(CFG, "use_torch_compile", False) and hasattr(torch, "compile"):
@@ -242,8 +243,21 @@ def main():
 
                     with autocast_ctx:
                         pred = model(fd, ind, ctx)
-                        # 仅用 margin 排序损失（常数 m）
-                        rank_val = pairwise_ranking_loss_margin(pred, y, m=CFG.pair_margin_m, num_pairs=CFG.pair_num_pairs)
+                        # 根据配置选择是否启用“收益差权重”的 ranking loss
+                        if getattr(CFG, "cs_rank_enable", False):
+                            rank_val = pairwise_ranking_loss_margin_cs(
+                                pred, y,
+                                m=CFG.pair_margin_m,
+                                num_pairs=CFG.pair_num_pairs,
+                                alpha=float(getattr(CFG, "cs_rank_alpha", 0.02)),
+                                w_max=float(getattr(CFG, "cs_rank_w_max", 3.0)),
+                            )
+                        else:
+                            rank_val = pairwise_ranking_loss_margin(
+                                pred, y,
+                                m=CFG.pair_margin_m,
+                                num_pairs=CFG.pair_num_pairs,
+                            )
                         loss = rank_val
 
                     loss_scaled = loss / CFG.grad_accum_steps
@@ -311,7 +325,20 @@ def main():
                         pred_cpu = torch.cat(preds, 0)
                         y_cpu = y_t.detach().float().cpu()
                         ric  = rank_ic(pred_cpu, y_cpu)
-                        prl  = float(pairwise_ranking_loss_margin(pred_cpu, y_cpu, m=CFG.pair_margin_m, num_pairs=CFG.pair_num_pairs).item())
+                        if getattr(CFG, "cs_rank_enable", False):
+                            prl = float(pairwise_ranking_loss_margin_cs(
+                                pred_cpu, y_cpu,
+                                m=CFG.pair_margin_m,
+                                num_pairs=CFG.pair_num_pairs,
+                                alpha=float(getattr(CFG, "cs_rank_alpha", 0.02)),
+                                w_max=float(getattr(CFG, "cs_rank_w_max", 3.0)),
+                            ).item())
+                        else:
+                            prl = float(pairwise_ranking_loss_margin(
+                                pred_cpu, y_cpu,
+                                m=CFG.pair_margin_m,
+                                num_pairs=CFG.pair_num_pairs,
+                            ).item())
                         per_date.append({"ic_rank": ric, "pairwise_margin_loss": prl, "n": len(y_cpu)})
                     return per_date
 
@@ -334,7 +361,20 @@ def main():
                         pred_cpu = torch.cat(preds, 0)
                         y_cpu = y_t.detach().float().cpu()
                         ric  = rank_ic(pred_cpu, y_cpu)
-                        prl  = float(pairwise_ranking_loss_margin(pred_cpu, y_cpu, m=CFG.pair_margin_m, num_pairs=CFG.pair_num_pairs).item())
+                        if getattr(CFG, "cs_rank_enable", False):
+                            prl = float(pairwise_ranking_loss_margin_cs(
+                                pred_cpu, y_cpu,
+                                m=CFG.pair_margin_m,
+                                num_pairs=CFG.pair_num_pairs,
+                                alpha=float(getattr(CFG, "cs_rank_alpha", 0.02)),
+                                w_max=float(getattr(CFG, "cs_rank_w_max", 3.0)),
+                            ).item())
+                        else:
+                            prl = float(pairwise_ranking_loss_margin(
+                                pred_cpu, y_cpu,
+                                m=CFG.pair_margin_m,
+                                num_pairs=CFG.pair_num_pairs,
+                            ).item())
                         per_date.append({"ic_rank": ric, "pairwise_margin_loss": prl, "n": len(y_cpu)})
                     return per_date
 
@@ -349,9 +389,13 @@ def main():
                     wv = [d["n"] / n_total for d in per_date_val]
                     val_avg_icr = sum(d["ic_rank"] * wi for d, wi in zip(per_date_val, wv))
                     val_avg_prl = sum(d["pairwise_margin_loss"] * wi for d, wi in zip(per_date_val, wv))
-                    val_target = float(val_avg_icr)
+                    # 使用综合 score = RankIC - λ * loss
+                    alpha = float(getattr(CFG, "model_select_alpha", 1.0))
+                    beta = float(getattr(CFG, "model_select_beta", 0.0))
+                    val_target = float(alpha*val_avg_icr + beta * val_avg_prl)
 
-                print(f"  Val:  pairwise_margin_loss={val_avg_prl:.4f} ic_r={val_avg_icr:.4f}")
+                print(f"  Val:  pairwise_margin_loss={val_avg_prl:.4f} ic_r={val_avg_icr:.4f} "
+                      f"score={val_target:.4f}")
 
                 ep = epoch_id - 1
                 writer.add_scalar(f"{tb_prefix}/val/pairwise_margin_loss", val_avg_prl, ep)
@@ -425,18 +469,35 @@ def main():
                     pred_cpu = torch.cat(preds, 0)
                     y_cpu = y_t.detach().float().cpu()
                     ric  = rank_ic(pred_cpu, y_cpu)
-                    prl  = float(pairwise_ranking_loss_margin(pred_cpu, y_cpu, m=CFG.pair_margin_m, num_pairs=CFG.pair_num_pairs).item())
+                    if getattr(CFG, "cs_rank_enable", False):
+                        prl = float(pairwise_ranking_loss_margin_cs(
+                            pred_cpu, y_cpu,
+                            m=CFG.pair_margin_m,
+                            num_pairs=CFG.pair_num_pairs,
+                            alpha=float(getattr(CFG, "cs_rank_alpha", 0.02)),
+                            w_max=float(getattr(CFG, "cs_rank_w_max", 3.0)),
+                        ).item())
+                    else:
+                        prl = float(pairwise_ranking_loss_margin(
+                            pred_cpu, y_cpu,
+                            m=CFG.pair_margin_m,
+                            num_pairs=CFG.pair_num_pairs,
+                        ).item())
                     per_date.append({"ic_rank": ric, "pairwise_margin_loss": prl, "n": len(y_cpu)})
                 return per_date
 
             per_date_val = eval_split_stream(val_gk)
             final_val = summarize(per_date_val)
 
+            alpha = float(getattr(CFG, "model_select_alpha", 1.0))
+            beta = float(getattr(CFG, "model_select_beta", 0.0))
+            final_score = float(alpha* final_val["avg_ic_rank"] + beta * final_val["avg_pairwise_margin_loss"])
             row = {
                 "pred_date": pred_date.strftime("%Y-%m-%d"),
                 "best_epoch": best_epoch,
                 "val_avg_rankic": final_val["avg_ic_rank"],
                 "val_avg_pairwise_margin_loss": final_val["avg_pairwise_margin_loss"],
+                "val_score": final_score,
                 "epoch_count": epoch_id,
             }
             df_new = pd.DataFrame([row])

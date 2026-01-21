@@ -327,6 +327,65 @@ def pairwise_ranking_loss_margin(pred: torch.Tensor, y: torch.Tensor, m: float, 
     x = m - s_ij * (pred[i] - pred[j])
     return torch.nn.functional.softplus(x).mean()
 
+# --------------------------- 排序损失（带常数 margin，成本敏感） --------------------------- #
+def pairwise_ranking_loss_margin_cs(
+    pred: torch.Tensor,
+    y: torch.Tensor,
+    m: float,
+    num_pairs: int = 2048,
+    alpha: float = 0.02,
+    w_max: float = 3.0,
+) -> torch.Tensor:
+    """
+    Cost-sensitive RankNet（带“收益差权重”）版本：
+    L = E_{(i,j)} [ w_ij * softplus( m - s_ij * (pred_i - pred_j) ) ]
+    其中：
+      - s_ij = sign(y_i - y_j) ∈ {-1, +1}
+      - w_ij = clip( |y_i - y_j| / alpha, max=w_max )
+        * |y_i - y_j| 越大，w_ij 越大（上限为 w_max）
+        * alpha 控制“收益差”的缩放尺度（例如 alpha=0.02 表示 2%）
+    """
+    B = pred.shape[0]
+    if B < 2:
+        return pred.new_tensor(0.0)
+
+    device = pred.device
+
+    # 随机采样若干 pair（避免 O(B^2)）
+    i = torch.randint(0, B, (num_pairs,), device=device)
+    j = torch.randint(0, B, (num_pairs,), device=device)
+    mask = (i != j)
+    if not mask.any():
+        return pred.new_tensor(0.0)
+    i = i[mask]
+    j = j[mask]
+
+    # label 差的符号，决定 pair 的正确方向
+    s_ij = torch.sign(y[i] - y[j])  # -1 / 0 / +1
+    valid = (s_ij != 0)
+    if not valid.any():
+        return pred.new_tensor(0.0)
+    i = i[valid]
+    j = j[valid]
+    s_ij = s_ij[valid]
+
+    # 收益差权重 |Δy|
+    dy = torch.abs(y[i] - y[j])     # |y_i - y_j|
+    # 线性放大 + 截断：w_ij = min(|Δy| / alpha, w_max)
+    if alpha <= 0:
+        # 防御：alpha<=0 时退化为等权重
+        w_ij = torch.ones_like(dy)
+    else:
+        w_ij = dy / alpha
+        if w_max is not None and w_max > 0:
+            w_ij = torch.clamp(w_ij, max=w_max)
+
+    # 原 RankNet+margin 结构
+    x = m - s_ij * (pred[i] - pred[j])
+    loss_ij = F.softplus(x)
+
+    # 加权平均
+    return (w_ij * loss_ij).mean()
 # --------------------------- 窗口内拟合 Scaler --------------------------- #
 def fit_scaler_for_groups(h5: h5py.File, group_keys: Iterable[str]) -> Scaler:
     """
